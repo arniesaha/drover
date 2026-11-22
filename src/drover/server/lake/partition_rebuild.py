@@ -52,7 +52,7 @@ def rebuild_partitioned(
     (evidence / "source-files.json").write_text(json.dumps(inventory, indent=2))
     peak = 0
 
-    def run(operation, output, **fields):
+    def run(operation, output, *, check_fence=None, **fields):
         nonlocal peak
         request = {
             "operation": operation,
@@ -60,10 +60,10 @@ def rebuild_partitioned(
             "spill": str(root / "spill"),
             **fields,
         }
+        supervision = {"check_fence": check_fence} if check_fence is not None else {}
         if rss_ceiling is not None:
-            result, rss = run_admin(request, root, rss_ceiling=rss_ceiling)
-        else:
-            result, rss = run_admin(request, root)
+            supervision["rss_ceiling"] = rss_ceiling
+        result, rss = run_admin(request, root, **supervision)
         peak = max(peak, rss)
         return result
 
@@ -148,6 +148,7 @@ def rebuild_partitioned(
                 run(
                     "publish",
                     root / "publication" / str(index),
+                    check_fence=fence.check,
                     spec=_spec(spec),
                     tables={
                         t: [str(Path(partition) / f)]
@@ -163,6 +164,7 @@ def rebuild_partitioned(
                     run(
                         "publish",
                         root / "publication" / table / str(index),
+                        check_fence=fence.check,
                         spec=_spec(spec),
                         tables={table: [path]},
                     )

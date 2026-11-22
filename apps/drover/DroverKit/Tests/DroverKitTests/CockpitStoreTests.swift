@@ -9,19 +9,26 @@ struct CockpitStoreTests {
             try decodeOverview(providerStatus: "ok", activitySessions: 10),
             try decodeOverview(providerStatus: "ok", activitySessions: 20),
         ])
-        let store = CockpitStore(client: client)
+        let entered = AsyncStream<Date>.makeStream()
+        let release = AsyncStream<Void>.makeStream()
+        let store = CockpitStore(client: client, busyWait: { deadline in
+            entered.continuation.yield(deadline)
+            for await _ in release.stream { break }
+            try Task.checkCancellation()
+        })
         store.updateCapability(from: try capableSnapshot())
         await store.refresh()
         let deadline = Date().addingTimeInterval(0.2)
         await client.setError(.busy(until: deadline))
         let load = Task { await store.refresh() }
-        try await Task.sleep(for: .milliseconds(40))
+        var waits = entered.stream.makeAsyncIterator()
+        #expect(await waits.next() == deadline)
         #expect(store.providerError?.hasPrefix("Hub busy,") == true)
         #expect(store.activity?.totals.sessionCount == 10)
         #expect(await client.overviewRequestCount == 2)
         await client.setError(nil)
+        release.continuation.yield(())
         await load.value
-        #expect(Date() >= deadline)
         #expect(await client.overviewRequestCount == 3)
         #expect(store.providerError == nil)
     }

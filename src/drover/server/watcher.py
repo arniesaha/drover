@@ -66,15 +66,19 @@ class _Handler(FileSystemEventHandler):
         max_lock_retries: int = 5,
         lock_retry_base_seconds: float = 1.0,
         shadow_publisher: ShadowPublisher | None = None,
+        stopping: threading.Event | None = None,
     ):
         self._parquet_dir = parquet_dir
         self._duckdb_path = duckdb_path
         self._lock = threading.Lock()  # serialize ingests; DuckDB single-writer
+        self._stopping = stopping if stopping is not None else threading.Event()
         self._max_lock_retries = max(0, int(max_lock_retries))
         self._lock_retry_base_seconds = max(0.0, float(lock_retry_base_seconds))
         self._shadow_publisher = shadow_publisher
 
     def _maybe_ingest(self, path: Path) -> None:
+        if self._stopping.is_set():
+            return
         if not path.is_file():
             return
         if path.suffix != ".jsonl":  # ignore .tmp and anything else
@@ -83,6 +87,8 @@ class _Handler(FileSystemEventHandler):
             return
 
         with self._lock:
+            if self._stopping.is_set():
+                return
             if not path.is_file():  # moved by another caller while we waited
                 return
             attempts = self._max_lock_retries + 1
@@ -106,8 +112,8 @@ class _Handler(FileSystemEventHandler):
                             attempts,
                             delay,
                         )
-                        if delay:
-                            time.sleep(delay)
+                        if delay and self._stopping.wait(delay):
+                            return
                         continue
                     if _is_ingest_contention(exc):
                         log.warning(
@@ -471,6 +477,7 @@ class IncomingWatcher:
             self._parquet_dir,
             self._duckdb_path,
             shadow_publisher=shadow_publisher,
+            stopping=self._stopping,
         )
 
     def start(self) -> None:
@@ -577,10 +584,32 @@ class IncomingWatcher:
         )
         self._sweeper.start()
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = 5.0) -> None:
+        """Acknowledge local writers only after bounded, verified termination.
+
+        On timeout retain ownership references and raise before the caller can
+        close shared database connections. A later stop may finish the join.
+        This is not a fence for independent CLI or external writers.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
         self._stopping.set()
-        if self._observer is not None:
-            self._observer.stop()
-            self._observer.join(timeout=5)
-            self._observer = None
-            log.info("watcher stopped")
+        observer = self._observer
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=max(0.0, deadline - time.monotonic()))
+            if observer.is_alive():
+                raise TimeoutError("incoming watcher observer did not stop")
+        # Also cover a directly invoked/backlog handler, not only the observer.
+        if not self._handler._lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            raise TimeoutError("incoming watcher ingest did not stop")
+        self._handler._lock.release()
+        sweeper = self._sweeper
+        if sweeper is not None:
+            sweeper.join(timeout=max(0.0, deadline - time.monotonic()))
+            if sweeper.is_alive():
+                raise TimeoutError("incoming watcher sweeper did not stop")
+        self._observer = None
+        self._sweeper = None
+        log.info("watcher stopped")

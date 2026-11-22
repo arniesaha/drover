@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "workspace_id": "native-canary-924-848",
+  "goal_id": "native-canary-924-848",
+  "items": [
+    {
+      "number": 49,
+      "state": "open",
+      "body": "M3 committed-provenance streak fixture 2 of 3. Only if the signed coordinator binding explicitly permits committed provenance for this work run, in the daemon-assigned disposable worktree create harmless tracked `tests/fixtures/native_canary_m3_49.py` implementing a deterministic status-summary helper and `tests/test_native_canary_m3_49.py` that runs it using only the Python standard library. Run exactly `python3 tests/test_native_canary_m3_49.py`. Create regular JSON evidence `.drover-native-canary/m3-49-analysis.json`, `.drover-native-canary/m3-49-implementation.json`, `.drover-native-canary/m3-49-focused-tests.json`, and `.drover-native-canary/source-task-49.json`, each identifying candidate 49 and the focused result. Before `drover_work_update(action=complete)`, commit exactly those source, test, and evidence files on this session branch, using `git add -f` only for ignored evidence. Invoke complete without optional `evidence_key` or `estimated_cost`. If the signed binding does not permit it, do not commit or create an effect; report blocked. If Run role is verify, inspect only the committed parent files and rerun exactly `python3 tests/test_native_canary_m3_49.py`; do not create, alter, or commit artifacts. Do not modify configuration, credentials, network resources, or external services.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": ["goal:native-canary-924-848", "agent:nix", "status:queued"],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-49.json"
+    },
+    {
+      "number": 50,
+      "state": "open",
+      "body": "M3 committed-provenance streak fixture 3 of 3. Only if the signed coordinator binding explicitly permits committed provenance for this work run, in the daemon-assigned disposable worktree create harmless tracked `tests/fixtures/native_canary_m3_50.py` implementing a deterministic evidence-phase validator and `tests/test_native_canary_m3_50.py` that runs it using only the Python standard library. Run exactly `python3 tests/test_native_canary_m3_50.py`. Create regular JSON evidence `.drover-native-canary/m3-50-analysis.json`, `.drover-native-canary/m3-50-implementation.json`, `.drover-native-canary/m3-50-focused-tests.json`, and `.drover-native-canary/source-task-50.json`, each identifying candidate 50 and the focused result. Before `drover_work_update(action=complete)`, commit exactly those source, test, and evidence files on this session branch, using `git add -f` only for ignored evidence. Invoke complete without optional `evidence_key` or `estimated_cost`. If the signed binding does not permit it, do not commit or create an effect; report blocked. If Run role is verify, inspect only the committed parent files and rerun exactly `python3 tests/test_native_canary_m3_50.py`; do not create, alter, or commit artifacts. Do not modify configuration, credentials, network resources, or external services.",
+      "created_at": "2026-11-20T00:00:00Z",
+      "labels": ["goal:native-canary-924-848", "agent:nix", "status:queued"],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-50.json"
+    }
+  ]
+}

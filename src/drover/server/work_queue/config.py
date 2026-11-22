@@ -47,6 +47,18 @@ class Authority(Model):
     allowed_actions: list[str]
     human_actions: list[str]
     ambiguous_requires_decision: bool
+    # Local manifests cannot select authority. A deployment scope is available
+    # only when this reviewed policy opt-in and a goal configuration selector
+    # name the exact candidate number.
+    local_candidate_deployment_scope_enabled: bool = False
+    # Committed local provenance is disabled by default. A reviewed policy and
+    # exact candidate selector are both required before a local worker may make
+    # an isolated session-branch commit for a separate verifier.
+    local_candidate_committed_provenance_enabled: bool = False
+    # A reviewed M2-only receipt handoff is disabled by default.  It permits
+    # one exact local candidate to stop after its durable effect receipt so a
+    # real hub restart can exercise successor-epoch acknowledgement recovery.
+    local_candidate_m2_ack_pending_enabled: bool = False
 
 
 class Acceptance(Model):
@@ -174,6 +186,18 @@ class GoalScope(Model):
     execution_budget: float | None = Field(default=None, gt=0)
     execution_estimated_cost: float = Field(default=5.0, gt=0)
     execution_max_workers: int | None = Field(default=None, gt=0)
+    # An explicitly configured conflicting-write class.  This is a logical
+    # delivery role only: it reuses this goal's native owner and normal
+    # implementation authority.
+    integration_serialization_key: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
+    )
+    # When present, only an operator-authorized candidate carrying this label
+    # enters the configured conflicting-write class.  Omitting the selector
+    # preserves the historical all-work serialization behavior.
+    integration_serialization_label: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$"
+    )
     # Explicit opt-in: the one OpenClaw session allowed to receive durable
     # work-completion wakes for this goal.  No default owner exists.
     continuity_owner_id: str | None = None
@@ -182,6 +206,29 @@ class GoalScope(Model):
     # provider/model default from an unrelated worker.
     continuity_owner_harness: str | None = None
     continuity_owner_model: str | None = None
+    # GitHub is the normal ingress.  ``local_file`` is an explicit isolated
+    # canary source and never inherits a remote provider credential.
+    candidate_source: Literal["github", "local_file"] = "github"
+    local_candidates_path: str | None = None
+    # Per-item worktrees are local-file-only and must be declared in the
+    # server configuration; manifest content cannot choose an arbitrary path.
+    local_candidate_worktrees: dict[str, str] = Field(default_factory=dict)
+    # A deployment authority is selected only by the reviewed goal config for
+    # an exact local candidate. Manifest labels and bodies cannot choose it.
+    local_candidate_authority_scopes: dict[str, Literal["deployment"]] = Field(
+        default_factory=dict
+    )
+    # An M3 committed-provenance exception is selected only by reviewed goal
+    # configuration for an exact local candidate. Manifest bodies cannot grant
+    # it, and verifier runs never inherit it.
+    local_candidate_committed_provenance: dict[str, Literal["m3"]] = Field(
+        default_factory=dict
+    )
+    # M2 restart evidence is selected only by reviewed config for one exact
+    # local candidate. Task bodies and manifests cannot request this handoff.
+    local_candidate_m2_ack_pending: dict[str, Literal["m2"]] = Field(
+        default_factory=dict
+    )
     credential: GitHubCredential
 
     @model_validator(mode="after")
@@ -215,6 +262,97 @@ class GoalScope(Model):
                 raise ValueError(
                     "native continuity owner requires an enabled harness profile"
                 )
+        if self.integration_serialization_key is not None and owner != native_owner:
+            raise ValueError(
+                "integration serialization requires this goal's native owner"
+            )
+        if (
+            self.integration_serialization_label is not None
+            and self.integration_serialization_key is None
+        ):
+            raise ValueError(
+                "integration serialization label requires a serialization key"
+            )
+        if self.candidate_source == "local_file":
+            if (
+                not self.local_candidates_path
+                or not Path(self.local_candidates_path).is_absolute()
+            ):
+                raise ValueError("local candidate source requires an absolute manifest")
+            for number, path in self.local_candidate_worktrees.items():
+                if (
+                    not number.isdigit()
+                    or int(number) <= 0
+                    or not Path(path).is_absolute()
+                ):
+                    raise ValueError(
+                        "local candidate worktrees require positive item keys and absolute paths"
+                    )
+            if self.local_candidate_authority_scopes:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local deployment scope requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_deployment_scope_enabled:
+                    raise ValueError("local deployment scope requires policy opt-in")
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_authority_scopes
+                ):
+                    raise ValueError(
+                        "local deployment scope requires positive item keys"
+                    )
+            if self.local_candidate_committed_provenance:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local committed provenance requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_committed_provenance_enabled:
+                    raise ValueError(
+                        "local committed provenance requires policy opt-in"
+                    )
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_committed_provenance
+                ):
+                    raise ValueError(
+                        "local committed provenance requires positive item keys"
+                    )
+                if set(self.local_candidate_committed_provenance) & set(
+                    self.local_candidate_authority_scopes
+                ):
+                    raise ValueError(
+                        "local committed provenance cannot select deployment authority"
+                    )
+            if self.local_candidate_m2_ack_pending:
+                if owner != native_owner:
+                    raise ValueError(
+                        "local M2 handoff requires this goal's native owner"
+                    )
+                if not policy.authority.local_candidate_m2_ack_pending_enabled:
+                    raise ValueError("local M2 handoff requires policy opt-in")
+                if any(
+                    not number.isdigit() or int(number) <= 0
+                    for number in self.local_candidate_m2_ack_pending
+                ):
+                    raise ValueError("local M2 handoff requires positive item keys")
+                if set(self.local_candidate_m2_ack_pending) & (
+                    set(self.local_candidate_authority_scopes)
+                    | set(self.local_candidate_committed_provenance)
+                ):
+                    raise ValueError(
+                        "local M2 handoff cannot select deployment or committed provenance"
+                    )
+        elif (
+            self.local_candidates_path is not None
+            or self.local_candidate_worktrees
+            or self.local_candidate_authority_scopes
+            or self.local_candidate_committed_provenance
+            or self.local_candidate_m2_ack_pending
+        ):
+            raise ValueError(
+                "GitHub candidate source cannot configure local candidate paths"
+            )
         return self
 
 
@@ -310,4 +448,11 @@ class WorkQueueConfig(Model):
             raise ValueError("enabled work queue requires workspace and goals")
         if len({g.goal_id for g in self.goals}) != len(self.goals):
             raise ValueError("duplicate goal ID")
+        keys = [
+            (goal.repo, goal.integration_serialization_key)
+            for goal in self.goals
+            if goal.integration_serialization_key is not None
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate integration serialization repository/key")
         return self

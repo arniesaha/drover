@@ -11,6 +11,9 @@ struct AnalyticsView: View {
     @State private var provider: String?
     @State private var model: String?
     @State private var project: String?
+    // Reload from the view lifecycle after filter state commits. A task created
+    // inside a menu action can be cancelled when SwiftUI dismisses that menu.
+    @State private var reloadRevision = 0
     /// Which number every distribution list is ordered by. One control for all
     /// of them: comparing "ranked by sessions" in one section against "ranked
     /// by tokens" in the next is exactly the confusion this is meant to remove.
@@ -64,7 +67,7 @@ struct AnalyticsView: View {
         }
         .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
         .toolbar(.hidden, for: .navigationBar)
-        .task { await reload() }
+        .task(id: reloadRevision) { await reload() }
         .refreshable { await reload() }
     }
 
@@ -76,7 +79,7 @@ struct AnalyticsView: View {
             FlowLayout(spacing: 12) {
                 Menu(HistoryPresentation.dayRange(days)) {
                     ForEach([1, 7, 14, 30, 90, 365], id: \.self) { value in
-                        Button(HistoryPresentation.dayRange(value)) { days = value; Task { await reload() } }
+                        Button(HistoryPresentation.dayRange(value)) { days = value; scheduleReload() }
                     }
                 }
                 Button {
@@ -90,19 +93,19 @@ struct AnalyticsView: View {
             if filtersExpanded {
                 FlowLayout(spacing: 8, lineSpacing: 8) {
                     AnalyticsFilterMenu(title: "Host", selection: host, values: hostValues) {
-                        host = $0; Task { await reload() }
+                        host = $0; scheduleReload()
                     }
                     AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
-                        harness = $0; Task { await reload() }
+                        harness = $0; scheduleReload()
                     }
                     AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
-                        provider = $0; Task { await reload() }
+                        provider = $0; scheduleReload()
                     }
                     AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
-                        model = $0; Task { await reload() }
+                        model = $0; scheduleReload()
                     }
                     AnalyticsFilterMenu(title: "Project", selection: project, values: projectValues) {
-                        project = $0; Task { await reload() }
+                        project = $0; scheduleReload()
                     }
                 }
             }
@@ -374,6 +377,10 @@ struct AnalyticsView: View {
         // "Not reported" as a standalone phrase with the label a swipe away.
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityText ?? "\(value) \(label)")
+    }
+
+    private func scheduleReload() {
+        reloadRevision &+= 1
     }
 
     private func reload() async {

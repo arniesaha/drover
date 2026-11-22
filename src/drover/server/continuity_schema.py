@@ -5,13 +5,33 @@
 # rather than treating a valid continuity checkpoint as corrupt.
 CONTINUITY_BASE_TABLES = ("factory_observer_runs", "factory_observer_inbox")
 CONTINUITY_RECEIPT_TABLE = "factory_observer_completion_receipts"
-CONTINUITY_TABLES = (*CONTINUITY_BASE_TABLES, CONTINUITY_RECEIPT_TABLE)
+CONTINUITY_RESERVATION_TABLE = "continuity_integration_reservations"
+CONTINUITY_TABLES = (
+    *CONTINUITY_BASE_TABLES,
+    CONTINUITY_RECEIPT_TABLE,
+    CONTINUITY_RESERVATION_TABLE,
+)
+
+# A logical integration serialization role is still served by the configured
+# native owner.  The reservation only fences conflicting deliveries; it never
+# grants the broader integration/publish authority scope.
+INTEGRATION_SERIALIZATION_DDL = (
+    """CREATE TABLE IF NOT EXISTS continuity_integration_reservations (
+      repository TEXT NOT NULL, serialization_key TEXT NOT NULL,
+      owner_id TEXT NOT NULL, run_id TEXT NOT NULL,
+      generation BIGINT NOT NULL CHECK (generation > 0),
+      owner_epoch BIGINT NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0),
+      state TEXT NOT NULL CHECK (state IN ('reserved', 'released')),
+      acquired_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ,
+      PRIMARY KEY (repository, serialization_key)
+    )""",
+)
 
 # Native owner execution records are control-plane state, not harness-local
 # state.  A turn claim is intentionally separate from the observer delivery:
 # a lost hub process may retry the same client turn id, but cannot overlap a
 # second turn on its linked owner session.
-NATIVE_OWNER_DDL = (
+NATIVE_OWNER_BASE_DDL = (
     """CREATE TABLE IF NOT EXISTS continuity_owner_sessions (
       goal_id TEXT NOT NULL, owner_id TEXT NOT NULL,
       session_id TEXT, client_session_id TEXT NOT NULL,
@@ -29,6 +49,24 @@ NATIVE_OWNER_DDL = (
     )""",
     "CREATE INDEX IF NOT EXISTS continuity_owner_turn_live ON continuity_owner_turn_claims (goal_id, owner_id, state, claim_until)",
 )
+
+# Recovery DDL belongs to additive PostgreSQL migration 40.
+NATIVE_OWNER_RECOVERY_DDL = (
+    """CREATE TABLE IF NOT EXISTS continuity_owner_recoveries (
+      wake_id TEXT PRIMARY KEY, goal_id TEXT NOT NULL, owner_id TEXT NOT NULL, run_id TEXT NOT NULL, old_session_id TEXT NOT NULL, old_client_turn_id TEXT NOT NULL, old_claim_until TIMESTAMPTZ NOT NULL, old_generation INTEGER NOT NULL, old_client_session_id TEXT NOT NULL, old_credential_id TEXT, old_owner_epoch BIGINT NOT NULL, executor_id TEXT, executor_until TIMESTAMPTZ, fenced_at TIMESTAMPTZ, state TEXT NOT NULL CHECK (state IN ('fencing', 'recovered')), created_at TIMESTAMPTZ NOT NULL, recovered_at TIMESTAMPTZ
+    )""",
+    "ALTER TABLE continuity_owner_sessions ADD COLUMN IF NOT EXISTS credential_id TEXT",
+    "ALTER TABLE continuity_owner_recoveries ADD COLUMN IF NOT EXISTS old_credential_id TEXT",
+    "ALTER TABLE continuity_owner_recoveries ADD COLUMN IF NOT EXISTS fenced_at TIMESTAMPTZ",
+)
+
+# Additive runner bootstrap for control stores that predate PostgreSQL migration
+# 43. A NULL legacy epoch fails closed in renewal until that claim settles.
+NATIVE_OWNER_CLAIM_EPOCH_DDL = (
+    "ALTER TABLE continuity_owner_turn_claims ADD COLUMN IF NOT EXISTS owner_epoch BIGINT",
+)
+
+NATIVE_OWNER_DDL = (*NATIVE_OWNER_BASE_DDL, *NATIVE_OWNER_RECOVERY_DDL)
 
 NATIVE_OWNER_RECEIPT_DDL = (
     """CREATE TABLE IF NOT EXISTS continuity_owner_action_intents (
@@ -54,7 +92,13 @@ CONTINUITY_DDL = (
       handoff_redeemed_at TIMESTAMPTZ,
       owner_id TEXT, owner_epoch BIGINT NOT NULL DEFAULT 0,
       lease_until TIMESTAMPTZ, worker_state TEXT NOT NULL DEFAULT 'unknown',
-      next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL
+      next_action_json TEXT, updated_at TIMESTAMPTZ NOT NULL,
+      delivery_role TEXT NOT NULL DEFAULT 'standard',
+      serialization_repository TEXT, serialization_key TEXT,
+      serialization_generation BIGINT,
+      expected_effect_artifact TEXT,
+      committed_provenance BOOLEAN,
+      m2_ack_pending BOOLEAN
     )
     """,
     """
@@ -84,6 +128,7 @@ CONTINUITY_DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS factory_observer_completion_receipts_run "
     "ON factory_observer_completion_receipts (run_id, state, recorded_at, harness_event_id)",
+    *INTEGRATION_SERIALIZATION_DDL,
 )
 
 # PostgreSQL migration 10 was released with this exact tuple. New continuity

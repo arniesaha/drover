@@ -463,6 +463,7 @@ def deprecate_legacy(spec: LakeSpec, *, apply: bool = False) -> dict:
                 },
             },
             spec.data_root,
+            check_fence=fence.check,
         )
         fence.check()
         plan = result["plan"]

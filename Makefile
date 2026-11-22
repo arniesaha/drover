@@ -59,7 +59,8 @@ check-release-ready: docs ## Verify repo is ready for release
 	@echo "This gate checks the repository, not the build. It does not run the"
 	@echo "test suite: run 'uv run pytest' (needs 'uv sync --extra dev'), or"
 	@echo "read CI on the commit you intend to tag. A release cut over a red"
-	@echo "suite passes this target."
+	@echo "suite passes this target; the Release workflow then refuses to"
+	@echo "publish it (scripts/require_main_ci.py)."
 
 build: ## Build distribution (sdist and wheel)
 	@echo "=== Building Distribution ===" && \

@@ -16,6 +16,7 @@ from drover.server.harness.model_catalog import (
     ModelCatalogService,
     ModelOption,
     ReasoningOptions,
+    catalog_wire_bytes,
 )
 
 NOW = datetime(2026, 8, 14, 18, 22, tzinfo=timezone.utc)
@@ -276,7 +277,10 @@ def test_discovered_catalog_rejects_too_many_duplicate_or_multiple_default_model
         DiscoveredCatalog(
             account_scope_material="scope",
             harness_version="1",
-            models=tuple(model for _ in range(257)),
+            models=tuple(
+                ModelOption(id=f"model-{index}", display_name=f"Model {index}")
+                for index in range(513)
+            ),
         )
     with pytest.raises(ValueError):
         DiscoveredCatalog(
@@ -334,6 +338,52 @@ def test_wire_parser_requires_exact_identity_and_safe_degraded_shape():
     value["host_id"] = "other-host"
     with pytest.raises(ValueError):
         CatalogEnvelope.from_wire(value, "mac-mini", "codex")
+
+
+def test_public_wire_accepts_cursor_sized_catalog_but_not_a_larger_one():
+    models = tuple(
+        ModelOption(
+            id=f"public-model-{index:03d}",
+            display_name=f"Public Model {index}",
+            is_default=index == 143,
+        )
+        for index in range(284)
+    )
+    envelope = CatalogEnvelope(
+        host_id="studio",
+        harness="cursor",
+        account_scope_id="opaque-cursor-scope",
+        harness_version="2026.11.19-f005e9d",
+        discovered_at=NOW,
+        stale=False,
+        stale_reason=None,
+        models=models,
+    )
+
+    wire = catalog_wire_bytes(envelope)
+    parsed = CatalogEnvelope.from_wire(envelope.to_wire(), "studio", "cursor")
+    assert len(wire) <= MAX_CATALOG_WIRE_BYTES
+    assert len(parsed.models) == 284
+    assert parsed.models[143].is_default is True
+
+    with pytest.raises(ValueError, match="too many models"):
+        CatalogEnvelope(
+            host_id="studio",
+            harness="cursor",
+            account_scope_id="opaque-cursor-scope",
+            harness_version="2026.11.19-f005e9d",
+            discovered_at=NOW,
+            stale=False,
+            stale_reason=None,
+            models=models
+            + tuple(
+                ModelOption(
+                    id=f"public-model-{index:03d}",
+                    display_name=f"Public Model {index}",
+                )
+                for index in range(284, 513)
+            ),
+        )
 
 
 def test_identity_change_and_invalidation_bypass_a_fresh_cache():

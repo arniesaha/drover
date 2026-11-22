@@ -127,8 +127,9 @@ class ProviderUsageService:
     ) -> tuple[ProviderAccountSnapshot, ...]:
         """Persist observations; scheduled failures overlay connector state.
 
-        With ``record_failures=False``, reject failed observations before
-        writing and raise a sanitized category for the optional caller.
+        With ``record_failures=False``, persist successful observations but
+        preserve last-good state for failed providers. After writing successes,
+        raise a sanitized category so the optional caller reports partial failure.
         """
         attempted_at = self.clock()
         host_id = _host_value(host, "host_id")
@@ -146,14 +147,30 @@ class ProviderUsageService:
                     error_category="empty_inventory",
                 )
                 return ()
-            if not record_failures and any(
-                snapshot.status not in _SUCCESS_STATUSES for snapshot in snapshots
-            ):
-                raise RuntimeError("provider_error")
+            failed_providers = {
+                snapshot.provider
+                for snapshot in snapshots
+                if snapshot.status not in _SUCCESS_STATUSES
+            }
+            if not record_failures:
+                snapshots = tuple(
+                    snapshot
+                    for snapshot in snapshots
+                    if snapshot.status in _SUCCESS_STATUSES
+                )
             snapshots = self._scope_connector_errors(snapshots)
             self._persist_new_snapshots(snapshots, host_id=host_id)
             self._record_snapshot_attempts(snapshots, attempted_at=attempted_at)
-            self._retire_unreported_accounts(snapshots, host_id=host_id)
+            # A failed account probe is not a complete inventory for its provider.
+            # Do not retire its last-good identities during an optional refresh.
+            retirement_snapshots = (
+                tuple(s for s in snapshots if s.provider not in failed_providers)
+                if not record_failures
+                else snapshots
+            )
+            self._retire_unreported_accounts(retirement_snapshots, host_id=host_id)
+            if not record_failures and failed_providers:
+                raise RuntimeError("provider_error")
             return snapshots
         except Exception as exc:  # A connector failure must not stop refresh loops.
             if not record_failures:

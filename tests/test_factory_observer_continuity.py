@@ -707,6 +707,190 @@ def test_scope_is_immutable_and_deployment_approval_is_blocked(
         assert store.status(run)["checkpoint"] == "Waiting"
 
 
+def test_integration_reservation_releases_only_after_terminal_effect_receipt(bridge):
+    store, clock, registry = bridge
+    owner_id = "drover:owner/integration-goal"
+    repository = "example/project"
+    key = "main-write"
+    first_run = "work-integration-first"
+    second_run = "work-integration-second"
+    for session_id, run_id in (
+        ("integration-first", first_run),
+        ("integration-second", second_run),
+    ):
+        registry.create_session(
+            session_id=session_id,
+            host_id="studio",
+            harness="codex",
+            command="codex",
+            status="running",
+            handoff_mode="work_coordinator",
+            source_session_id=f"work/{run_id}@0",
+        )
+    store.initialize(
+        session_id="integration-first",
+        objective="Serialized implementation A",
+        checkpoint="pending",
+        authorized_owner_id=owner_id,
+        delivery_role="integration_serialized",
+        repository=repository,
+        serialization_key=key,
+        expected_effect_artifact="local-file:.drover-native-canary/source-task-55.json",
+    )
+    first = store.lease(first_run, owner_id=owner_id)
+    fence = {"owner_id": owner_id, "owner_epoch": first["owner_epoch"]}
+    start = store.report(
+        first_run,
+        source="coordinator",
+        source_event_id="integration-start",
+        subject="worker-integration-a",
+        sequence=1,
+        kind="worker_started",
+        summary="serialized worker started",
+    )
+    start_action = store.consume(first_run, **fence)
+    assert start_action["type"] == "observe_worker_start"
+    store.action_intent(
+        first_run,
+        **fence,
+        wake_id=start,
+        action_fingerprint=start_action["action_id"],
+        artifact="local:started-observation",
+    )
+    store.acknowledge(first_run, **fence, event_id=start, checkpoint="start observed")
+
+    # A start observation is not the serialized effect. The competing ready
+    # run remains fenced until the exact terminal action is receipt-complete.
+    status = store.status(first_run)
+    assert status["integration_serialization"]["state"] == "reserved"
+    assert status["integration_serialization"]["generation"] == 1
+    with pytest.raises(ContinuityConflict, match="reservation"):
+        store.initialize(
+            session_id="integration-second",
+            objective="Serialized implementation B",
+            checkpoint="pending",
+            authorized_owner_id=owner_id,
+            delivery_role="integration_serialized",
+            repository=repository,
+            serialization_key=key,
+        )
+    # Replay of the already-acknowledged observation cannot release or clobber
+    # the reservation after a later terminal event is pending.
+    done = store.report(
+        first_run,
+        source="coordinator",
+        source_event_id="integration-done",
+        subject="worker-integration-a",
+        sequence=2,
+        kind="worker_done",
+        summary="serialized worker completed",
+    )
+    store.acknowledge(
+        first_run, **fence, event_id=start, checkpoint="stale start replay"
+    )
+    assert store.status(first_run)["integration_serialization"]["state"] == "reserved"
+
+    done_action = store.consume(first_run, **fence)
+    assert done_action["type"] == "review_worker_result"
+    # A successor epoch owns the same delivered terminal wake after expiry;
+    # the stale epoch cannot record its effect or release the reservation.
+    clock.advance(61)
+    successor_lease = store.lease(first_run, **fence)
+    successor_fence = {
+        "owner_id": owner_id,
+        "owner_epoch": successor_lease["owner_epoch"],
+    }
+    with pytest.raises(ContinuityConflict, match="current owner lease"):
+        store.action_intent(
+            first_run,
+            **fence,
+            wake_id=done,
+            action_fingerprint=done_action["action_id"],
+            artifact="local-file:.drover-native-canary/source-task-55.json",
+        )
+    done_action = store.consume(first_run, **successor_fence)
+    store.action_intent(
+        first_run,
+        **successor_fence,
+        wake_id=done,
+        action_fingerprint=done_action["action_id"],
+        artifact="local-file:.drover-native-canary/source-task-55.json",
+    )
+    store.acknowledge(
+        first_run,
+        **successor_fence,
+        event_id=done,
+        checkpoint="terminal effect verified",
+    )
+    assert store.status(first_run)["integration_serialization"]["state"] == "released"
+
+    store.initialize(
+        session_id="integration-second",
+        objective="Serialized implementation B",
+        checkpoint="pending",
+        authorized_owner_id=owner_id,
+        delivery_role="integration_serialized",
+        repository=repository,
+        serialization_key=key,
+    )
+    successor = store.status(second_run)["integration_serialization"]
+    assert successor["state"] == "reserved"
+    assert successor["generation"] == 2
+    # The terminal ACK is idempotent and cannot clobber the successor's
+    # generation after the key has been released exactly once.
+    store.acknowledge(
+        first_run,
+        **successor_fence,
+        event_id=done,
+        checkpoint="stale terminal replay",
+    )
+    assert store.status(second_run)["integration_serialization"] == successor
+    with pytest.raises(ContinuityConflict):
+        store.lease(first_run, **fence)
+
+
+def test_candidate_worker_started_cannot_bypass_deployment_effect_or_gate(bridge):
+    store, _, registry = bridge
+    registry.create_session(
+        session_id="deployment-candidate",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        source_session_id="factory/run_DEPLOYMENT497@4",
+        handoff_mode="factory_observer",
+    )
+    expected = "local-file:.drover-native-canary/source-task-deployment.json"
+    run_id = store.initialize(
+        session_id="deployment-candidate",
+        objective="Deploy candidate",
+        checkpoint="Waiting for approval",
+        authority_scope="deployment",
+        authorized_owner_id="owner",
+        expected_effect_artifact=expected,
+    )
+    lease = store.lease(run_id, owner_id="owner")
+    fence = {"owner_id": "owner", "owner_epoch": lease["owner_epoch"]}
+    event_id = store.report(
+        run_id,
+        source="openclaw",
+        source_event_id="worker-started",
+        subject="worker-deployment",
+        sequence=1,
+        kind="worker_started",
+        summary="Worker started",
+    )
+
+    action = store.consume(run_id, **fence)
+    assert action["type"] == "request_explicit_approval"
+    assert action["authorized"] is False
+    assert action["expected_effect_artifact"] == expected
+    assert not store.status(run_id)["owner_wake"]
+    with pytest.raises(ContinuityConflict, match="approval"):
+        store.acknowledge(
+            run_id, **fence, event_id=event_id, checkpoint="unauthorized deployment"
+        )
+
+
 def test_delivery_backoff_and_retry_budget_survive_owner_recovery(bridge):
     store, clock, _ = bridge
     fence = owner(store, lease_seconds=1)
@@ -1210,9 +1394,11 @@ def test_http_initialize_requires_host_issued_handoff_and_cannot_be_raced(
                 )
             )
         assert sorted(outcomes) == [200, 403]
-        assert store.status(race_run)["owner_handoff"]["authorized_owner_id"] == (
-            owner_principal
-        )
+        race_status = store.status(race_run)
+        assert race_status["owner_handoff"]["authorized_owner_id"] == owner_principal
+        # The host-issued handoff did not carry a signed local-candidate mode.
+        # Initial redemption must preserve that unknown rather than downgrading it.
+        assert race_status["committed_provenance"] is None
     finally:
         server.shutdown()
         server.server_close()
@@ -1537,3 +1723,70 @@ def test_http_owner_credential_is_required_for_native_continuity_writes(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_candidate_specific_expected_effect_is_durable_and_fences_generic_marker(
+    bridge,
+):
+    """A native acknowledgement cannot use a wake marker for another candidate."""
+    store, _, registry = bridge
+    owner_id = "drover:owner/candidate-effect"
+    expected = "local-file:worktrees/work-b/.drover-native-canary/source-task-9.json"
+    session_id = "observer-candidate-effect"
+    run_id = "run_candidate_effect"
+    registry.create_session(
+        session_id=session_id,
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="factory_observer",
+        source_session_id=f"factory/{run_id}@4",
+    )
+    store.initialize(
+        session_id=session_id,
+        objective="Candidate effect",
+        checkpoint="Implementation pending",
+        authorized_owner_id=owner_id,
+        expected_effect_artifact=expected,
+    )
+    lease = store.lease(run_id, owner_id=owner_id)
+    fence = {"owner_id": owner_id, "owner_epoch": lease["owner_epoch"]}
+    event_id = store.report(
+        run_id,
+        source="drover-work-coordinator",
+        source_event_id="candidate-effect:done",
+        subject=session_id,
+        sequence=1,
+        kind="worker_done",
+        summary="Bounded candidate effect completed.",
+    )
+    action = store.consume(run_id, **fence)
+
+    assert action["expected_effect_artifact"] == expected
+    assert store.status(run_id)["expected_effect_artifact"] == expected
+    with pytest.raises(ContinuityConflict, match="expected effect"):
+        store.action_intent(
+            run_id,
+            **fence,
+            wake_id=event_id,
+            action_fingerprint=action["action_id"],
+            artifact="local-file:.drover-native-canary/actions/generic-wake.json",
+        )
+    with pytest.raises(ContinuityConflict, match="completed action intent"):
+        store.acknowledge(
+            run_id, **fence, event_id=event_id, checkpoint="generic marker rejected"
+        )
+    receipt = store.action_intent(
+        run_id,
+        **fence,
+        wake_id=event_id,
+        action_fingerprint=action["action_id"],
+        artifact=expected,
+    )
+    assert receipt == {
+        "wake_id": event_id,
+        "action_fingerprint": action["action_id"],
+        "state": "complete",
+        "artifact": expected,
+    }

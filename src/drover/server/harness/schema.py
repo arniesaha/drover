@@ -358,6 +358,11 @@ def bootstrap_harness_tables(con: duckdb.DuckDBPyConnection) -> None:
             "handoff_issued_by": "VARCHAR",
             "handoff_issued_at": "TIMESTAMPTZ",
             "handoff_redeemed_at": "TIMESTAMPTZ",
+            "delivery_role": "VARCHAR NOT NULL DEFAULT 'standard'",
+            "serialization_repository": "VARCHAR",
+            "serialization_key": "VARCHAR",
+            "serialization_generation": "BIGINT",
+            "expected_effect_artifact": "VARCHAR",
         },
     )
     con.execute(_HARNESS_HOSTS_DDL)

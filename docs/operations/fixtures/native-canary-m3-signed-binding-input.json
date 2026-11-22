@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "purpose": "offline review input; not an executable runtime configuration",
+  "goal_id": "native-canary-924-848",
+  "requires_existing_goal_scope_values": {
+    "candidate_source": "local_file",
+    "execution_enabled": true,
+    "execution_max_workers": 2,
+    "continuity_owner_id": "drover:owner/native-canary-924-848",
+    "continuity_owner_harness": "codex",
+    "integration_serialization_key": "canary-integration-924-848",
+    "integration_serialization_label": "delivery:integration"
+  },
+  "signing_boundary": "HarnessBridge signs these selected values into each ordinary work-coordinator binding at launch; this offline file carries no signature or secret.",
+  "candidate_labels_requiring_serialization": [
+    "goal:native-canary-924-848",
+    "agent:nix",
+    "status:queued",
+    "delivery:integration"
+  ],
+  "deployment_gate": {
+    "runnable_after_reviewed_alignment": true,
+    "candidate": 33,
+    "scope": "deployment",
+    "expected_behavior": "the hub-signed binding causes a request_explicit_approval action; the wake has no owner executor action or ACK until a separate paired human approval exists",
+    "recovery_constraint": "if the initial signed session cannot be recovered, hub recovery fails closed instead of recomputing deployment authority from configuration"
+  },
+  "policy_delta": {
+    "authority": {
+      "local_candidate_deployment_scope_enabled": true
+    },
+    "purpose": "reviewed isolated-canary policy opt-in; false remains the default on ordinary goals"
+  },
+  "goal_scope_delta": {
+    "local_candidate_authority_scopes": {
+      "33": "deployment"
+    },
+    "purpose": "hub configuration selects only candidate 33; manifest labels and body cannot select a scope"
+  }
+}

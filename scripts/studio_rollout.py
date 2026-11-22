@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Safely roll a Studio hub and its local harnessd to one staged runtime.
+"""Advanced maintenance tool: roll a Studio hub and local harnessd together.
+
+This is not the default for a compatible server-only private update; follow
+``docs/operations/private-server-update.md`` for that path. Keep this tool for
+an explicitly scoped offline/multi-role maintenance operation that needs its
+paired-service and rollback safeguards.
 
 This is deliberately an operator tool, not an installer hook.  It refuses a
 partly specified release and makes its rollback choice explicit in the JSON

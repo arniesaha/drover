@@ -117,13 +117,12 @@ def _as_utc_datetime(value: Any) -> datetime | None:
 
 
 def _db_timestamp_to_utc(value: Any) -> datetime | None:
-    """Restore UTC timezone from a DuckDB TIMESTAMP column value.
+    """Restore UTC timezone from a DuckDB ``TIMESTAMP`` column value.
 
-    Every timestamp column in ``schema.py`` is ``TIMESTAMP``, never
-    ``TIMESTAMPTZ``. Binding an aware datetime converts it to *process-local*
-    wall time and discards the offset; binding a naive datetime stores it
-    verbatim. So a naive datetime read back out of one of those columns means
-    process-local, not UTC::
+    DuckDB control-plane timestamps are ``TIMESTAMP`` values. Binding an
+    aware datetime converts it to *process-local* wall time and discards the
+    offset; binding a naive datetime stores it verbatim. So a naive datetime
+    read back out of one of those columns means process-local, not UTC::
 
         aware 20:00+00:00  ->  stored as 13:00   (in PDT)
         naive 20:00        ->  stored as 20:00
@@ -175,7 +174,26 @@ def _as_db_timestamp(value: Any) -> datetime | None:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    """Return the process-local clock used by DuckDB control tables.
+
+    Kept as a zero-argument seam for deterministic registry callers.
+    """
+    return datetime.now()
+
+
+def _now_for_connection(con: object) -> datetime:
+    """Return the timestamp representation required by this control store.
+
+    DuckDB's control tables are ``TIMESTAMP`` columns whose naive values mean
+    process-local wall time. PostgreSQL's central control tables are
+    ``TIMESTAMPTZ`` and pooled sessions use UTC, so their bindings must remain
+    aware UTC values. The clock seam may supply an aware fixture value, so
+    normalize both branches at this connection boundary.
+    """
+    now = _now()
+    if is_postgres_connection(con):
+        return now.astimezone(timezone.utc)
+    return now.astimezone().replace(tzinfo=None) if now.tzinfo is not None else now
 
 
 #: Awaiting values that mean the agent is blocked on the user, and therefore
@@ -263,6 +281,26 @@ def _is_turn_completion_payload(payload: dict[str, Any]) -> bool:
         return True
     inner = payload.get("payload")
     return isinstance(inner, dict) and inner.get("turn_complete") is True
+
+
+def _completion_turn_id(payload: dict[str, Any]) -> str | None:
+    """Return a structured completion's exact submitted-turn correlation.
+
+    A relay can deliver a terminal status before the hub has persisted the
+    matching ``user_input`` event.  Only the outer StructuredMessage turn id
+    (or its compatibility ``client_turn_id`` spelling) is trustworthy for
+    bridging that ordering race; an uncorrelated terminal status remains
+    bounded by the ordinary event-order window.
+    """
+    inner = payload.get("payload")
+    for candidate in (payload, inner):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("turn_id", "client_turn_id"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
 
 
 def _project_work_item_lifecycle(
@@ -491,8 +529,8 @@ class HarnessRegistry:
         update: dict[str, Any] | None = None,
     ) -> HarnessHost:
         capabilities = validate_capabilities(capabilities, host_id)
-        now = _now()
         with self._connect() as con:
+            now = _now_for_connection(con)
             con.execute(
                 """
                 INSERT INTO harness_hosts (
@@ -587,16 +625,17 @@ class HarnessRegistry:
                     raise HostBusyError(
                         "host has running/awaiting sessions; use --force to retire"
                     )
+                now = _now_for_connection(con)
                 con.execute(
                     "UPDATE harness_hosts SET retired_at = COALESCE(retired_at, ?), "
                     "retired_reason = ?, updated_at = ? WHERE host_id = ?",
-                    [_now(), reason.strip(), _now(), host_id],
+                    [now, reason.strip(), now, host_id],
                 )
                 if is_postgres_connection(con):
                     con.execute(
                         "UPDATE control_credentials SET revoked_at = ? "
                         "WHERE scope = 'host' AND host_id = ? AND revoked_at IS NULL",
-                        [_now(), host_id],
+                        [now, host_id],
                     )
                 con.execute("COMMIT")
             except Exception:
@@ -615,7 +654,7 @@ class HarnessRegistry:
                 "UPDATE harness_hosts SET retired_at = NULL, retired_reason = NULL, "
                 "status = CASE WHEN retired_at IS NOT NULL THEN 'offline' ELSE status END, "
                 "updated_at = ? WHERE host_id = ?",
-                [_now(), host_id],
+                [_now_for_connection(con), host_id],
             )
         return self.get_host(host_id)
 
@@ -670,7 +709,7 @@ class HarnessRegistry:
             con.execute(
                 "UPDATE harness_hosts SET model_catalogs_json = ?, updated_at = ? "
                 "WHERE host_id = ?",
-                [serialized, _now(), host_id],
+                [serialized, _now_for_connection(con), host_id],
             )
 
     def latest_model_catalog(self, host_id: str, harness: str) -> dict[str, Any] | None:
@@ -727,10 +766,10 @@ class HarnessRegistry:
             existing = self.session_by_client_id(client_session_id)
             if existing is not None:
                 return existing
-        now = _now()
-        started_at = _as_utc_datetime(started_at) or now
         session_id = session_id or f"harness-{uuid4()}"
         with self._connect() as con:
+            now = _now_for_connection(con)
+            started_at = _as_utc_datetime(started_at) or now
             con.execute("BEGIN TRANSACTION")
             try:
                 lock = " FOR UPDATE" if is_postgres_connection(con) else ""
@@ -1062,9 +1101,9 @@ class HarnessRegistry:
         ended_at: datetime | None = None,
         summary_session_id: str | None = None,
     ) -> HarnessSession:
-        now = _now()
         ended_at = _as_utc_datetime(ended_at)
         with self._connect() as con:
+            now = _now_for_connection(con)
             previous = con.execute(
                 "SELECT status FROM harness_sessions WHERE session_id = ?", [session_id]
             ).fetchone()
@@ -1072,6 +1111,7 @@ class HarnessRegistry:
                 """
                 UPDATE harness_sessions
                    SET status = ?,
+                       attention_id = CASE WHEN ? IN ('completed', 'terminated', 'errored', 'failed') THEN NULL ELSE attention_id END,
                        updated_at = ?,
                        ended_at = COALESCE(?, ended_at),
                        last_error = ?,
@@ -1079,6 +1119,7 @@ class HarnessRegistry:
                  WHERE session_id = ?
                 """,
                 [
+                    status,
                     status,
                     now,
                     ended_at,
@@ -1099,8 +1140,8 @@ class HarnessRegistry:
     def mark_session_recovered(
         self, session_id: str, native_session_id: str
     ) -> HarnessSession:
-        now = _now()
         with self._connect() as con:
+            now = _now_for_connection(con)
             con.execute(
                 """
                 UPDATE harness_sessions
@@ -1111,10 +1152,11 @@ class HarnessRegistry:
                        lifecycle_generation = lifecycle_generation + 1,
                        last_error = NULL,
                        awaiting = 'input',
+                       attention_id = ?,
                        native_session_id = ?
                  WHERE session_id = ?
                 """,
-                [now, native_session_id, session_id],
+                [now, str(uuid4()), native_session_id, session_id],
             )
         session = self.get_session(session_id)
         if session is None:
@@ -1128,14 +1170,15 @@ class HarnessRegistry:
         awaiting: str | None,
         last_activity: datetime | None = None,
     ) -> None:
-        stamp = _as_utc_datetime(last_activity) or _now()
+        stamp = _as_utc_datetime(last_activity)
         with self._connect() as con:
+            stamp = stamp or _now_for_connection(con)
             # Read the prior value inside the same window as the write: this
             # is the one chokepoint both the local emit() path and the remote
             # /harness/events ingest path funnel through, so a transition seen
             # here is seen exactly once however the event arrived.
             previous = con.execute(
-                "SELECT awaiting, harness, cwd, status FROM harness_sessions "
+                "SELECT awaiting, harness, cwd, status, attention_id FROM harness_sessions "
                 "WHERE session_id = ?",
                 [session_id],
             ).fetchone()
@@ -1143,17 +1186,22 @@ class HarnessRegistry:
             effective_awaiting = (
                 None if status in ARCHIVED_SESSION_STATUSES else awaiting
             )
+            attention_id = (
+                (previous[4] if previous[0] == effective_awaiting else str(uuid4()))
+                if previous is not None and effective_awaiting in _AWAITING_STATES
+                else None
+            )
             con.execute(
                 """
                 UPDATE harness_sessions
-                   SET awaiting = CASE
+                   SET attention_id = ?, awaiting = CASE
                          WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
                          ELSE ?
                        END,
                        last_activity = ?
                  WHERE session_id = ?
                 """,
-                [awaiting, stamp, session_id],
+                [attention_id, awaiting, stamp, session_id],
             )
             # Only a real change notifies. A harness that re-emits "still
             # awaiting input" every few seconds must not produce a banner every
@@ -1457,7 +1505,7 @@ class HarnessRegistry:
                 "UPDATE harness_sessions "
                 "SET native_session_id = ?, updated_at = ? "
                 "WHERE session_id = ?",
-                [native_session_id, _now(), session_id],
+                [native_session_id, _now_for_connection(con), session_id],
             )
 
     def update_session_preferences(
@@ -1469,16 +1517,16 @@ class HarnessRegistry:
     ) -> None:
         if model is None and thinking_effort is None:
             return
-        assignments = ["updated_at = ?"]
-        params: list[Any] = [_now()]
-        if model is not None:
-            assignments.append("model = ?")
-            params.append(model)
-        if thinking_effort is not None:
-            assignments.append("thinking_effort = ?")
-            params.append(thinking_effort)
-        params.append(session_id)
         with self._connect() as con:
+            assignments = ["updated_at = ?"]
+            params: list[Any] = [_now_for_connection(con)]
+            if model is not None:
+                assignments.append("model = ?")
+                params.append(model)
+            if thinking_effort is not None:
+                assignments.append("thinking_effort = ?")
+                params.append(thinking_effort)
+            params.append(session_id)
             con.execute(
                 f"UPDATE harness_sessions SET {', '.join(assignments)} WHERE session_id = ?",
                 params,
@@ -1502,7 +1550,7 @@ class HarnessRegistry:
         # after the last sequenced event at or before their creation timestamp.
         # Never reserve a number owned by a remote structured manager.
         event_id = event_id or f"harness-event-{uuid4()}"
-        created_at = _as_utc_datetime(created_at) or _now()
+        created_at = _as_utc_datetime(created_at)
         normalized = normalize_harness_event(
             event_type=event_type,
             payload=payload,
@@ -1513,6 +1561,7 @@ class HarnessRegistry:
         )
         payload_json = canonical_payload(payload)
         with self._connect() as con:
+            created_at = created_at or _now_for_connection(con)
             dedup_key = event_ingest_identity(
                 con,
                 session_id=session_id,
@@ -1692,7 +1741,9 @@ class HarnessRegistry:
                 seq = record.get("seq")
                 if not isinstance(seq, int) or isinstance(seq, bool):
                     seq = None
-                created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                created_at = _as_utc_datetime(
+                    record.get("created_at")
+                ) or _now_for_connection(con)
                 payload_json = canonical_payload(record.get("payload"))
                 params.append(
                     [
@@ -1904,7 +1955,7 @@ class HarnessRegistry:
                     str(row["session_id"]): row
                     for row in _rows(
                         con,
-                        "SELECT session_id, awaiting, last_activity, "
+                        "SELECT session_id, awaiting, attention_id, last_activity, "
                         "native_session_id, harness, cwd, status "
                         "FROM harness_sessions "
                         f"WHERE session_id IN ({session_placeholders})",
@@ -1937,7 +1988,9 @@ class HarnessRegistry:
                     seq = record.get("seq")
                     if not isinstance(seq, int) or isinstance(seq, bool):
                         seq = None
-                    created_at = _as_utc_datetime(record.get("created_at")) or _now()
+                    created_at = _as_utc_datetime(
+                        record.get("created_at")
+                    ) or _now_for_connection(con)
                     payload_json = canonical_payload(payload)
                     normalized = normalize_harness_event(
                         event_type=event_type,
@@ -2113,16 +2166,19 @@ class HarnessRegistry:
                             for event in raw_projection_events
                         ]
                         awaiting: str | None = None
+                        attention_id = None
                     else:
                         projection_events = sorted(
                             inserted_events,
                             key=lambda event: (
                                 event.get("seq") or 0,
-                                _as_utc_datetime(event.get("created_at")) or _now(),
+                                _as_utc_datetime(event.get("created_at"))
+                                or _now_for_connection(con),
                                 event["event_id"],
                             ),
                         )
                         awaiting = previous.get("awaiting")
+                        attention_id = previous.get("attention_id")
 
                     latest_activity: datetime | None = None
                     native_session_id: str | None = None
@@ -2145,11 +2201,18 @@ class HarnessRegistry:
                             inner_payload = (
                                 raw_payload if isinstance(raw_payload, dict) else {}
                             )
+                        prior_awaiting = awaiting
                         awaiting = _derive_structured_awaiting(
                             event_type=str(event["event_type"]),
                             payload=inner_payload,
                             current=awaiting,
                         )
+                        if awaiting != prior_awaiting:
+                            attention_id = (
+                                str(event["event_id"])
+                                if awaiting in _AWAITING_STATES
+                                else None
+                            )
                         if event["event_type"] == "session.exited":
                             terminal_status = (
                                 "failed"
@@ -2175,7 +2238,7 @@ class HarnessRegistry:
                     con.execute(
                         """
                         UPDATE harness_sessions
-                           SET awaiting = CASE
+                           SET attention_id = ?, awaiting = CASE
                                  WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
                                  ELSE ?
                                END,
@@ -2188,6 +2251,11 @@ class HarnessRegistry:
                          WHERE session_id = ?
                         """,
                         [
+                            (
+                                attention_id
+                                if effective_awaiting in _AWAITING_STATES
+                                else None
+                            ),
                             awaiting,
                             latest_activity,
                             latest_activity,
@@ -2198,7 +2266,7 @@ class HarnessRegistry:
                     )
                     if terminal_status and previous.get("status") != terminal_status:
                         con.execute(
-                            "UPDATE harness_sessions SET status = ?, awaiting = NULL WHERE session_id = ?",
+                            "UPDATE harness_sessions SET status = ?, awaiting = NULL, attention_id = NULL WHERE session_id = ?",
                             [terminal_status, session_id],
                         )
                     if previous.get("awaiting") != effective_awaiting or (
@@ -2594,6 +2662,230 @@ class HarnessRegistry:
             if isinstance(turn_id, str) and turn_id:
                 turn_ids.append(turn_id)
         return turn_ids
+
+    def has_user_input_turn_id(self, session_id: str, turn_id: str) -> bool:
+        # Exact durable client-turn identity; not a bounded replay-cache window.
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT event_id FROM harness_events WHERE session_id = ? AND event_type = 'user_input'",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        for payload_json in payloads.values():
+            try:
+                payload = json.loads(payload_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("turn_id") == turn_id:
+                return True
+        return False
+
+    def has_completed_turn(self, session_id: str, turn_id: str) -> bool:
+        """Retain completion evidence for one durably submitted turn.
+
+        Later status/awaiting projections cannot erase completion. A different
+        user input closes the turn's event window, so an older completion can
+        never settle a successor claim. Read payloads through the control-store
+        abstraction, including PostgreSQL's separate payload relation.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type FROM harness_events
+                WHERE session_id = ? AND event_type IN ('user_input', 'status')
+                ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        pending_exact_completion = False
+        for event_id, event_type in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event_type == "user_input":
+                submitted_turn_id = payload.get("turn_id")
+                if submitted and submitted_turn_id != turn_id:
+                    return False
+                submitted = submitted_turn_id == turn_id
+                if submitted and pending_exact_completion:
+                    return True
+                continue
+
+            inner = payload.get("payload", payload)
+            is_completion = _is_turn_completion_payload(payload) or (
+                isinstance(inner, dict) and "exited" in inner
+            )
+            if not is_completion:
+                continue
+            completed_turn_id = _completion_turn_id(payload)
+            if completed_turn_id is not None:
+                # A terminal status for another submitted turn can never
+                # settle this claim.  For our exact turn, retain the
+                # correlation until the durable user_input arrives: remote
+                # relay delivery may legitimately win that local write race.
+                if completed_turn_id != turn_id:
+                    continue
+                if submitted:
+                    return True
+                pending_exact_completion = True
+            elif submitted:
+                # Preserve legacy drivers that do not emit a terminal turn
+                # identifier, but only within the ordinary submission window.
+                return True
+        return False
+
+    def has_successfully_completed_turn(self, session_id: str, turn_id: str) -> bool:
+        """Require one exact submitted turn to finish successfully.
+
+        This is stricter than :meth:`has_completed_turn`: deferred work
+        verification cannot use a terminal status from an older turn, a newer
+        active turn, or a non-zero/unknown terminal outcome as authority.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type FROM harness_events
+                WHERE session_id = ? AND event_type IN ('user_input', 'status')
+                ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        successful = False
+        pending_success = False
+        for event_id, event_type in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if event_type == "user_input":
+                submitted_turn_id = payload.get("turn_id")
+                if submitted and submitted_turn_id != turn_id:
+                    return False
+                submitted = submitted_turn_id == turn_id
+                if submitted and pending_success:
+                    successful = True
+                continue
+            completed_turn_id = _completion_turn_id(payload)
+            if completed_turn_id != turn_id:
+                continue
+            inner = payload.get("payload", payload)
+            if not isinstance(inner, dict) or "exited" not in inner:
+                continue
+            if inner.get("exited") != 0:
+                return False
+            if submitted:
+                successful = True
+            else:
+                pending_success = True
+        return submitted and successful
+
+    def owner_turn_failure_category(self, session_id: str, turn_id: str) -> str | None:
+        """Return a bounded structured infrastructure category for one turn.
+
+        Only a persisted tool-result category qualifies.  Legacy events may
+        use the exact daemon JSON response as a compatibility shape; prose,
+        assistant output, and arbitrary tool output are never interpreted.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type, content_preview
+                     FROM harness_events
+                    WHERE session_id = ?
+                      AND event_type IN ('user_input', 'tool_result')
+                 ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+        submitted = False
+        for event_id, event_type, preview in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if event_type == "user_input":
+                if submitted and (
+                    not isinstance(payload, dict) or payload.get("turn_id") != turn_id
+                ):
+                    return None
+                submitted = (
+                    isinstance(payload, dict) and payload.get("turn_id") == turn_id
+                )
+                continue
+            if not submitted or not isinstance(payload, dict):
+                continue
+            if payload.get("failure_category") == "authentication_required":
+                return "authentication_required"
+            # Compatibility for already-persisted structured Codex events:
+            # parse only the exact JSON daemon response, never free text.
+            try:
+                legacy = json.loads(str(preview or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if legacy == {"error": "authentication required"}:
+                return "authentication_required"
+        return None
+
+    def coordinator_turn_failure_category(self, session_id: str) -> str | None:
+        """Return a typed failure for the most recent coordinator turn.
+
+        A work-coordinator session has one initial submitted turn per launch.
+        Recovery may only use the same persisted tool-result category as a
+        native-owner turn; assistant text is never an infrastructure signal.
+        Selecting the last durable user-input id also prevents an earlier
+        failed turn from rearming a session after it has received new work.
+        """
+        turn_ids = self.recent_user_input_turn_ids(session_id, limit=1)
+        if not turn_ids:
+            return None
+        return self.owner_turn_failure_category(session_id, turn_ids[-1])
+
+    def work_coordinator_expected_effect_artifact(
+        self, session_id: str, run_id: str
+    ) -> str | None:
+        """Read the hub-signed immutable effect binding for one worker run."""
+        if not session_id or not run_id:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT expected_effect_artifact FROM factory_observer_runs
+                     WHERE session_id = ? AND run_id = ?""",
+                [session_id, run_id],
+            ).fetchone()
+        artifact = row[0] if row else None
+        return artifact if isinstance(artifact, str) and artifact else None
+
+    def work_coordinator_committed_provenance(
+        self, session_id: str, run_id: str
+    ) -> bool | None:
+        """Read the immutable hub-signed provenance mode for one worker run."""
+        if not session_id or not run_id:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT committed_provenance FROM factory_observer_runs
+                     WHERE session_id = ? AND run_id = ?""",
+                [session_id, run_id],
+            ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], bool) else None
+
+    def work_coordinator_m2_ack_pending(
+        self, session_id: str, run_id: str
+    ) -> bool | None:
+        """Read the immutable hub-signed M2 handoff selection for one worker run."""
+        if not session_id or not run_id:
+            return None
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT m2_ack_pending FROM factory_observer_runs
+                     WHERE session_id = ? AND run_id = ?""",
+                [session_id, run_id],
+            ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], bool) else None
 
     def completed_turn_kinds(self, session_ids: list[str]) -> dict[str, str]:
         """Classify idle turns without changing the session's resumable state.
@@ -3009,9 +3301,9 @@ class HarnessRegistry:
         the hub stays durable indefinitely.  Per-session rank keeps the 500
         newest acknowledgements even when they are younger than seven days.
         """
-        cutoff = _as_utc_datetime(now) or _now()
-        cutoff -= timedelta(days=7)
+        cutoff = _as_utc_datetime(now)
         with self._connect() as con:
+            cutoff = (cutoff or _now_for_connection(con)) - timedelta(days=7)
             rows = con.execute(
                 """
                 WITH ranked AS MATERIALIZED (

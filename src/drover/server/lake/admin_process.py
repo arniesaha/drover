@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from .query_process import _rss
 from .runtime import LakeError
@@ -17,7 +18,11 @@ RSS_CEILING = 5 * 1024**3 // 2
 
 
 def run_admin(
-    request: dict, root: Path, *, rss_ceiling: int = RSS_CEILING
+    request: dict,
+    root: Path,
+    *,
+    rss_ceiling: int = RSS_CEILING,
+    check_fence: Callable[[], None] | None = None,
 ) -> tuple[dict, int]:
     """Run one disposable worker under a caller-selected aggregate RSS cap.
 
@@ -25,6 +30,15 @@ def run_admin(
     override at this process boundary prevents it from changing the server or
     standalone verification safety budgets.
     """
+    # This bounds a live supervisor's response to fence loss; it is not a
+    # hard-parent-death or arbitrary external-writer exclusion guarantee.
+    mutates_catalog = request.get("operation") == "publish" or (
+        request.get("operation") == "deprecate_legacy" and request.get("apply")
+    )
+    if mutates_catalog and check_fence is None:
+        raise LakeError("lake_admin_fence_required")
+    if check_fence is not None:
+        check_fence()
     job = root / "admin-request.json"
     reply = root / "admin-reply.json"
     job.write_text(json.dumps({**request, "reply": str(reply)}))
@@ -44,6 +58,8 @@ def run_admin(
         )
         try:
             while child.poll() is None:
+                if check_fence is not None:
+                    check_fence()
                 try:
                     coordinator_rss = _rss(os.getpid())
                     child_rss = _rss(child.pid)
@@ -63,6 +79,8 @@ def run_admin(
                     failure = "supervisor_partition_deadline"
                     raise LakeError("rebuild_partition_deadline_exceeded")
                 time.sleep(0.02)
+            if check_fence is not None:
+                check_fence()
             if child.returncode or not reply.is_file():
                 failure = "child_process"
                 raise LakeError("rebuild_partition_process_failed")

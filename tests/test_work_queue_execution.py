@@ -171,6 +171,15 @@ def test_uncertain_intent_blocks_even_a_different_request_key(service):
     assert len(service.harness.calls) == 1
 
 
+def test_running_nonlocal_work_cannot_defer_verification(service):
+    work = launch(service)
+
+    with pytest.raises(ValueError, match="work session must complete"):
+        update(service, work, "complete", estimated_cost=5)
+
+    assert not service.store.events(identity(work["run_key"], "complete", None))
+
+
 def test_failed_behavioral_check_cannot_close(service):
     work = launch(service)
     verify = complete(service, work)

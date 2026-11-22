@@ -139,8 +139,28 @@
           "title": "Checkpoint",
           "type": "string"
         },
+        "committed_provenance": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Committed Provenance"
+        },
         "completion_receipts": {
           "$ref": "#/$defs/CompletionReceipts"
+        },
+        "delivery_role": {
+          "enum": [
+            "standard",
+            "integration_serialized"
+          ],
+          "title": "Delivery Role",
+          "type": "string"
         },
         "events": {
           "items": {
@@ -149,6 +169,21 @@
           "maxItems": 50,
           "title": "Events",
           "type": "array"
+        },
+        "expected_effect_artifact": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Effect Artifact"
         },
         "expected_revision": {
           "minimum": 0,
@@ -174,6 +209,28 @@
           },
           "title": "Inbox Counts",
           "type": "object"
+        },
+        "integration_serialization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IntegrationSerialization"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "m2_ack_pending": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "M2 Ack Pending"
         },
         "next_action": {
           "anyOf": [
@@ -270,6 +327,8 @@
         "checkpoint",
         "authority_scope",
         "scope_limit",
+        "delivery_role",
+        "integration_serialization",
         "owner_handoff",
         "owner",
         "worker_state",
@@ -285,11 +344,75 @@
       "title": "ContinuityProjection",
       "type": "object"
     },
+    "DeliveryEscalation": {
+      "additionalProperties": false,
+      "description": "Sanitized durable health signal for an unacknowledged observation.",
+      "properties": {
+        "attempts": {
+          "anyOf": [
+            {
+              "minimum": 3,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempts"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "const": "authentication_required",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "state": {
+          "enum": [
+            "delivery_stalled",
+            "delivery_blocked",
+            "superseded_by_terminal"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "successor_wake_id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Successor Wake Id"
+        },
+        "wake_id": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Wake Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "wake_id"
+      ],
+      "title": "DeliveryEscalation",
+      "type": "object"
+    },
     "InboxEntry": {
       "additionalProperties": false,
       "properties": {
         "attempts": {
-          "maximum": 3,
           "minimum": 0,
           "title": "Attempts",
           "type": "integer"
@@ -322,6 +445,19 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "superseded_by_terminal": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseded By Terminal"
         }
       },
       "required": [
@@ -396,6 +532,58 @@
       "title": "InboxReport",
       "type": "object"
     },
+    "IntegrationSerialization": {
+      "additionalProperties": false,
+      "description": "Read-only reservation state for a serialized integration delivery.",
+      "properties": {
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "held_by_run": {
+          "title": "Held By Run",
+          "type": "boolean"
+        },
+        "key": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Key",
+          "type": "string"
+        },
+        "owner_epoch": {
+          "minimum": 0,
+          "title": "Owner Epoch",
+          "type": "integer"
+        },
+        "repository": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Repository",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "reserved",
+            "released"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "key",
+        "generation",
+        "owner_epoch",
+        "state",
+        "held_by_run"
+      ],
+      "title": "IntegrationSerialization",
+      "type": "object"
+    },
     "OwnerAction": {
       "additionalProperties": false,
       "properties": {
@@ -426,6 +614,17 @@
         "authorized": {
           "title": "Authorized",
           "type": "boolean"
+        },
+        "escalation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryEscalation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "event_id": {
           "pattern": "^[a-f0-9]{64}$",

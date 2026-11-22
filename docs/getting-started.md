@@ -56,6 +56,24 @@ hub prints its one pasted setup command with `drover-server pair-host`; see
 The installer brings its own [uv](https://docs.astral.sh/uv/) if you do not
 have it.
 
+## Docker Compose hub
+
+To run the hub and its PostgreSQL control store in containers on one machine:
+
+```bash
+git clone https://github.com/arniesaha/drover.git
+cd drover
+cp deploy/compose.env.example deploy/.env   # set both values to long random strings
+docker compose -f deploy/compose.yaml up -d --build
+```
+
+Open `http://127.0.0.1:7080/ui`, then pair the browser with the code from
+`docker compose -f deploy/compose.yaml exec hub drover-server --config /etc/drover/config.toml pair`.
+The hub is published on loopback only; set `[server] advertised_url` in
+`deploy/compose/config.toml` and expose it through Tailscale Serve or a private
+address before pairing phones or other hosts. Harness hosts keep running
+`drover-harnessd` natively and join with `drover-server pair-host`.
+
 ## Railway / generic cloud hub
 
 Run the hub image built from [`deploy/Dockerfile`](../deploy/Dockerfile), not
@@ -322,3 +340,7 @@ uv run drover-server mcp tools
 Agent-log collection and OTLP ingestion are optional extensions. See
 [Integrations](integrations.md) and [Context Store](context-store.md) after the
 command plane works end to end.
+
+## Verify A Public Release
+
+Use a pinned GitHub release and its published checksums. `install.sh --verify-release` performs a disposable verification without selecting a runtime or changing `~/.drover`. Private test builds and locally named runtime aliases are not public release artifacts; do not use their version labels for an upgrade decision.

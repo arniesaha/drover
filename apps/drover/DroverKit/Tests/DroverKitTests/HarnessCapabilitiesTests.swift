@@ -37,7 +37,7 @@ struct HarnessCapabilityDecodingTests {
         let golden = try host("test-host", in: goldenSnapshot())
         let studio = try host("studio", in: mixedSnapshot())
         #expect(golden.harnessOffers.map(\.name)
-            == ["shell", "claude-code", "codex", "agy", "deepseek-harness"])
+            == ["shell", "claude-code", "codex", "agy", "cursor", "deepseek-harness"])
         for offer in golden.harnessOffers {
             guard case .v1 = offer.advertisement else {
                 Issue.record("\(offer.name) is not a v1 row")
@@ -58,6 +58,11 @@ struct HarnessCapabilityDecodingTests {
 
         let codex = try #require(studio.offer(named: "codex")).capabilities
         #expect(!codex.approvals && codex.worktree && codex.turnPreferences)
+
+        let cursor = try #require(studio.offer(named: "cursor")).capabilities
+        #expect(!cursor.approvals && cursor.interrupt && cursor.nativeResume)
+        #expect(cursor.modelCatalog && cursor.interactiveAuth)
+        #expect(!cursor.worktree && cursor.turnPreferences && cursor.attachments.isEmpty)
 
         let deepseek = try #require(studio.offer(named: "deepseek-harness")).capabilities
         #expect(!deepseek.interactiveAuth && deepseek.modelCatalog)
@@ -184,7 +189,7 @@ struct HarnessCapabilityDecodingTests {
     @Test func launchableOrderIsStructuredFirstThenHostOrder() throws {
         let studio = try host("studio", in: mixedSnapshot())
         #expect(studio.launchableOffers.map(\.name) == [
-            "claude-code", "codex", "agy", "deepseek-harness",
+            "claude-code", "codex", "agy", "cursor", "deepseek-harness",
             "fixture-lab", "fixture-wildcard", "shell",
         ])
         // Advertised but switched off by the host: not launchable, and not
@@ -224,6 +229,8 @@ struct HarnessControlsTests {
                            midSession: true, signIn: true, worktree: true, images: true)),
         ("agy", Expected(mode: .structured, approvals: false, interrupt: true, models: true,
                          midSession: true, signIn: true, worktree: true, images: true)),
+        ("cursor", Expected(mode: .structured, approvals: false, interrupt: true, models: true,
+                            midSession: true, signIn: true, worktree: false, images: false)),
         ("deepseek-harness", Expected(mode: .structured, approvals: false, interrupt: true, models: true,
                                       midSession: true, signIn: false, worktree: true, images: true)),
         ("shell", Expected(mode: .pty, approvals: false, interrupt: false, models: false,
@@ -478,7 +485,7 @@ struct CapabilityDrivenChatTests {
         #expect(claude.runPreferences.isCatalogAvailable)
         // Handoff targets are structured launchers only: never the PTY shell.
         #expect(claude.handoffHarnesses == [
-            "claude-code", "codex", "agy", "deepseek-harness", "fixture-lab", "fixture-wildcard",
+            "claude-code", "codex", "agy", "cursor", "deepseek-harness", "fixture-lab", "fixture-wildcard",
         ])
 
         let lab = try await loadedChat("s-lab", harness: "fixture-lab")

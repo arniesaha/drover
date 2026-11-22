@@ -410,6 +410,55 @@ def test_initial_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
     ]
 
 
+def test_work_coordinator_mcp_uses_bound_stdio_bridge_without_listener():
+    env = {
+        "DROVER_WORK_CONTROL_URL": "http://127.0.0.1:28180",
+        "DROVER_WORK_RUN_KEY": "a" * 32,
+        "DROVER_WORK_GOAL_ID": "native-canary-924-848",
+        "DROVER_WORK_ITEM_NUMBER": "41",
+        "DROVER_MCP_TOKEN": "launch-only-bearer",
+    }
+    driver = CodexDriver(["codex"], None, lambda _message: None, env=env)
+
+    argv = driver._argv_for("complete the bound work")
+
+    assert argv[:7] == [
+        "codex",
+        "-c",
+        f"mcp_servers.drover.command={json.dumps(sys.executable)}",
+        "-c",
+        'mcp_servers.drover.args=["-m", "drover.server.work_queue.worker_mcp"]',
+        "-c",
+        'mcp_servers.drover.env_vars=["DROVER_WORK_CONTROL_URL", "DROVER_MCP_TOKEN", "DROVER_WORK_RUN_KEY", "DROVER_WORK_GOAL_ID", "DROVER_WORK_ITEM_NUMBER", "PYTHONPATH"]',
+    ]
+    assert "launch-only-bearer" not in " ".join(argv)
+    assert argv[-2:] == ["--", "complete the bound work"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.invalid",
+        "http://127.0.0.1:28180/control",
+        "http://user@127.0.0.1:28180",
+        "http://127.0.0.1:28180?token=forbidden",
+        "http://[::1:28182",
+        "http://127.0.0.1:65536",
+    ],
+)
+def test_work_coordinator_mcp_rejects_invalid_control_routes(url):
+    env = {
+        "DROVER_WORK_CONTROL_URL": url,
+        "DROVER_WORK_RUN_KEY": "a" * 32,
+        "DROVER_WORK_GOAL_ID": "native-canary-924-848",
+        "DROVER_WORK_ITEM_NUMBER": "41",
+        "DROVER_MCP_TOKEN": "launch-only-bearer",
+    }
+    driver = CodexDriver(["codex"], None, lambda _message: None, env=env)
+
+    assert "mcp_servers.drover" not in " ".join(driver._argv_for("work"))
+
+
 def test_resume_turn_argv_is_otherwise_unchanged_for_an_ordinary_prompt():
     driver = CodexDriver(
         ["codex"], None, lambda _message: None, native_session_id="thread-1"
@@ -506,6 +555,41 @@ def test_parse_turn_completed_marks_awaiting_input():
     assert message.payload["turn_complete"] is True
     assert message.payload["awaiting"] == "input"
     assert message.payload["usage"]["output_tokens"] == 67
+
+
+def test_command_result_projects_exact_daemon_auth_category():
+    messages = _driver([]).parse_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-auth",
+                    "type": "command_execution",
+                    "aggregated_output": '{"error":"authentication required"}',
+                    "exit_code": 22,
+                    "status": "failed",
+                },
+            }
+        )
+    )
+    assert messages[0].type == "tool_result"
+    assert messages[0].payload["failure_category"] == "authentication_required"
+
+
+def test_command_result_does_not_classify_prose_as_daemon_auth():
+    messages = _driver([]).parse_line(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-prose",
+                    "type": "command_execution",
+                    "aggregated_output": "authentication required",
+                },
+            }
+        )
+    )
+    assert "failure_category" not in messages[0].payload
 
 
 def test_parse_command_execution_started_and_completed():

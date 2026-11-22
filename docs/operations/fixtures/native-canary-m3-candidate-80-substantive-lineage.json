@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "workspace_id": "native-canary-924-848",
+  "goal_id": "native-canary-924-848",
+  "items": [
+    {
+      "number": 80,
+      "state": "open",
+      "body": "M3 substantive committed-provenance lineage fixture. Only if the hub-signed coordinator binding explicitly permits committed provenance for this exact work run, use only the daemon-assigned disposable worktree. Work role: first write `.drover-native-canary/m3-80-analysis.json` with the bounded observed requirement that a new pure local helper must classify non-negative integers into even and odd counts while rejecting booleans, negative integers, and non-integers; include alternatives considered, the chosen minimal implementation, and why it is isolated and harmless. Then create tracked `tests/fixtures/native_canary_m3_80.py` implementing exactly that helper and `tests/test_native_canary_m3_80.py` with deterministic standard-library checks for valid input and each rejected class. Run exactly `python3 tests/test_native_canary_m3_80.py` and record the actual command, exit status, and bounded result in `.drover-native-canary/m3-80-focused-tests.json`. Create `.drover-native-canary/m3-80-implementation.json` naming the scoped source/test paths and the analysis it implements. Create `.drover-native-canary/m3-80-review-request.json` containing the parent commit SHA and SHA-256 hashes of only the already-written analysis, implementation, focused-test evidence, source, and test files; it must not hash the final effect. Include verifier questions (recompute every listed hash; inspect the bounded analysis; rerun the exact test; reject missing, changed, or untracked-only evidence) and the only permitted next-action recommendation: `verified` if all checks pass, otherwise no verified report. After that request is complete, create `.drover-native-canary/source-task-80.json` with candidate 80, the same parent commit SHA, the named lineage paths, the review-request path, and the SHA-256 of the completed review request. It must not contain its own hash. This is the required acyclic construction order. Before `drover_work_update(action=complete)`, commit exactly these two tracked files and five ignored JSON evidence files on this assigned session branch, using `git add -f` only for `.drover-native-canary` files. Invoke complete without optional `evidence_key` or `estimated_cost`. If the signed binding does not permit it, do not commit or create an effect; report blocked. Verify role: do not create, alter, commit, or reconstruct anything. Inspect only the committed parent files in the assigned verifier worktree, recompute the recorded hashes, inspect the bounded analysis and scoped implementation, rerun exactly `python3 tests/test_native_canary_m3_80.py`, and only if every review question passes report `drover_work_update(action=verified, behavioral_passed=true, checks_rerun=true, evidence_key=m3-80-reviewed-parent)`, then finish the structured turn. Do not modify configuration, credentials, network resources, external services, or deployment state.",
+      "created_at": "2026-11-21T00:00:00Z",
+      "labels": [
+        "goal:native-canary-924-848",
+        "agent:nix",
+        "status:queued"
+      ],
+      "expected_effect_artifact": "local-file:.drover-native-canary/source-task-80.json"
+    }
+  ]
+}

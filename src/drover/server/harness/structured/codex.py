@@ -39,10 +39,12 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from drover.server.harness.structured.driver import EmitFn, StructuredMessage
 from drover.server.harness.structured.git_changes import capture_head, changed_paths
@@ -141,6 +143,60 @@ def resolve_last_context_input_tokens(
         return None
 
 
+def _bound_work_mcp_overrides(env: dict[str, str]) -> list[str]:
+    """Return ephemeral stdio-MCP config for one signed coordinator worker.
+
+    The bridge talks to the existing authenticated hub control route.  It does
+    not create an HTTP MCP listener or edit the shared CODEX_HOME.
+    """
+    required = (
+        "DROVER_WORK_CONTROL_URL",
+        "DROVER_WORK_RUN_KEY",
+        "DROVER_WORK_GOAL_ID",
+        "DROVER_WORK_ITEM_NUMBER",
+        "DROVER_MCP_TOKEN",
+    )
+    if not all(isinstance(env.get(key), str) and env[key] for key in required):
+        return []
+    try:
+        parsed = urlparse(env["DROVER_WORK_CONTROL_URL"])
+    except ValueError:
+        return []
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return []
+    try:
+        if parsed.port is None or not 1 <= parsed.port <= 65535:
+            return []
+        if int(env["DROVER_WORK_ITEM_NUMBER"]) <= 0:
+            return []
+    except ValueError:
+        return []
+    return [
+        f"mcp_servers.drover.command={json.dumps(sys.executable)}",
+        "mcp_servers.drover.args="
+        + json.dumps(["-m", "drover.server.work_queue.worker_mcp"]),
+        "mcp_servers.drover.env_vars="
+        + json.dumps(
+            [
+                "DROVER_WORK_CONTROL_URL",
+                "DROVER_MCP_TOKEN",
+                "DROVER_WORK_RUN_KEY",
+                "DROVER_WORK_GOAL_ID",
+                "DROVER_WORK_ITEM_NUMBER",
+                "PYTHONPATH",
+            ]
+        ),
+    ]
+
+
 class CodexDriver:
     """Owns one `codex exec` subprocess per turn; no persistent process."""
 
@@ -183,6 +239,7 @@ class CodexDriver:
         self._closed = False
         self._git_base: str | None = None
         self._git_turn_id: str | None = None
+        self._bound_work_mcp_overrides = _bound_work_mcp_overrides(self.env)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -293,6 +350,8 @@ class CodexDriver:
         thinking_effort: str | None = None,
     ) -> list[str]:
         command = list(self.command)
+        for override in self._bound_work_mcp_overrides:
+            command.extend(["-c", override])
         if model:
             command.extend(["--model", model])
         if thinking_effort:
@@ -503,6 +562,24 @@ class CodexDriver:
             ]
         return []  # e.g. agent_message item.started, if it ever occurs
 
+    @staticmethod
+    def _tool_result_failure_category(output: object) -> str | None:
+        """Classify only a structured daemon authentication response.
+
+        Tool output stays in the transcript.  This metadata is deliberately
+        narrower than text matching: it accepts exactly the daemon's JSON
+        authorization response and nothing an assistant merely says.
+        """
+        if not isinstance(output, str):
+            return None
+        try:
+            payload = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if payload == {"error": "authentication required"}:
+            return "authentication_required"
+        return None
+
     def _on_item_completed(self, obj: dict[str, Any]) -> list[StructuredMessage]:
         item = obj.get("item") or {}
         item_type = item.get("type")
@@ -538,6 +615,12 @@ class CodexDriver:
                         "tool_use_id": item.get("id"),
                         "exit_code": item.get("exit_code"),
                         "status": item.get("status"),
+                        **(
+                            {"failure_category": category}
+                            if (category := self._tool_result_failure_category(output))
+                            is not None
+                            else {}
+                        ),
                         # Everything else codex reported, minus the output
                         # itself: `text` above already carries it, and shell
                         # output is the largest thing a session produces. Sent

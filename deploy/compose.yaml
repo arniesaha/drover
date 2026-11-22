@@ -1,0 +1,77 @@
+# One-command Drover hub: PostgreSQL 17 control store plus the hub image.
+#
+#   cp deploy/compose.env.example deploy/.env    # then set both secrets
+#   docker compose -f deploy/compose.yaml up -d --build
+#   open http://127.0.0.1:7080/ui
+#   docker compose -f deploy/compose.yaml exec hub drover-server --config /etc/drover/config.toml pair
+#
+# Harness hosts (drover-harnessd) stay on your workstations and join with
+# `drover-server pair-host`. See docs/design/hub-container.md.
+name: drover
+
+x-hub-env: &hub-env
+  DROVER_CONTROL_DSN: postgresql://drover:${DROVER_POSTGRES_PASSWORD:?set DROVER_POSTGRES_PASSWORD in deploy/.env}@postgres:5432/drover
+  DROVER_API_TOKEN: ${DROVER_API_TOKEN:?set DROVER_API_TOKEN in deploy/.env}
+
+services:
+  postgres:
+    # Same pinned image CI uses: PostgreSQL 17 with pgvector, which /readyz
+    # requires for session embeddings and semantic recall.
+    image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: drover
+      POSTGRES_DB: drover
+      POSTGRES_PASSWORD: ${DROVER_POSTGRES_PASSWORD:?set DROVER_POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - drover-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drover -d drover"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Creates or upgrades the control-store schema, then exits.
+  control-store-init:
+    image: drover-hub:local
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["--config", "/etc/drover/config.toml", "control-store", "init"]
+    environment: *hub-env
+    volumes:
+      - ./compose/config.toml:/etc/drover/config.toml:ro
+      - drover-data:/var/lib/drover
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  hub:
+    image: drover-hub:local
+    restart: unless-stopped
+    environment: *hub-env
+    volumes:
+      - ./compose/config.toml:/etc/drover/config.toml:ro
+      - drover-data:/var/lib/drover
+    ports:
+      # Loopback only. Reach it from other devices through Tailscale Serve
+      # or a private LAN address you choose, never the public internet.
+      - "127.0.0.1:7080:7080"
+    depends_on:
+      control-store-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7080/healthz', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  drover-postgres:
+  drover-data:

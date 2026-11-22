@@ -140,6 +140,42 @@ class StructuredSessionManager:
         finally:
             entry.lock.release()
 
+    def turn_in_flight(self, session_id: str) -> bool | None:
+        """Whether this session has a structured turn in flight right now.
+
+        This is deliberately separate from :meth:`is_busy`, which answers
+        "would a restart cut work off?" and therefore reports any live
+        persistent driver as busy even while it is parked on user input.
+        Hub continuity settlement needs the narrower live-turn question, so
+        reusing ``is_busy`` there fenced every reused Claude Code (or other
+        persistent) owner session forever.
+
+        ``None`` means unknown: no live manager entry for the session.
+        """
+        with self._entries_lock:
+            entry = self._entries.get(session_id)
+        if entry is None:
+            return None
+        if not entry.driver.is_alive():
+            return False
+        # A dispatch or an event write in progress holds entry.lock.
+        if not entry.lock.acquire(blocking=False):
+            return True
+        try:
+            if entry.awaiting == "approval":
+                return True
+            if getattr(entry.adapter, "persistent_turn_guard", False):
+                with entry.turn_lock:
+                    return bool(entry.turn_active)
+            has_turn_in_flight = getattr(entry.driver, "has_turn_in_flight", None)
+            if callable(has_turn_in_flight):
+                return bool(has_turn_in_flight())
+            # No adapter-level turn signal: fall back to the live driver
+            # stream, which sets ``awaiting=input`` when a turn completes.
+            return entry.awaiting != "input"
+        finally:
+            entry.lock.release()
+
     def harness_for(self, session_id: str) -> str | None:
         with self._entries_lock:
             entry = self._entries.get(session_id)

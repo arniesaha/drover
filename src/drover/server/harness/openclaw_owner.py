@@ -98,6 +98,28 @@ class OwnerToolCall(WireModel):
     ]
 
 
+class DeliveryEscalation(WireModel):
+    """Sanitized durable health signal for an unacknowledged observation."""
+
+    state: Literal["delivery_stalled", "delivery_blocked", "superseded_by_terminal"]
+    wake_id: EventId
+    attempts: Annotated[int, Field(ge=3)] | None = None
+    reason: Literal["authentication_required"] | None = None
+    successor_wake_id: EventId | None = None
+
+    @model_validator(mode="after")
+    def check_shape(self):
+        if self.state == "delivery_stalled" and self.attempts is None:
+            raise ValueError("stalled delivery needs attempts")
+        if self.state == "delivery_blocked" and self.reason is None:
+            raise ValueError("blocked delivery needs a typed reason")
+        if self.state != "delivery_blocked" and self.reason is not None:
+            raise ValueError("only blocked delivery carries a failure reason")
+        if self.state == "superseded_by_terminal" and self.successor_wake_id is None:
+            raise ValueError("superseded delivery needs terminal successor")
+        return self
+
+
 class OwnerAction(WireModel):
     action_id: str
     event_id: EventId
@@ -115,6 +137,7 @@ class OwnerAction(WireModel):
     authority_scope: Scope
     authorized: bool
     action_intent: ActionIntentReceipt | None = None
+    escalation: DeliveryEscalation | None = None
 
     @model_validator(mode="after")
     def check_authority(self):
@@ -133,6 +156,8 @@ class OwnerAction(WireModel):
         value = handler(self)
         if value.get("action_intent") is None:
             value.pop("action_intent")
+        if value.get("escalation") is None:
+            value.pop("escalation")
         return value
 
 
@@ -188,9 +213,23 @@ class InboxReport(WireModel):
 class InboxEntry(WireModel):
     event_id: EventId
     state: Literal["pending", "delivered", "exhausted"]
-    attempts: Annotated[int, Field(ge=0, le=3)]
+    # Native start observations can retry after transient owner outages;
+    # their persisted identity and backoff remain bounded by the hub contract.
+    attempts: Annotated[int, Field(ge=0)]
     next_delivery_at: datetime | None
     report: InboxReport
+    superseded_by_terminal: EventId | None = None
+
+
+class IntegrationSerialization(WireModel):
+    """Read-only reservation state for a serialized integration delivery."""
+
+    repository: Id
+    key: Id
+    generation: Annotated[int, Field(ge=1)]
+    owner_epoch: Annotated[int, Field(ge=0)]
+    state: Literal["reserved", "released"]
+    held_by_run: bool
 
 
 class ContinuityProjection(WireModel):
@@ -203,6 +242,17 @@ class ContinuityProjection(WireModel):
     checkpoint: Checkpoint
     authority_scope: Scope
     scope_limit: Literal["commit_only", "publish_review", "explicit_approval_required"]
+    delivery_role: Literal["standard", "integration_serialized"]
+    # Older hubs do not project this field.  Keep that reply compatible while
+    # accepting the optional candidate-bound attestation from newer hubs.
+    expected_effect_artifact: Checkpoint | None = None
+    # New signed runs carry an explicit bool. A pre-migration run has no
+    # immutable provenance selection, which remains an explicit wire unknown.
+    committed_provenance: bool | None = None
+    # A signed M2 run may intentionally hand off only after receipt completion.
+    # Legacy rows remain null; ordinary new runs carry false.
+    m2_ack_pending: bool | None = None
+    integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease
     worker_state: Literal[

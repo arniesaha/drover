@@ -8,7 +8,7 @@ from drover.server.harness.adapters import HarnessAdapterRegistry, LaunchRequest
 from drover.server.harness.auth import default_auth_adapters
 from drover.server.harness.daemon import HarnessDaemonState
 from drover.server.harness.model_catalog import default_model_catalog_service
-from drover.server.harness.structured import agy, claude, codex, deepseek
+from drover.server.harness.structured import agy, claude, codex, cursor, deepseek
 from drover.server.harness.structured.adapters import BUILTIN_ADAPTERS
 
 
@@ -17,6 +17,7 @@ def test_every_builtin_resolves_with_its_existing_policy():
         "claude-code": (False, True, True, True),
         "codex": (True, False, True, True),
         "agy": (True, False, True, True),
+        "cursor": (False, False, True, True),
         "deepseek-harness": (True, False, False, True),
     }
     assert set(BUILTIN_ADAPTERS.ids()) == set(expected)
@@ -34,6 +35,7 @@ def test_every_builtin_resolves_with_its_existing_policy():
         ("claude-code", claude.ClaudeDriver, ["--resume", "native-1"]),
         ("codex", codex.CodexDriver, []),
         ("agy", agy.AgyDriver, ["--conversation", "native-1"]),
+        ("cursor", cursor.CursorDriver, []),
         ("deepseek-harness", deepseek.DeepSeekDriver, []),
     ],
 )
@@ -57,6 +59,8 @@ def test_adapter_constructs_existing_driver_without_starting_it(
         assert driver._thread_id == "native-1"
     elif harness_id == "deepseek-harness":
         assert driver._native_session_id == "native-1"
+    elif harness_id == "cursor":
+        assert driver.native_session_id == "native-1"
     else:
         assert driver.native_session_id == "native-1"
 
@@ -66,6 +70,7 @@ def test_registry_owns_default_commands(monkeypatch):
         ("claude-code", claude),
         ("codex", codex),
         ("agy", agy),
+        ("cursor", cursor),
         ("deepseek-harness", deepseek),
     ):
         monkeypatch.setattr(module, "default_command", lambda: ["fixture-cli"])

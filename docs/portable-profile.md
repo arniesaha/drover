@@ -46,7 +46,7 @@ Private readers see all three tiers. Hidden content is represented only by
 
 HTTP derives identity from an active bearer credential and the PostgreSQL
 `profile_agents` registry. Unknown agents default to general. The operator can
-issue and revoke registered credentials with `drover profile agents`; trusted
+issue and revoke registered credentials with `drover-server profile agents`; trusted
 access requires explicit `--tier trusted`. Deployment identities are deliberately
 absent from public fixtures
 and source. No registry or production configuration is modified by installation
@@ -55,7 +55,7 @@ of this code alone.
 The cluster operator bearer represents the user: it can read private content,
 review proposals, approve changes, reverse changes and manage tier bindings.
 Device, host and profile bearers cannot approve changes. Profile bearers issued
-by `drover profile agents issue` authorize only `GET /profile`; they cannot write
+by `drover-server profile agents issue` authorize only `GET /profile`; they cannot write
 proposals, use fleet/harness APIs, pair clients, manage credentials or mint
 browser sessions. Browser cookies and authentication-
 disabled requests receive general profile access. Do not put agent or reader
@@ -102,7 +102,7 @@ start pending, keeping approval explicit.
 
 Bindings to non-profile credentials are ignored at resolution, so existing
 host/device bindings must be reissued as profile credentials with
-`drover profile agents issue`.
+`drover-server profile agents issue`.
 
 The operator can inspect `GET /profile/proposals?status=pending&limit=25`.
 The queue includes proposed content and source identity. Allowed statuses are
@@ -129,7 +129,7 @@ Approval scope failures return 403; invalid inputs return 400.
 ## Markdown import
 
 ```sh
-drover profile import --from examples/USER.md
+drover-server profile import --from examples/USER.md
 drover --config examples/config.toml profile import --from examples/MEMORY.md --tier trusted --apply
 ```
 
@@ -181,13 +181,13 @@ access. They do not require a running HTTP server. No import or credential
 issuance happens without an explicit command.
 
 ```sh
-drover profile review PROPOSAL_ID accept
-drover profile review PROPOSAL_ID reject
-drover profile review PROPOSAL_ID revert
-drover profile set-tier ITEM_ID --tier general --reason "Reviewed for sharing"
-drover profile set-tier ITEM_ID --tier private --reason "Restrict visibility"
-drover profile agents issue AGENT_ID --tier trusted
-drover profile agents revoke AGENT_ID
+drover-server profile review PROPOSAL_ID accept
+drover-server profile review PROPOSAL_ID reject
+drover-server profile review PROPOSAL_ID revert
+drover-server profile set-tier ITEM_ID --tier general --reason "Reviewed for sharing"
+drover-server profile set-tier ITEM_ID --tier private --reason "Restrict visibility"
+drover-server profile agents issue AGENT_ID --tier trusted
+drover-server profile agents revoke AGENT_ID
 ```
 
 Default imports remain pending. Accept a private proposal before changing its
