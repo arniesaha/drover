@@ -1000,6 +1000,10 @@ public struct ProviderHostPresentation: Sendable, Equatable, Identifiable {
         case "login_refresh_needed":
             return "Claude login on \(host) needs a refresh: run `claude` once"
         case "login_expired": return "Log in to Claude Code on \(host)"
+        // Cursor's authenticated CLI account has no supported quota reading;
+        // the daemon reserves this category for that case.
+        case "quota_unsupported":
+            return "View Cursor usage in Cursor settings or Grok dashboard"
         default: return nil
         }
     }

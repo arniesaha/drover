@@ -561,6 +561,15 @@ def test_detected_agy_is_honest_when_quota_contract_is_unavailable():
     assert accounts[0].usage_status == "usage_unavailable"
 
 
+def test_detected_cursor_marks_quota_as_unavailable():
+    accounts = detect_provider_accounts({"harnesses": [{"id": "cursor"}]})
+
+    assert [
+        (account.provider, account.harnesses, account.usage_status)
+        for account in accounts
+    ] == [("cursor", ("cursor",), "usage_unavailable")]
+
+
 def test_inventory_omits_disabled_harnesses_and_keeps_supported_codex():
     accounts = detect_provider_accounts(
         {

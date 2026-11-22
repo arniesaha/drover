@@ -1540,6 +1540,7 @@ class ProviderUsageRefreshCache:
         self.probe_timeout_seconds = probe_timeout_seconds
         self._snapshots: dict[tuple[str, tuple[str, ...]], ProviderAccountSnapshot] = {}
         self._in_flight: dict[tuple[str, tuple[str, ...]], _InFlightProviderProbe] = {}
+        self._cursor_authenticated = False
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._wake = threading.Event()
@@ -1570,7 +1571,7 @@ class ProviderUsageRefreshCache:
         if not self._refresh_lock.acquire(blocking=False):
             return
         try:
-            for detected in detect_provider_accounts(self.state.capabilities()):
+            for detected in self._detected_provider_accounts(refresh_cursor_auth=True):
                 self._refresh_provider(detected)
         finally:
             self._refresh_lock.release()
@@ -1578,7 +1579,7 @@ class ProviderUsageRefreshCache:
     def accounts(self) -> list[dict[str, Any]]:
         """Return immediately from cached observations or existing placeholder."""
         accounts: list[dict[str, Any]] = []
-        for detected in detect_provider_accounts(self.state.capabilities()):
+        for detected in self._detected_provider_accounts(refresh_cursor_auth=False):
             if detected.provider == "anthropic":
                 detected = _with_claude_plan_label(detected, self.state.auth)
             with self._lock:
@@ -1593,6 +1594,38 @@ class ProviderUsageRefreshCache:
             else:
                 accounts.append(_provider_snapshot_json(snapshot, detected))
         return accounts
+
+    def _detected_provider_accounts(
+        self, *, refresh_cursor_auth: bool
+    ) -> list[DetectedProvider]:
+        """Return inventory records that have the account state needed here.
+
+        Cursor's status command proves authentication but does not report a
+        subscription identity or quota. Probe it only from the refresh worker:
+        the HTTP projection remains cache-only, and an unauthenticated CLI is
+        never presented as a provider account.
+        """
+        detected = detect_provider_accounts(self.state.capabilities())
+        if not any(account.provider == "cursor" for account in detected):
+            return detected
+        if refresh_cursor_auth:
+            try:
+                authenticated = (
+                    self.state.auth.status("cursor").get("state") == "authenticated"
+                )
+            except KeyError:
+                # A configured preset may outlive an adapter that is no longer
+                # available on PATH. It cannot substantiate an account.
+                authenticated = False
+            with self._lock:
+                self._cursor_authenticated = authenticated
+        with self._lock:
+            cursor_authenticated = self._cursor_authenticated
+        return [
+            account
+            for account in detected
+            if account.provider != "cursor" or cursor_authenticated
+        ]
 
     def _refresh_provider(self, detected: DetectedProvider) -> None:
         key = _provider_cache_key(detected)
@@ -4401,6 +4434,8 @@ def _read_provider_usage_snapshot(
             probe = AgyUsageProbe()
             state.agy_usage_probe = probe
         return probe.read(host_id=state.host_id)
+    if detected.provider == "cursor":
+        return _provider_usage_unavailable_snapshot(detected, "quota_unsupported")
     return _provider_probe_error_snapshot(detected, "probe_failed")
 
 
@@ -4435,6 +4470,39 @@ def _provider_probe_error_snapshot(
     )
 
 
+def _provider_usage_unavailable_snapshot(
+    detected: DetectedProvider, error_category: str
+) -> ProviderAccountSnapshot:
+    """Represent a connected account whose provider does not report quota."""
+    from drover.server.providers.types import ProviderAccountSnapshot
+
+    observed_at = datetime.now(timezone.utc)
+    fingerprint = json.dumps(
+        {
+            "provider": detected.provider,
+            "host_id": detected.host_id,
+            "source": "harness-inventory",
+            "status": "usage_unavailable",
+            "error_category": error_category,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ProviderAccountSnapshot(
+        snapshot_id=str(uuid4()),
+        dedup_key=hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+        provider=detected.provider,
+        account_label=detected.account_label,
+        plan_label=detected.plan_label,
+        host_id=detected.host_id,
+        status="usage_unavailable",
+        observed_at=observed_at,
+        windows=(),
+        source="harness-inventory",
+        error_category=error_category,
+    )
+
+
 def _provider_probe_failed(snapshot: ProviderAccountSnapshot) -> bool:
     """Whether a probe result should overlay, rather than replace, good data."""
     if snapshot.status == "error":
@@ -4448,6 +4516,7 @@ def _provider_probe_failed(snapshot: ProviderAccountSnapshot) -> bool:
     return snapshot.status == "usage_unavailable" and snapshot.error_category not in {
         None,
         "no_usage_reported",
+        "quota_unsupported",
     }
 
 

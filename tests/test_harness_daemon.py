@@ -2188,6 +2188,75 @@ def test_harnessd_provider_usage_uses_configured_agy_probe(tmp_path):
     assert body["accounts"][0]["windows"][0]["used_percent"] == 42.0
 
 
+def test_harnessd_provider_usage_shows_authenticated_cursor_with_unreported_quota(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"cursor": replace(DEFAULT_PRESETS["cursor"], enabled=True)}
+    state.auth = AuthFlowManager(
+        {
+            "cursor": StaticAuthAdapter(
+                "cursor",
+                status_value=HarnessAuthStatus("cursor", "authenticated"),
+            )
+        }
+    )
+    state.provider_usage_cache.refresh_once()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    assert len(body["accounts"]) == 1
+    account = body["accounts"][0]
+    assert account["provider"] == "cursor"
+    assert account["account_label"] == "Cursor"
+    assert account["account_identity"] is None
+    assert account["plan_label"] is None
+    assert account["harnesses"] == ["cursor"]
+    assert account["usage_status"] == "usage_unavailable"
+    assert account["status"] == "usage_unavailable"
+    assert account["source"] == "harness-inventory"
+    assert account["error_category"] == "quota_unsupported"
+    assert account["windows"] == []
+
+
+def test_harnessd_provider_usage_omits_unauthenticated_cursor(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"cursor": replace(DEFAULT_PRESETS["cursor"], enabled=True)}
+    state.auth = AuthFlowManager(
+        {
+            "cursor": StaticAuthAdapter(
+                "cursor",
+                status_value=HarnessAuthStatus("cursor", "unauthenticated"),
+            )
+        }
+    )
+    state.provider_usage_cache.refresh_once()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert response.status == 200
+    assert body["accounts"] == []
+
+
 def test_harnessd_provider_usage_reports_claude_windows(tmp_path):
     """The anthropic branch must emit a snapshot-shaped account, not the
     unavailable placeholder, when the probe has real windows to report."""

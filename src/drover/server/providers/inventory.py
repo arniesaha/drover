@@ -22,6 +22,7 @@ _PROVIDER_HARNESSES: tuple[tuple[str, str, str, UsageStatus], ...] = (
     ("codex", "openai", "Codex", "supported"),
     ("claude-code", "anthropic", "Claude Code", "supported"),
     ("agy", "google", "Antigravity", "usage_unavailable"),
+    ("cursor", "cursor", "Cursor", "usage_unavailable"),
 )
 
 
@@ -31,8 +32,10 @@ def detect_provider_accounts(capabilities: Mapping[str, Any]) -> list[DetectedPr
     Antigravity is an account-only record for now. Its ``FetchQuotaStatus``
     API is not served on any reachable REST route, and nothing local caches
     the answer, so its probe reports the signed-in account and leaves
-    capacity unavailable (see ``providers/agy.py``). Codex and Claude Code
-    both have a real source and report windows.
+    capacity unavailable (see ``providers/agy.py``). Cursor's documented
+    status command establishes authentication but does not report subscription
+    quota, so its authenticated account likewise leaves capacity unavailable.
+    Codex and Claude Code both have a real source and report windows.
     """
     host_id = str(capabilities.get("host_id") or "local").strip() or "local"
     available = _available_harnesses(capabilities.get("harnesses"))
