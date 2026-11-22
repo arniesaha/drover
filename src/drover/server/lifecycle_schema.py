@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS session_lifecycle_operations (
 """
 STOP_MIGRATION = tuple(
     f"ALTER TABLE harness_sessions ADD COLUMN IF NOT EXISTS {name} {ddl}"
+    # Migration 13 is released: freeze its original columns; new fields use new versions.
     for name, ddl in SESSION_COLUMNS.items()
+    if name != "attention_id"
 ) + (
     OPERATIONS_DDL,
     "CREATE INDEX IF NOT EXISTS lifecycle_pending ON session_lifecycle_operations (state, host_id)",
