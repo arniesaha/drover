@@ -27,6 +27,8 @@ def control_call(url, headers, operation, args):
         "update",
         "question",
         "decide",
+        "delegate",
+        "revoke_delegation",
     }:
         raise ValueError("unknown work operation")
     with requests.request(

@@ -65,6 +65,19 @@ Reuse `NotificationRouting`, APNs and local notifications with an attention ref,
 
 All trusted paired devices in the workspace may decide. Refresh before executing, recheck already-resolved requests, and disable offline decisions. Serialize decisions in the control service; log an intent before an external action and the outcome afterward. If an action times out, inspect provider state before retrying and show uncertainty. This is a small audit flow, not a general mutation-receipt system.
 
+### Audited paired-human delegation
+
+Delegation is disabled by default. An operator must explicitly set
+`work_queue.audited_delegation.enabled: true` in the server-side control-plane
+configuration before the `/work/delegate` endpoint will mint a grant. A grant
+is accepted only when its issuer authenticated using an active paired *device*
+credential; agent assertions, legacy API tokens, and GitHub labels are not
+human provenance. It names one credential delegatee, repository, issue,
+`launch` action, `work|verify` stage, and short expiry. The control store binds
+its one permitted use to the launch request key, so retries are idempotent but
+a second request, scope/stage change, expiry, or revocation fails closed.
+GitHub identities are never inferred or impersonated.
+
 ## Policy defaults
 
 All defaults live in versioned per-goal config, referenced by the goal brief. Log policy changes as metadata events and sanitized issue comments where appropriate.
