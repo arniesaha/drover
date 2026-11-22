@@ -9,7 +9,10 @@ from typing import Any
 
 MAX_ID_LENGTH = 256
 MAX_DESCRIPTION_LENGTH = 2_048
-MAX_MODELS = 256
+# Current authenticated Cursor Agent listings contain 284 public entries. Keep
+# this count bounded while allowing the host and client catalog contracts to
+# carry the complete CLI-authoritative listing.
+MAX_MODELS = 512
 MAX_REASONING_EFFORTS = 32
 MAX_CATALOG_WIRE_BYTES = 256 * 1024
 
