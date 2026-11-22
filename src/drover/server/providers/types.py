@@ -49,6 +49,17 @@ ProviderStatus = Literal[
 ]
 
 
+class ProviderRefreshDeferred(RuntimeError):
+    """A host observation is temporarily inadmissible, not a connector failure.
+
+    The only current producer is the authenticated analytics-to-API bridge when
+    a persisted relay host heartbeat outlives the API process's in-memory relay
+    attachment after a restart. Callers leave the last known provider facts
+    untouched and retry after relay admission; ordinary transport, auth, and
+    connector failures remain failures.
+    """
+
+
 @dataclass(frozen=True)
 class ProviderAccountSnapshot:
     snapshot_id: str

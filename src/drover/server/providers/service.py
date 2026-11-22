@@ -23,6 +23,7 @@ from drover.server.parquet_io import atomic_write_table
 from drover.server.providers.quota import is_public_window
 from drover.server.providers.types import (
     ProviderAccountSnapshot,
+    ProviderRefreshDeferred,
     ProviderStatus,
     ProviderUsageWindow,
     provider_snapshot_table,
@@ -172,6 +173,11 @@ class ProviderUsageService:
             if not record_failures and failed_providers:
                 raise RuntimeError("provider_error")
             return snapshots
+        except ProviderRefreshDeferred:
+            # Relay admission is an infrastructure readiness edge, not a
+            # provider observation. Do not overwrite a truthful last-good
+            # account state with a fabricated connector failure.
+            raise
         except Exception as exc:  # A connector failure must not stop refresh loops.
             if not record_failures:
                 category = (

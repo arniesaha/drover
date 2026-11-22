@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from drover.config import AnalyticsBoundaryConfig, RuntimeConfig, load_config
+from drover.schema import bootstrap
 from drover.server.analytics_boundary import (
     ANALYTICS_UNAVAILABLE_BODY,
     AnalyticsBoundaryClient,
@@ -30,7 +31,9 @@ from drover.server.analytics_boundary import (
     is_analytics_route,
     start_analytics_boundary_server,
 )
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.metrics import MetricsCollector
+from drover.server.providers.types import ProviderRefreshDeferred
 from drover.server.web.app import start_metrics_server
 
 
@@ -470,6 +473,65 @@ def test_host_data_bridge_rejects_query_before_dispatch(tmp_path: Path) -> None:
         assert response.status == 404
         assert json.loads(response.read()) == {"error": "not found"}
         connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_host_data_bridge_defers_only_until_a_relay_host_reattaches(
+    tmp_path: Path,
+) -> None:
+    """A persisted heartbeat cannot stand in for this API process's relay."""
+
+    duckdb_path = tmp_path / "central.duckdb"
+    bootstrap(parquet_dir=tmp_path / "parquet", duckdb_path=duckdb_path)
+    registry = HarnessRegistry(duckdb_path)
+    registry.register_host(
+        host_id="relay-host",
+        display_name="Relay host",
+        kind="macos",
+        connection_kind="relay",
+    )
+    assert registry.get_host("relay-host").status == "online"  # type: ignore[union-attr]
+    collector = MetricsCollector(
+        duckdb_path=duckdb_path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+    )
+    server = start_metrics_server(
+        host="127.0.0.1",
+        port=0,
+        collector=collector,
+        host_data_bridge_token="bridge-secret",
+    )
+    try:
+        host, port = server.server_address[:2]
+        client = HostDataBridgeClient(
+            AnalyticsBoundaryConfig(api_url=f"http://{host}:{port}"),
+            token="bridge-secret",
+        )
+        with pytest.raises(ProviderRefreshDeferred):
+            client.fetch_provider_usage("relay-host")
+
+        class _AttachedRelay:
+            def is_live(self, host_id: str) -> bool:
+                return host_id == "relay-host"
+
+            def request(self, host_id, method, path, payload, *, timeout_s):
+                assert (host_id, method, path, payload) == (
+                    "relay-host",
+                    "GET",
+                    "/providers/usage",
+                    {},
+                )
+                assert timeout_s >= 10.0
+                return 200, '{"accounts":[],"observed_at":"2026-11-22T17:10:00+00:00"}'
+
+        collector.relay_manager = _AttachedRelay()
+        assert client.fetch_provider_usage("relay-host") == {
+            "accounts": [],
+            "observed_at": "2026-11-22T17:10:00+00:00",
+        }
     finally:
         server.shutdown()
         server.server_close()

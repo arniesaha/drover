@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlsplit
 
 from drover.config import AnalyticsBoundaryConfig
+from drover.server.providers.types import ProviderRefreshDeferred
 
 ANALYTICS_UNAVAILABLE_BODY = (
     json.dumps({"error": "analytics worker unavailable"}, separators=(",", ":")) + "\n"
@@ -33,6 +34,12 @@ ANALYTICS_MUTATION_CONCURRENCY = 4
 ANALYTICS_ADMISSION_WAIT_SECONDS = 1.0
 API_TO_WORKER_HEADER = "X-Drover-Api-To-Analytics"
 WORKER_TO_API_HEADER = "X-Drover-Analytics-To-Api"
+# This is a fixed, token-authenticated loopback response only. It lets the
+# analytics worker distinguish a new API process waiting for a relay socket
+# from an actual provider or bridge failure, without exposing relay topology.
+HOST_BRIDGE_RELAY_NOT_ATTACHED_BODY = (
+    '{"error":"host bridge unavailable","reason":"relay_not_attached"}\n'
+)
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _HOP_BY_HOP_HEADERS = frozenset(
@@ -871,6 +878,11 @@ class HostDataBridgeClient:
             body,
             response_limit,
         )
+        if (
+            response.status == 503
+            and response.body == HOST_BRIDGE_RELAY_NOT_ATTACHED_BODY.encode("utf-8")
+        ):
+            raise ProviderRefreshDeferred("relay_not_attached")
         if not 200 <= response.status < 300:
             raise HostDataBridgeUnavailable("API host bridge unavailable")
         try:
