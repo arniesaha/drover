@@ -73,6 +73,16 @@ Interpret a local receipt through these sources:
 5. [reconciler.py](../../src/drover/server/work_queue/reconciler.py) and
    [runtime.py](../../src/drover/server/work_queue/runtime.py): existing worker
    admission and active-slot calculation.
+6. [service.py](../../src/drover/server/work_queue/service.py):
+   `advance_deferred_completion`, `advance_deferred_verification`, and bound
+   host verification reports enforce terminal structured turn boundaries.
+7. [worker_mcp.py](../../src/drover/server/work_queue/worker_mcp.py):
+   `drover_work_update` forwards `action=verified` reports with behavioral
+   evidence only while bound; workers cannot self-accept.
+
+See [Verified Event-Path and Automatic Flow Boundaries](verified-event-path-boundaries.md)
+for the complete operational contract across automatic work, separate verification,
+owner acknowledgement, GitHub event paths, and status visibility.
 
 Join inbox `event_id` with claim and action-intent `wake_id`. The completed
 receipt key is `(wake_id, action_fingerprint)`. Join completion projections by
