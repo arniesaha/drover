@@ -211,9 +211,12 @@ def test_external_activity_requires_the_exact_bound_owner_or_session():
         "owner": owner_a,
         "done": [],
     }
-    assert normalize_facts(
-        facts(markers={"session": "session-a", "done": []}, owner_id=owner_a)
-    )["markers"]["owner"] == owner_a
+    assert (
+        normalize_facts(
+            facts(markers={"session": "session-a", "done": []}, owner_id=owner_a)
+        )["markers"]["owner"]
+        == owner_a
+    )
 
 
 def test_shadow_compare_http_returns_400_for_malformed_nested_facts(tmp_path):

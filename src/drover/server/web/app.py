@@ -2573,7 +2573,11 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                     )
                 if "run_id" not in params and params.keys() & telemetry_fields:
                     raise ValueError("owner telemetry requires run_id")
-                if "run_id" in params and "owner_id" not in params and params.keys() & telemetry_fields:
+                if (
+                    "run_id" in params
+                    and "owner_id" not in params
+                    and params.keys() & telemetry_fields
+                ):
                     raise ValueError("owner telemetry requires owner_id")
                 if (
                     "run_id" in params
@@ -2618,7 +2622,9 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                         store.record_owner_telemetry(
                             params["run_id"][0],
                             owner_id=owner_id,
-                            session_activity_at=params.get("session_activity_at", [None])[0],
+                            session_activity_at=params.get(
+                                "session_activity_at", [None]
+                            )[0],
                             last_error=params.get("last_error", [None])[0],
                         )
                     result = {

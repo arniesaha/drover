@@ -1403,7 +1403,9 @@ class FactoryObserverContinuity:
         activity = _telemetry_timestamp(session_activity_at)
         error = _telemetry_error(last_error)
         if activity is None and error is None:
-            raise ValueError("owner telemetry requires session_activity_at or last_error")
+            raise ValueError(
+                "owner telemetry requires session_activity_at or last_error"
+            )
         payload = canonical_payload(
             {
                 "owner_id": owner_id,

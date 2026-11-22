@@ -193,13 +193,16 @@ test("service stop releases every held lease concurrently inside one drain deadl
   });
   f.listing.runs = ["run_A", "run_B"];
   const { runId: _fixed, ...sessionConfig } = f.config;
-  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 1000, maxDrainMs: 80 });
+  const runtime = fakeApi({ ...sessionConfig, mode: "owner", wakePollIntervalMs: 10, maxDrainMs: 80 });
   register(runtime.api);
   const health = serviceContext(runtime.api.pluginConfig);
   runtime.services[0].start(health.context);
   await eventually(
-    () => f.calls.filter((request) => request.method === "GET" && new URL(request.url, "http://x").searchParams.has("run_id")).length >= 2,
-    `listed runs were not polled: ${health.failures.map((failure) => String(failure)).join("; ")}`,
+    // The third scoped poll can only begin after the first loop has stored
+    // both leased runs. Waiting for merely two polls races the second map
+    // insertion and can make the stop assertion observe only one held lease.
+    () => f.calls.filter((request) => request.method === "GET" && new URL(request.url, "http://x").searchParams.has("run_id")).length >= 3,
+    `listed runs were not fully leased: ${health.failures.map((failure) => String(failure)).join("; ")}`,
   );
   await runtime.services[0].stop(health.context);
   assert.equal(releases.length, 2);
