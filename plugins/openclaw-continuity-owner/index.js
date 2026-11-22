@@ -182,10 +182,10 @@ function registerWakeService(api) {
             for (const runId of listed) {
               try {
                 const scoped = scopedTo(config, runId);
-                const query = { run_id: runId, limit: 1 };
-                if (latestActivityAt) query.session_activity_at = latestActivityAt;
-                if (lastError) query.last_error = lastError;
-                const polled = reply(await request(scoped, "GET", query, signal, assertCurrent), scoped);
+                const polled = reply(await poll(scoped, 1, {
+                  session_activity_at: latestActivityAt,
+                  last_error: lastError,
+                }, signal, assertCurrent), scoped);
                 const status = await maintainOwnerLease(scoped, polled.continuity, signal, assertCurrent);
                 assertCurrent();
                 if (status.owner?.epoch) {
@@ -233,14 +233,15 @@ function registerWakeService(api) {
     async stop(ctx) {
       const config = ctx ? committedServiceConfiguration(ctx) : null;
       const drainMs = config?.maxDrainMs ?? 55000;
+      const deadlineAt = Date.now() + drainMs;
+      // Reserve one bounded transport window for fenced releases. If an
+      // in-flight host operation ignores cancellation, stop still reaches the
+      // release phase before the single overall deadline.
+      const releaseReserveMs = Math.min(config?.timeoutMs ?? 5000, drainMs);
       controller?.abort();
       let timeoutId;
-      let timedOut = false;
       const drainTimer = new Promise((resolve) => {
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          resolve();
-        }, drainMs);
+        timeoutId = setTimeout(resolve, drainMs - releaseReserveMs);
         if (typeof timeoutId.unref === "function") timeoutId.unref();
       });
       try {
@@ -248,21 +249,23 @@ function registerWakeService(api) {
       } finally {
         clearTimeout(timeoutId);
       }
-      if (timedOut && heldLeases.size > 0) {
-        for (const [runId, leaseInfo] of heldLeases.entries()) {
-          try {
-            await invoke(leaseInfo.config, false, {
+      // A normal stop must release just as a drain timeout does. All releases
+      // share this one deadline and run concurrently: never add a fresh
+      // five-second wait for every held run after the service has drained.
+      const remaining = deadlineAt - Date.now();
+      if (remaining > 0 && heldLeases.size > 0) {
+        const releases = [...heldLeases.values()].map((leaseInfo) => {
+          const releaseConfig = { ...leaseInfo.config, timeoutMs: remaining };
+          return invoke(releaseConfig, false, {
               version: 1,
               request: {
                 operation: "lease",
                 owner_epoch: leaseInfo.epoch,
                 lease_seconds: 0,
               },
-            }, AbortSignal.timeout(config?.timeoutMs ?? 5000), () => {});
-          } catch {
-            // best-effort lease release during drain timeout
-          }
-        }
+            }, AbortSignal.timeout(remaining), () => {});
+        });
+        await Promise.allSettled(releases);
         heldLeases.clear();
       }
     },
@@ -347,12 +350,10 @@ async function invoke(base, readOnly, payload, signal, assertCurrent) {
   requireValue(runId !== undefined, "run_id is required when no fixed runId is bound");
   const config = scopedTo(base, runId);
   requireValue(!readOnly || args.operation === "poll", "Read-only canary permits poll only");
-  const get = (limit) => {
-    const query = { run_id: config.runId, limit };
-    if (args.session_activity_at) query.session_activity_at = args.session_activity_at;
-    if (args.last_error) query.last_error = args.last_error;
-    return request(config, "GET", query, signal, assertCurrent);
-  };
+  const get = (limit) => poll(config, limit, {
+    session_activity_at: args.session_activity_at,
+    last_error: args.last_error,
+  }, signal, assertCurrent);
   let raw;
   let ownerId = config.ownerPrincipal;
   if (args.operation === "poll") raw = await get(args.limit ?? 20);
@@ -385,6 +386,22 @@ async function invoke(base, readOnly, payload, signal, assertCurrent) {
   if (args.operation === "report") requireValue(result.event_id !== null, "Report must return its durable identity");
   else requireValue(!Object.hasOwn(raw, "event_id"), "Only report may return an event identity");
   return result;
+}
+
+async function poll(config, limit, telemetry, signal, assertCurrent) {
+  const query = { run_id: config.runId, limit };
+  const hasTelemetry = Boolean(telemetry.session_activity_at || telemetry.last_error);
+  if (!hasTelemetry) return request(config, "GET", query, signal, assertCurrent);
+  // A fixed-run binding can represent either the bearer principal or a
+  // coordinator-owned agent session. Establish the immutable handoff first,
+  // then attribute telemetry to that exact bound owner.
+  const initial = await request(config, "GET", query, signal, assertCurrent);
+  const status = reply(initial, config).continuity;
+  return request(config, "GET", {
+    ...query,
+    owner_id: ownerIdFor(config, status),
+    ...telemetry,
+  }, signal, assertCurrent);
 }
 
 function initializeBody(config) {

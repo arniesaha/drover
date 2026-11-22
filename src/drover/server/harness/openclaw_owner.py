@@ -179,6 +179,14 @@ class OwnerLease(WireModel):
     live: bool
 
 
+class OwnerTelemetry(WireModel):
+    """Read-only owner liveness recorded by the bounded poll endpoint."""
+
+    owner_id: Id
+    session_activity_at: datetime | None
+    last_error: Annotated[str, Field(min_length=1, max_length=1000)] | None
+
+
 class OwnerHandoff(WireModel):
     authorized_owner_id: Id | None
     state: Literal[
@@ -259,6 +267,9 @@ class ContinuityProjection(WireModel):
     integration_serialization: IntegrationSerialization | None
     owner_handoff: OwnerHandoff
     owner: OwnerLease
+    # Older hubs omit telemetry entirely; newer hubs return only the exact
+    # handoff owner record, never a different agent's activity.
+    owner_telemetry: OwnerTelemetry | None = None
     worker_state: Literal[
         "unknown",
         "started",

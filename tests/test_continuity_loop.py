@@ -13,6 +13,7 @@ from drover.server.continuity_loop import (
     ShadowCompareService,
     action_identity,
     decide,
+    normalize_facts,
 )
 from drover.server.metrics import MetricsCollector
 from drover.server.web.app import start_metrics_server
@@ -189,6 +190,30 @@ def test_shadow_compare_mutation_is_thread_safe_and_bounded():
         results = list(workers.map(compare, range(1000, 1050)))
     assert all(result["recorded"] for result in results)
     assert len(service.mismatches) == 7
+
+
+def test_external_activity_requires_the_exact_bound_owner_or_session():
+    owner_a = "agent:owner-a:main"
+    owner_b = "agent:owner-b:main"
+    stalled = facts(
+        markers={"session": "session-a", "owner": owner_a, "done": []},
+        external_session_activity={owner_b: NOW.isoformat()},
+    )
+    # A different active agent must not hide owner A's stalled issue.
+    assert decide(stalled, NOW).action == "nudge"
+    active = facts(
+        markers={"session": "session-a", "owner": owner_a, "done": []},
+        external_session_activity={owner_a: NOW.isoformat(), owner_b: NOW.isoformat()},
+    )
+    assert decide(active, NOW).action == "none"
+    assert normalize_facts(active)["markers"] == {
+        "session": "session-a",
+        "owner": owner_a,
+        "done": [],
+    }
+    assert normalize_facts(
+        facts(markers={"session": "session-a", "done": []}, owner_id=owner_a)
+    )["markers"]["owner"] == owner_a
 
 
 def test_shadow_compare_http_returns_400_for_malformed_nested_facts(tmp_path):

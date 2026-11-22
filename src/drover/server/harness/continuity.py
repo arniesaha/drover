@@ -29,6 +29,7 @@ from drover.server.harness.registry import HarnessRegistry
 MAX_DELIVERIES = 3
 MAX_LEASE_SECONDS = 300
 MAX_COMPLETION_PROJECTION_BATCH = 100
+OWNER_TELEMETRY_SOURCE = "owner-telemetry"
 
 
 def _observation_retry_delay(event_id: str, attempts: int) -> int:
@@ -164,6 +165,34 @@ def _handoff_token_sha256(token: str) -> str:
 def _integer(value: int, name: str, minimum: int, maximum: int) -> int:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer in {minimum}..{maximum}")
+    return value
+
+
+def _telemetry_timestamp(value: str | None) -> str | None:
+    """Accept a bounded, offset-aware owner activity timestamp.
+
+    The value is telemetry rather than a control-plane clock, so retain the
+    sender's ISO representation after validating it. It must never advance a
+    lease or any other authority fence.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("session_activity_at must be an ISO timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("session_activity_at must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("session_activity_at must be an ISO timestamp")
+    return value
+
+
+def _telemetry_error(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 1000:
+        raise ValueError("last_error must be non-empty text of at most 1000 characters")
     return value
 
 
@@ -1310,10 +1339,26 @@ class FactoryObserverContinuity:
         owner_epoch: int | None = None,
     ) -> dict:
         _text(owner_id, "owner_id", 191)
-        _integer(lease_seconds, "lease_seconds", 1, MAX_LEASE_SECONDS)
+        _integer(lease_seconds, "lease_seconds", 0, MAX_LEASE_SECONDS)
         with self._transaction(run_id) as (con, run):
             now = self.clock()
             self._authorized_owner(run, owner_id)
+            if lease_seconds == 0:
+                # Release is deliberately not a new claim. A caller must
+                # still hold the exact live lease it is releasing, so a stale
+                # owner cannot clear a successor's fence.
+                self._fence(run, owner_id, owner_epoch, now)
+                con.execute(
+                    """UPDATE factory_observer_runs SET lease_until = NULL,
+                    updated_at = ? WHERE run_id = ? AND owner_id = ?
+                    AND owner_epoch = ? AND lease_until > ?""",
+                    [now, run_id, owner_id, owner_epoch, now],
+                )
+                return {
+                    "owner_id": owner_id,
+                    "owner_epoch": run["owner_epoch"],
+                    "lease_until": None,
+                }
             # A delayed renewal is a compare-and-swap even after expiry. It
             # must not silently reacquire after a newer owner epoch expired.
             if owner_epoch is not None and (
@@ -1338,6 +1383,65 @@ class FactoryObserverContinuity:
             "owner_epoch": epoch,
             "lease_until": until.isoformat(),
         }
+
+    def record_owner_telemetry(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        session_activity_at: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Durably retain bounded owner telemetry without creating a wake.
+
+        A deployed control plane already has the inbox table, while adding a
+        run column would require a PostgreSQL migration. The record is kept
+        acknowledged and excluded from operational inbox counts, so it cannot
+        become a delivery or affect recovery decisions.
+        """
+        _text(owner_id, "owner_id", 191)
+        activity = _telemetry_timestamp(session_activity_at)
+        error = _telemetry_error(last_error)
+        if activity is None and error is None:
+            raise ValueError("owner telemetry requires session_activity_at or last_error")
+        payload = canonical_payload(
+            {
+                "owner_id": owner_id,
+                "session_activity_at": activity,
+                "last_error": error,
+            }
+        )
+        with self._transaction(run_id) as (con, run):
+            self._authorized_owner(run, owner_id)
+            event_id = _report_event_id(run_id, OWNER_TELEMETRY_SOURCE, owner_id)
+            now = self.clock()
+            existing = _row(
+                con,
+                "SELECT event_id FROM factory_observer_inbox WHERE event_id = ?",
+                [event_id],
+            )
+            if existing is None:
+                con.execute(
+                    """INSERT INTO factory_observer_inbox
+                    (event_id, run_id, source, subject, sequence, payload_json,
+                     state, acknowledged_at, received_at)
+                    VALUES (?, ?, ?, ?, 0, ?, 'acknowledged', ?, ?)""",
+                    [
+                        event_id,
+                        run_id,
+                        OWNER_TELEMETRY_SOURCE,
+                        owner_id,
+                        payload,
+                        now,
+                        now,
+                    ],
+                )
+            else:
+                con.execute(
+                    """UPDATE factory_observer_inbox SET payload_json = ?,
+                    acknowledged_at = ?, received_at = ? WHERE event_id = ?""",
+                    [payload, now, now, event_id],
+                )
 
     def fence_owner(
         self,
@@ -1851,9 +1955,21 @@ class FactoryObserverContinuity:
             live = run["lease_until"] is not None and run["lease_until"] > now
             counts = dict(
                 con.execute(
-                    "SELECT state, count(*) FROM factory_observer_inbox WHERE run_id = ? GROUP BY state",
-                    [run_id],
+                    """SELECT state, count(*) FROM factory_observer_inbox
+                    WHERE run_id = ? AND source <> ? GROUP BY state""",
+                    [run_id, OWNER_TELEMETRY_SOURCE],
                 ).fetchall()
+            )
+            telemetry_row = _row(
+                con,
+                """SELECT payload_json FROM factory_observer_inbox
+                WHERE run_id = ? AND source = ? AND subject = ?""",
+                [run_id, OWNER_TELEMETRY_SOURCE, run.get("authorized_owner_id")],
+            )
+            owner_telemetry = (
+                json.loads(telemetry_row["payload_json"])
+                if telemetry_row is not None
+                else None
             )
             # Counts drive health and recovery decisions, so they must not
             # depend on the bounded event page returned to this caller. A
@@ -2036,6 +2152,7 @@ class FactoryObserverContinuity:
                     ),
                     "live": live,
                 },
+                "owner_telemetry": owner_telemetry,
                 "worker_state": run["worker_state"],
                 "terminal_release": False,
                 "next_action": action,

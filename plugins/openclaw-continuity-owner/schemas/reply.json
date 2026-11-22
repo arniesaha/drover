@@ -255,6 +255,17 @@
         "owner_handoff": {
           "$ref": "#/$defs/OwnerHandoff"
         },
+        "owner_telemetry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerTelemetry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "owner_wake": {
           "title": "Owner Wake",
           "type": "boolean"
@@ -740,6 +751,51 @@
         "live"
       ],
       "title": "OwnerLease",
+      "type": "object"
+    },
+    "OwnerTelemetry": {
+      "additionalProperties": false,
+      "description": "Read-only owner liveness recorded by the bounded poll endpoint.",
+      "properties": {
+        "last_error": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Error"
+        },
+        "owner_id": {
+          "maxLength": 191,
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Owner Id",
+          "type": "string"
+        },
+        "session_activity_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Activity At"
+        }
+      },
+      "required": [
+        "owner_id",
+        "session_activity_at",
+        "last_error"
+      ],
+      "title": "OwnerTelemetry",
       "type": "object"
     }
   },
