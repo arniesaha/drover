@@ -20,12 +20,18 @@ enum OnboardingStep: Int, CaseIterable, Identifiable, Sendable {
 /// The multi-step first-launch onboarding experience for Drover.
 /// Guides the user through first-computer setup and QR or manual pairing recovery.
 struct OnboardingView: View {
+    private enum ManualPairField: Hashable {
+        case serverURL
+        case code
+    }
+
     var environment: AppEnvironment
     var onFinished: () -> Void = {}
 
     @State private var step: OnboardingStep = .welcome
     @State private var selectedSetupMode: ServerSetupMode = .hub
     @StateObject private var pairingModel = PairingModel()
+    @FocusState private var focusedManualPairField: ManualPairField?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -254,107 +260,119 @@ struct OnboardingView: View {
     // MARK: - Step 3: Pair & Connect
 
     private var pairStep: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                if step == .pair {
-                    QRScannerView { scanned in
-                        guard let payload = PairingPayload(scanned: scanned) else { return }
-                        Task { await pair(payload) }
-                    }
-                    .frame(height: 240)
-                    .frame(maxWidth: .infinity)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .strokeBorder(DroverColor.line, lineWidth: 1)
-                    }
-                    .accessibilityIdentifier("onboarding-qr-scanner")
-                } else {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.black)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    if step == .pair {
+                        QRScannerView { scanned in
+                            guard let payload = PairingPayload(scanned: scanned) else { return }
+                            Task { await pair(payload) }
+                        }
                         .frame(height: 240)
                         .frame(maxWidth: .infinity)
-                }
-
-                Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
-                    .droverText(.subtitle)
-                    .foregroundStyle(DroverColor.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Divider().overlay(DroverColor.line)
-
-                Text("Or enter it by hand").droverText(.h3)
-
-                field("http://host:7080", text: $pairingModel.serverURLString)
-                    .keyboardType(.URL)
-                    .accessibilityIdentifier("onboarding-server-url-field")
-                field("K7QP-2M4X", text: $pairingModel.manualCode)
-                    .textInputAutocapitalization(.characters)
-                    .accessibilityIdentifier("onboarding-pairing-code-field")
-
-                if let statusMessage = pairingModel.statusMessage {
-                    statusRow(statusMessage)
-                }
-                if pairingModel.requiresHTTPSRePairing {
-                    Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
-                        .droverText(.subtitle)
-                        .foregroundStyle(DroverColor.accentHi)
-                }
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 10)
-            .padding(.bottom, 28)
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 8) {
-                Button {
-                    guard let payload = pairingModel.manualPayload() else { return }
-                    Task { await pair(payload) }
-                } label: {
-                    Text(pairingModel.isPairing ? "Pairing..." : "Pair")
-                        .droverText(.h3)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                }
-                .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
-                .foregroundStyle(DroverColor.accentHi)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(DroverColor.accentHi, lineWidth: 1)
-                }
-                .accessibilityIdentifier("onboarding-pair-submit-button")
-
-                Button {
-                    environment.enterDemoMode()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("Try a demo — no computer needed")
-                            .font(.system(.subheadline, design: .default, weight: .medium))
-                    }
-                            .foregroundStyle(DroverColor.accentHi)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(DroverColor.line, lineWidth: 1)
+                        }
+                        .accessibilityIdentifier("onboarding-qr-scanner")
+                    } else {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.black)
+                            .frame(height: 240)
                             .frame(maxWidth: .infinity)
-                            .frame(minHeight: 44)
-                    .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(DroverColor.line, lineWidth: 1)
                     }
+
+                    Text("Run `drover-server pair` on your Drover machine, then scan the code it prints.")
+                        .droverText(.subtitle)
+                        .foregroundStyle(DroverColor.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Divider().overlay(DroverColor.line)
+
+                    Text("Or enter it by hand").droverText(.h3)
+
+                    field("http://host:7080", text: $pairingModel.serverURLString)
+                        .keyboardType(.URL)
+                        .focused($focusedManualPairField, equals: .serverURL)
+                        .accessibilityIdentifier("onboarding-server-url-field")
+                    field("K7QP-2M4X", text: $pairingModel.manualCode)
+                        .textInputAutocapitalization(.characters)
+                        .focused($focusedManualPairField, equals: .code)
+                        .accessibilityIdentifier("onboarding-pairing-code-field")
+                        .id(ManualPairField.code)
+
+                    if let statusMessage = pairingModel.statusMessage {
+                        statusRow(statusMessage)
+                    }
+                    if pairingModel.requiresHTTPSRePairing {
+                        Link("Remote HTTPS setup guide", destination: PairingModel.transportGuideURL)
+                            .droverText(.subtitle)
+                            .foregroundStyle(DroverColor.accentHi)
+                    }
+
+                    manualPairActions
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("pairing-try-demo-button")
+                .padding(.horizontal, 18)
+                .padding(.top, 10)
+                .padding(.bottom, 28)
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 10)
-            .background(DroverColor.bg)
+            .scrollDismissesKeyboard(.interactively)
+            .onChange(of: focusedManualPairField) { _, field in
+                guard let field else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(field, anchor: .center)
+                }
+            }
         }
-        .scrollDismissesKeyboard(.interactively)
         .onAppear {
             if pairingModel.serverURLString.isEmpty, let config = environment.config {
                 pairingModel.serverURLString = config.baseURL.absoluteString
             }
         }
+    }
+
+    private var manualPairActions: some View {
+        VStack(spacing: 8) {
+            Button {
+                guard let payload = pairingModel.manualPayload() else { return }
+                Task { await pair(payload) }
+            } label: {
+                Text(pairingModel.isPairing ? "Pairing..." : "Pair")
+                    .droverText(.h3)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+            }
+            .disabled(!pairingModel.canSubmitManualCode || pairingModel.isPairing)
+            .foregroundStyle(DroverColor.accentHi)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DroverColor.accentHi, lineWidth: 1)
+            }
+            .accessibilityIdentifier("onboarding-pair-submit-button")
+
+            Button {
+                environment.enterDemoMode()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Try a demo — no computer needed")
+                        .font(.system(.subheadline, design: .default, weight: .medium))
+                }
+                .foregroundStyle(DroverColor.accentHi)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 44)
+                .background(DroverColor.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(DroverColor.line, lineWidth: 1)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("pairing-try-demo-button")
+        }
+        .padding(.top, 4)
     }
 
     // MARK: - Helpers
