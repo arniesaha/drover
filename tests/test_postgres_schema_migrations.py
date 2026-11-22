@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 
 from drover.server.postgres_schema import (
+    AUDITED_DELEGATION_MIGRATION,
     COMMITTED_PROVENANCE_MIGRATION,
     CONTINUITY_LEASES_MIGRATION,
     CONTINUITY_OWNER_HANDOFF_MIGRATION,
@@ -49,6 +50,7 @@ from drover.server.postgres_schema import (
 
 #: sha256 of each released migration's statements (see ``_statements_hash``).
 RELEASED_MIGRATION_HASHES: dict[int, str] = {
+    AUDITED_DELEGATION_MIGRATION: "d55636b5281c81fec8672b72a030013fb307a88127a186b3a6c44c469be14ce6",
     47: "8d57ec091e2eb2cbc96c95cd68ddd6bb06986a4cb2e3b351604da31a6325ddfc",
     M2_ACK_PENDING_MIGRATION: "459f66c940aa8ec7a24b5736e5271a30d6d82fa96a783b937b3c78b148a9e811",
     WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION: "cff55639aaf01f98ea23005e5bb6001b80e98277ce1f97d7f424ff44f82f4588",
@@ -151,6 +153,53 @@ def test_migration_versions_are_unique_and_ascending():
     assert versions == sorted(set(versions))
     assert VECTOR_MIGRATION not in versions
     assert sorted([*versions, VECTOR_MIGRATION]) == list(range(1, max(versions) + 1))
+
+
+def test_audited_delegation_migration_48_is_fresh_and_additive(pg_control_path):
+    """Fresh stores and pre-48 stores receive the exact grant ledger once."""
+    from drover.server.control_store import postgres_control_store
+    from drover.server.postgres_schema import bootstrap_postgres_control_store
+
+    store = postgres_control_store(pg_control_path)
+    with store.connection() as con:
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [AUDITED_DELEGATION_MIGRATION],
+        ).fetchone() == (1,)
+        con.execute("DROP TABLE audited_delegations")
+        con.execute(
+            "DELETE FROM control_schema_migrations WHERE version = ?",
+            [AUDITED_DELEGATION_MIGRATION],
+        )
+    bootstrap_postgres_control_store(store)
+    bootstrap_postgres_control_store(store)
+    with store.connection() as con:
+        columns = {
+            row[0]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'audited_delegations'"
+            ).fetchall()
+        }
+        assert {
+            "grantor_principal",
+            "delegatee_principal",
+            "provider",
+            "repo",
+            "item_number",
+            "request_key",
+            "action",
+            "stage",
+            "expires_at",
+            "revoked_at",
+            "used_at",
+            "use_key",
+        } <= columns
+        assert con.execute(
+            "SELECT count(*) FROM control_schema_migrations WHERE version = ?",
+            [AUDITED_DELEGATION_MIGRATION],
+        ).fetchone() == (1,)
 
 
 def test_expected_effect_artifact_migration_42_is_additive(pg_control_path):
