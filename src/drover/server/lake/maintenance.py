@@ -188,24 +188,70 @@ def maintain_lake(
     ):
         baseline, proof_digest, proof = _baseline_snapshot(spec)
         snapshots_before = _snapshot_count(con)
-        before_snapshot = max(row[0] for row in _snapshot_rows(con))
         from .serving_proof import check_referenced_files
 
         referenced_files_before = check_referenced_files(spec, con, limit=2**31 - 1)
         before = {table: _fingerprint(con, table) for table in selected}
         before_rows = {table: _row_count(con, table) for table in selected}
-        run_id = uuid4().hex
-        intent = {
-            "version": 1,
-            "proof_sha256": proof_digest,
-            "catalog_id": proof["catalog_id"],
-            "data_root": proof["data_root"],
-            "before_snapshot": before_snapshot,
-            "tables": before,
-        }
-        intent_digest = hashlib.sha256(
-            json.dumps(intent, sort_keys=True).encode()
-        ).hexdigest()
+
+        def attested_transaction(operation):
+            # DuckLake forbids row changes and file compaction in the same
+            # transaction. Keep each phase separately receipted while holding
+            # this SAME drained writer/reader fence across the whole operation.
+            before_snapshot = max(row[0] for row in _snapshot_rows(con))
+            run_id = uuid4().hex
+            intent = {
+                "version": 1,
+                "proof_sha256": proof_digest,
+                "catalog_id": proof["catalog_id"],
+                "data_root": proof["data_root"],
+                "before_snapshot": before_snapshot,
+                "tables": before,
+            }
+            intent_digest = hashlib.sha256(
+                json.dumps(intent, sort_keys=True).encode()
+            ).hexdigest()
+            con.execute("BEGIN")
+            try:
+                con.execute(
+                    "CALL lake.set_commit_message(?, ?, extra_info => ?)",
+                    [MAINTENANCE_AUTHOR, run_id, intent_digest],
+                )
+                operation()
+                after = {table: _fingerprint(con, table) for table in selected}
+                if after != before:
+                    raise ValueError("maintenance changed logical table content")
+                after_rows = {table: _row_count(con, table) for table in selected}
+                if after_rows != before_rows:
+                    raise ValueError("maintenance changed logical table row counts")
+                fence.check()
+                con.execute("COMMIT")
+            except BaseException:
+                try:
+                    con.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            commits = _snapshot_rows(con, before_snapshot)
+            if any(
+                row[1:] != [MAINTENANCE_AUTHOR, run_id, intent_digest]
+                for row in commits
+            ):
+                raise ValueError("maintenance produced an unattested snapshot")
+            if commits:
+                _append_receipt(
+                    spec,
+                    {
+                        **intent,
+                        "after_snapshot": commits[-1][0],
+                        "commits": commits,
+                        "after_tables": after,
+                        "intent_sha256": intent_digest,
+                    },
+                    fence=fence,
+                )
+            return after_rows
+
         report = {"tables": {}}
         # Preserve both constraints: DuckLake's usual 30-day time-travel
         # window, and the proof/checkpoint baseline. The earlier cutoff is
@@ -217,21 +263,16 @@ def maintain_lake(
         timestamp = con.execute(
             "SELECT least(?, now() - INTERVAL '30 days')", [baseline_timestamp]
         ).fetchone()[0]
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                "CALL lake.set_commit_message(?, ?, extra_info => ?)",
-                [MAINTENANCE_AUTHOR, run_id, intent_digest],
-            )
-            if retune_exporter_role is not None:
-                from .exporter import configure_export_storage, prime_export_inlining
+        if retune_exporter_role is not None:
+            from .exporter import configure_export_storage, prime_export_inlining
 
-                # Unlike raw provisioning on a serving lake, this explicit
-                # retune is one attested unchanged-content transaction. Keep
-                # mutable tables at zero and create append-only inline maps
-                # as admin before refreshing the exporter's DML grants.
+            def retune():
                 configure_export_storage(con)
                 prime_export_inlining(con)
+
+            attested_transaction(retune)
+
+        def compact():
             for table in selected:
                 before = _file_count(con, table)
                 merged = con.execute(
@@ -245,14 +286,8 @@ def maintain_lake(
                     "files_after": _file_count(con, table),
                 }
                 fence.check()
-            after = {table: _fingerprint(con, table) for table in selected}
-            if after != intent["tables"]:
-                raise ValueError("maintenance changed logical table content")
-            after_rows = {table: _row_count(con, table) for table in selected}
-            if after_rows != before_rows:
-                raise ValueError("maintenance changed logical table row counts")
-            # Keep every catalog-changing maintenance procedure in this one
-            # receipted transaction; a later anonymous expiry snapshot would
+            # Keep compaction/expiry/cleanup in their own receipted
+            # transaction; a later anonymous expiry snapshot would
             # correctly fail the serving proof.
             con.execute(
                 "CALL ducklake_expire_snapshots('lake', older_than => ?)",
@@ -264,27 +299,8 @@ def maintain_lake(
                 "older_than => now() - INTERVAL '7 days')"
             )
             fence.check()
-            con.execute("COMMIT")
-        except BaseException:
-            try:
-                con.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        commits = _snapshot_rows(con, before_snapshot)
-        if any(
-            row[1:] != [MAINTENANCE_AUTHOR, run_id, intent_digest] for row in commits
-        ):
-            raise ValueError("maintenance produced an unattested snapshot")
-        if commits:
-            receipt = {
-                **intent,
-                "after_snapshot": commits[-1][0],
-                "commits": commits,
-                "after_tables": after,
-                "intent_sha256": intent_digest,
-            }
-            _append_receipt(spec, receipt, fence=fence)
+
+        after_rows = attested_transaction(compact)
         for table in selected:
             report["tables"][table]["files_after"] = _file_count(con, table)
             report["tables"][table]["rows_after"] = after_rows[table]

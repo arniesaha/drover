@@ -189,9 +189,13 @@ def test_serving_retune_preserves_logical_rows_and_receipted_proof(export_lake):
                 "CALL lake.set_option('data_inlining_row_limit', 0, table_name => ?)",
                 [table],
             )
-        con.execute(
-            "INSERT INTO lake.agent_events (id,date) VALUES ('preserved', '2026-11-21')"
-        )
+        # A retune with no mergeable files masks DuckLake's prohibition on
+        # mixing its temporary row probes with compaction in one transaction.
+        for index in range(80):
+            con.execute(
+                "INSERT INTO lake.agent_events (id,date) VALUES (?, '2026-11-21')",
+                [f"preserved-{index}"],
+            )
     write_serving_proof(export_lake)
     with psycopg.connect(export_lake.dsn()) as pg:
         role = pg.execute("select current_user").fetchone()[0]
@@ -199,6 +203,8 @@ def test_serving_retune_preserves_logical_rows_and_receipted_proof(export_lake):
         before = _fingerprint(con, "agent_events")
     report = compact_lake(export_lake, retune_exporter_role=role)
     assert report["exporter_storage_retuned"] is True
+    assert report["tables"]["agent_events"]["files_before"] >= 80
+    assert report["tables"]["agent_events"]["files_after"] < 80
     proof = export_lake.data_root / "verification/serving-proof.json"
     digest = hashlib.sha256(proof.read_bytes()).hexdigest()
     with lake_connection(export_lake) as con:
@@ -207,7 +213,8 @@ def test_serving_retune_preserves_logical_rows_and_receipted_proof(export_lake):
         options = con.execute("FROM lake.options()").fetchall()
         assert any("30 days" in str(row) for row in options)
     journal = json.loads((proof.parent / "maintenance-receipts.json").read_text())
-    assert journal[-1]["tables"] == journal[-1]["after_tables"]
+    assert len(journal) >= 2
+    assert all(receipt["tables"] == receipt["after_tables"] for receipt in journal)
 
 
 def test_bad_shared_lake_refuses_update_before_any_drain(monkeypatch, tmp_path):
