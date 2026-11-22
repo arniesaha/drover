@@ -169,6 +169,8 @@ public struct LocalNotifier: Notifying {
 public struct AttentionWatcher: Sendable {
     public static let seenKey = "drover.needsyou.seen"
     public static let readKey = "drover.needsyou.read"
+    public static let generationKey = "drover.needsyou.generations"
+    public static let readGenerationKey = "drover.needsyou.read.generations"
     public static let finishedKey = "drover.finished.seen"
 
     private let notifier: Notifying
@@ -227,6 +229,7 @@ public struct AttentionWatcher: Sendable {
         let needsYou = Self.needingUser(snapshot.sessions)
         await notifier.clearResolvedAwaiting(sessionIDs: Set(needsYou.map(\.id)))
         await notifier.setBadge(needsYou.count)
+        seenStore.set(Self.generations(needsYou), forKey: Self.generationKey)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
         seenStore.set(Self.completionReceipts(snapshot), forKey: Self.finishedKey)
     }
@@ -257,7 +260,13 @@ public struct AttentionWatcher: Sendable {
         let needsYou = Self.needsYou(in: snapshot)
         await notifier.clearResolvedAwaiting(sessionIDs: Set(needsYou.map(\.id)))
         let previousIDs = Set(seenStore.stringArray(forKey: Self.seenKey) ?? [])
-        let fresh = SessionStore.newlyNeedsYou(current: snapshot.sessions, previousIDs: previousIDs)
+        let previousGenerations = seenStore.dictionary(forKey: Self.generationKey) as? [String: String] ?? [:]
+        let fresh = needsYou.filter { session in
+            if let generation = session.attentionID {
+                return previousGenerations[session.id] != generation
+            }
+            return !previousIDs.contains(session.id)
+        }
 
         let completions = Self.completionReceipts(snapshot)
         let previousCompletions = seenStore.dictionary(forKey: Self.finishedKey) as? [String: String] ?? [:]
@@ -278,6 +287,7 @@ public struct AttentionWatcher: Sendable {
         seenStore.set(completions, forKey: Self.finishedKey)
         let read = prunedRead(against: needsYou)
         await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
+        seenStore.set(Self.generations(needsYou), forKey: Self.generationKey)
         seenStore.set(needsYou.map(\.id), forKey: Self.seenKey)
     }
 
@@ -293,6 +303,9 @@ public struct AttentionWatcher: Sendable {
         var read = prunedRead(against: needsYou)
         if needsYou.contains(where: { $0.id == sessionID }) {
             read.insert(sessionID)
+            var generations = seenStore.dictionary(forKey: Self.readGenerationKey) as? [String: String] ?? [:]
+            generations[sessionID] = needsYou.first { $0.id == sessionID }?.attentionID
+            seenStore.set(generations, forKey: Self.readGenerationKey)
             seenStore.set(Array(read), forKey: Self.readKey)
         }
         await notifier.setBadge(needsYou.filter { !read.contains($0.id) }.count)
@@ -303,11 +316,23 @@ public struct AttentionWatcher: Sendable {
     /// and makes "asked, read, asked again" behave like a new question.
     private func prunedRead(against needsYou: [SessionSummary]) -> Set<String> {
         let stored = Set(seenStore.stringArray(forKey: Self.readKey) ?? [])
-        let pruned = stored.intersection(needsYou.map(\.id))
+        let generations = seenStore.dictionary(forKey: Self.readGenerationKey) as? [String: String] ?? [:]
+        let pruned = Set(needsYou.filter { session in
+            guard stored.contains(session.id) else { return false }
+            guard let generation = session.attentionID else { return true }
+            return generations[session.id] == generation
+        }.map(\.id))
+        seenStore.set(generations.filter { pruned.contains($0.key) }, forKey: Self.readGenerationKey)
         if pruned != stored {
             seenStore.set(Array(pruned), forKey: Self.readKey)
         }
         return pruned
+    }
+
+    private static func generations(_ sessions: [SessionSummary]) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: sessions.compactMap { session in
+            session.attentionID.map { (session.id, $0) }
+        })
     }
 
     private static func needsYou(in snapshot: HarnessSnapshot) -> [SessionSummary] {

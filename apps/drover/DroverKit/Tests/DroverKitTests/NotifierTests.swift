@@ -416,6 +416,31 @@ struct NotifierTests {
     #expect(notifications.map(\.body) == ["Codex · reply requested"])
 }
 
+@Test func actionGenerationSurvivesMissedClearAndProcessRestart() async throws {
+    func snapshot(_ generation: String, _ activity: String) throws -> HarnessSnapshot {
+        try HarnessSnapshot.decode(from: Data("""
+        {"hosts":[],"sessions":[{"session_id":"same-session","host_id":"host-1",
+        "harness":"codex","mode":"structured","status":"running","awaiting":"input",
+        "attention_id":"\(generation)","last_activity":"\(activity)"}],"cwd_suggestions":[]}
+        """.utf8))
+    }
+    let defaults = testDefaults()
+    let spy = SpyNotifier()
+    let first = try snapshot("question-a", "2026-11-21T20:00:00Z")
+    let watcher = AttentionWatcher(notifier: spy, seenStore: defaults)
+    await watcher.evaluate(first)
+    await watcher.markRead("same-session", in: first)
+    // Same question after a heartbeat and a fresh process must stay silent/read.
+    let restarted = AttentionWatcher(notifier: spy, seenStore: defaults)
+    await restarted.evaluate(try snapshot("question-a", "2026-11-21T20:01:00Z"))
+    // Resolution and a new question both happened entirely between polls.
+    await restarted.evaluate(try snapshot("question-b", "2026-11-21T20:02:00Z"))
+    await AttentionWatcher(notifier: spy, seenStore: defaults).evaluate(
+        try snapshot("question-b", "2026-11-21T20:03:00Z"))
+    #expect(await spy.notifications.map(\.id) == ["same-session", "same-session"])
+    #expect(await spy.badgeCounts == [1, 0, 0, 1, 1])
+}
+
 // MARK: - One announcer at a time
 
 @Test func onceTheHubPushesTheAppStopsAnnouncing() async throws {
