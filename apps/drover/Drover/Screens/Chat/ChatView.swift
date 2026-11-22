@@ -620,6 +620,16 @@ struct ChatView: View {
                         scheduleScroll(with: proxy)
                     }
                 }
+                // The tail includes clearance for the floating stack, whose
+                // first non-zero measurement arrives after the transcript has
+                // taken its initial bottom anchor. Follow it once that space
+                // exists so the final inline row cannot remain behind a newly
+                // measured artifact/activity/composer stack. Detached readers
+                // retain their position.
+                .onChange(of: floatingStackHeight) { oldHeight, newHeight in
+                    guard newHeight > oldHeight, followState.isFollowing else { return }
+                    scheduleScroll(with: proxy)
+                }
                 .onScrollPhaseChange { oldPhase, newPhase, context in
                     scrollPhase = newPhase
                     if newPhase == .tracking

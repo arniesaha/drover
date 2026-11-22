@@ -236,7 +236,19 @@ final class AccessibilityJourneyUITests: XCTestCase {
                 return currentInline.exists && currentChip.exists
                     && currentInline.frame.maxY <= currentChip.frame.minY
             }, object: app)
-        XCTAssertEqual(XCTWaiter.wait(for: [cleared], timeout: timeout), .completed)
+        let clearanceResult = XCTWaiter.wait(for: [cleared], timeout: timeout)
+        let settledInline = app.buttons["artifact-pane-toggle"]
+        let settledChip = app.buttons["chat-floating-artifacts"]
+        XCTAssertEqual(
+            clearanceResult,
+            .completed,
+            "Inline artifact must clear the floating chip after tail anchoring "
+                + "(inline maxY: \(settledInline.frame.maxY), chip minY: \(settledChip.frame.minY))."
+        )
+        let clearedScreenshot = XCTAttachment(screenshot: app.screenshot())
+        clearedScreenshot.name = "Inline artifact clears floating chip XXXL"
+        clearedScreenshot.lifetime = .keepAlways
+        add(clearedScreenshot)
         chip.tap()
         XCTAssertTrue(app.buttons["Open Pull request"].waitForExistence(timeout: timeout))
         app.buttons["Done"].tap()
