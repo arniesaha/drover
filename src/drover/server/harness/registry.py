@@ -1111,6 +1111,7 @@ class HarnessRegistry:
                 """
                 UPDATE harness_sessions
                    SET status = ?,
+                       attention_id = CASE WHEN ? IN ('completed', 'terminated', 'errored', 'failed') THEN NULL ELSE attention_id END,
                        updated_at = ?,
                        ended_at = COALESCE(?, ended_at),
                        last_error = ?,
@@ -1118,6 +1119,7 @@ class HarnessRegistry:
                  WHERE session_id = ?
                 """,
                 [
+                    status,
                     status,
                     now,
                     ended_at,
@@ -1150,10 +1152,11 @@ class HarnessRegistry:
                        lifecycle_generation = lifecycle_generation + 1,
                        last_error = NULL,
                        awaiting = 'input',
+                       attention_id = ?,
                        native_session_id = ?
                  WHERE session_id = ?
                 """,
-                [now, native_session_id, session_id],
+                [now, str(uuid4()), native_session_id, session_id],
             )
         session = self.get_session(session_id)
         if session is None:
@@ -1175,7 +1178,7 @@ class HarnessRegistry:
             # /harness/events ingest path funnel through, so a transition seen
             # here is seen exactly once however the event arrived.
             previous = con.execute(
-                "SELECT awaiting, harness, cwd, status FROM harness_sessions "
+                "SELECT awaiting, harness, cwd, status, attention_id FROM harness_sessions "
                 "WHERE session_id = ?",
                 [session_id],
             ).fetchone()
@@ -1183,17 +1186,22 @@ class HarnessRegistry:
             effective_awaiting = (
                 None if status in ARCHIVED_SESSION_STATUSES else awaiting
             )
+            attention_id = (
+                (previous[4] if previous[0] == effective_awaiting else str(uuid4()))
+                if previous is not None and effective_awaiting in _AWAITING_STATES
+                else None
+            )
             con.execute(
                 """
                 UPDATE harness_sessions
-                   SET awaiting = CASE
+                   SET attention_id = ?, awaiting = CASE
                          WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
                          ELSE ?
                        END,
                        last_activity = ?
                  WHERE session_id = ?
                 """,
-                [awaiting, stamp, session_id],
+                [attention_id, awaiting, stamp, session_id],
             )
             # Only a real change notifies. A harness that re-emits "still
             # awaiting input" every few seconds must not produce a banner every
@@ -1947,7 +1955,7 @@ class HarnessRegistry:
                     str(row["session_id"]): row
                     for row in _rows(
                         con,
-                        "SELECT session_id, awaiting, last_activity, "
+                        "SELECT session_id, awaiting, attention_id, last_activity, "
                         "native_session_id, harness, cwd, status "
                         "FROM harness_sessions "
                         f"WHERE session_id IN ({session_placeholders})",
@@ -2158,6 +2166,7 @@ class HarnessRegistry:
                             for event in raw_projection_events
                         ]
                         awaiting: str | None = None
+                        attention_id = None
                     else:
                         projection_events = sorted(
                             inserted_events,
@@ -2169,6 +2178,7 @@ class HarnessRegistry:
                             ),
                         )
                         awaiting = previous.get("awaiting")
+                        attention_id = previous.get("attention_id")
 
                     latest_activity: datetime | None = None
                     native_session_id: str | None = None
@@ -2191,11 +2201,18 @@ class HarnessRegistry:
                             inner_payload = (
                                 raw_payload if isinstance(raw_payload, dict) else {}
                             )
+                        prior_awaiting = awaiting
                         awaiting = _derive_structured_awaiting(
                             event_type=str(event["event_type"]),
                             payload=inner_payload,
                             current=awaiting,
                         )
+                        if awaiting != prior_awaiting:
+                            attention_id = (
+                                str(event["event_id"])
+                                if awaiting in _AWAITING_STATES
+                                else None
+                            )
                         if event["event_type"] == "session.exited":
                             terminal_status = (
                                 "failed"
@@ -2221,7 +2238,7 @@ class HarnessRegistry:
                     con.execute(
                         """
                         UPDATE harness_sessions
-                           SET awaiting = CASE
+                           SET attention_id = ?, awaiting = CASE
                                  WHEN status IN ('completed', 'terminated', 'errored', 'failed') THEN NULL
                                  ELSE ?
                                END,
@@ -2234,6 +2251,11 @@ class HarnessRegistry:
                          WHERE session_id = ?
                         """,
                         [
+                            (
+                                attention_id
+                                if effective_awaiting in _AWAITING_STATES
+                                else None
+                            ),
                             awaiting,
                             latest_activity,
                             latest_activity,
@@ -2244,7 +2266,7 @@ class HarnessRegistry:
                     )
                     if terminal_status and previous.get("status") != terminal_status:
                         con.execute(
-                            "UPDATE harness_sessions SET status = ?, awaiting = NULL WHERE session_id = ?",
+                            "UPDATE harness_sessions SET status = ?, awaiting = NULL, attention_id = NULL WHERE session_id = ?",
                             [terminal_status, session_id],
                         )
                     if previous.get("awaiting") != effective_awaiting or (

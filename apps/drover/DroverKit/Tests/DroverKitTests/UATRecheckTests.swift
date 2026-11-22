@@ -24,6 +24,17 @@ struct UATRecheckTests {
         #expect(prompt.interruptionLevel == .timeSensitive)
     }
 
+    @Test func actionableLocalFallbackKeepsSafeIdentityAndNeverUsesPaths() {
+        let prompt = LocalNotifier.content(
+            title: "Drover needs you", body: "Codex · approval required", id: "fixture"
+        )
+        #expect(prompt.categoryIdentifier == "input")
+        #expect(prompt.title == "Drover needs you")
+        #expect(prompt.body == "Codex · approval required")
+        #expect(!prompt.body.contains("/"))
+        #expect(prompt.interruptionLevel == .timeSensitive)
+    }
+
     @Test func completedTurnIsNotAQuestionButApprovalStillIs() throws {
         var session = try JSONDecoder().decode(SessionSummary.self, from: Data("""
         {"session_id":"fixture","status":"running","mode":"structured",

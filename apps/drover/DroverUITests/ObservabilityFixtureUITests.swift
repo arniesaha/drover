@@ -437,6 +437,15 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testStaleNotificationRouteReturnsToCurrentSessions() {
+        let app = launchRealApp(pendingSessionID: "missing-session")
+        let notice = app.descendants(matching: .any)["notification-route-stale"]
+        XCTAssertTrue(notice.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 5))
+        screenshot("notification-stale-target-recovery", app)
+    }
+
+    @MainActor
     func testNotificationRouteWaitsForHomeTabBeforePushingAndSurvivesRotation() {
         // First prove that Inbox owns its own session presentation: this
         // navigates neither Home's stack nor the tab selection at the same
