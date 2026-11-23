@@ -18,11 +18,14 @@ struct HarnessPreferenceControls: View {
             selectedEffort: runPreferences.thinkingEffort
         )
 
-        // Normal text keeps both choices on one row. Accessibility sizes
-        // may wrap inside the scrollable input, leaving Send in its own row.
-        let layout = dynamicTypeSize.isAccessibilitySize
-            ? AnyLayout(FlowLayout(spacing: 8))
-            : AnyLayout(HStackLayout(spacing: 8))
+        // Keep the controls on one complete row at every Dynamic Type size.
+        // The composer deliberately caps its input viewport; allowing this
+        // pair to flow into a second line left the lower chip behind the
+        // Attach/Send row at XXXL. A truncated title still leads to the
+        // complete, accessible control (and its picker/menu) without making
+        // the dock taller or concealing part of a hit target.
+        let layout = AnyLayout(HStackLayout(spacing: 8))
+        let fittedAccessibilityRow = dynamicTypeSize.isAccessibilitySize
         layout {
             Button {
                 showsModelPicker = true
@@ -34,11 +37,12 @@ struct HarnessPreferenceControls: View {
                     ),
                     systemImage: "cpu",
                     kind: "Model",
-                    wraps: dynamicTypeSize.isAccessibilitySize
+                    wraps: false
                 )
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("composer-model")
+            .frame(maxWidth: fittedAccessibilityRow ? .infinity : nil, alignment: .leading)
 
             if let effort {
                 Menu {
@@ -52,11 +56,12 @@ struct HarnessPreferenceControls: View {
                         title: effort.title,
                         systemImage: "brain",
                         kind: "Thinking effort",
-                        wraps: dynamicTypeSize.isAccessibilitySize
+                        wraps: false
                     )
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("composer-effort")
+                .frame(maxWidth: fittedAccessibilityRow ? .infinity : nil, alignment: .leading)
             }
 
             if !isEditable {

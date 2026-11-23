@@ -63,7 +63,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: fittedChatComposer ? 2 : 12) {
             if scrollsInput {
                 // Keep one focused input as its height changes. Swapping
                 // ViewThatFits candidates mid-entry used to drop keystrokes.
@@ -79,8 +79,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 18)
-        .padding(.top, attachments.isEmpty ? 16 : 14)
-        .padding(.bottom, 14)
+        .padding(.top, fittedChatComposer ? 4 : (attachments.isEmpty ? 16 : 14))
+        .padding(.bottom, fittedChatComposer ? 4 : 14)
         .background {
             if !floatsInChat {
                 RoundedRectangle(cornerRadius: 30, style: .continuous)
@@ -94,7 +94,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     }
 
     private var inputContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: fittedChatComposer ? 2 : 12) {
             if !attachments.isEmpty {
                 attachmentStrip
             }
@@ -160,6 +160,14 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 .accessibilityIdentifier("composer-send")
             }
         }
+    }
+
+    /// Chat intentionally caps the composer at accessibility sizes so the
+    /// transcript stays useful. The fitted preference row needs the compact
+    /// surrounding rhythm to remain completely above Attach and Send at rest.
+    /// Launch keeps its existing generous form spacing.
+    private var fittedChatComposer: Bool {
+        floatsInChat && dynamicTypeSize.isAccessibilitySize && showsPreferences
     }
 
     /// Dismissal lives in the composer, at the trailing end of the text line.
