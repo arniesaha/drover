@@ -201,7 +201,9 @@ def test_scheduler_skips_planned_stop_before_starting_child(monkeypatch, tmp_pat
     assert scheduler.health()["last_skip"] == "planned_stop_active"
 
 
-def test_compaction_child_uses_its_private_writable_request_directory(monkeypatch, tmp_path):
+def test_compaction_child_uses_its_private_writable_request_directory(
+    monkeypatch, tmp_path
+):
     """DuckDB's default .tmp must never inherit the service working directory."""
     from drover.server.lake import maintenance
     from drover.server.lake.runtime import LakeSpec
@@ -221,7 +223,9 @@ def test_compaction_child_uses_its_private_writable_request_directory(monkeypatc
         return Child()
 
     monkeypatch.setattr(maintenance.subprocess, "Popen", fake_popen)
-    spec = LakeSpec("MAINTENANCE_DSN", tmp_path / "data", tmp_path / "extensions", "0" * 64)
+    spec = LakeSpec(
+        "MAINTENANCE_DSN", tmp_path / "data", tmp_path / "extensions", "0" * 64
+    )
 
     assert maintenance._run_compaction_process(spec, timeout_seconds=7) == {}
     assert seen["cwd"] is not None
