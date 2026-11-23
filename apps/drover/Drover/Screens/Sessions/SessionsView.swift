@@ -255,13 +255,6 @@ struct SessionsView: View {
         // screens (chat, terminal, the launch sheet) declare their own bars
         // and are unaffected.
         .toolbar(.hidden, for: .navigationBar)
-        // Both this and the scene-phase change below ask the store to poll —
-        // the screen appearing and the app becoming active are separate
-        // events and either can happen first. That overlap used to cancel the
-        // first load, because starting tore the running loop down (#85);
-        // `startPolling()` now leaves a live loop alone, so the two calls can
-        // stay independent and neither has to know about the other.
-        .task { store.startPolling() }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             while !Task.isCancelled {
@@ -273,24 +266,6 @@ struct SessionsView: View {
                 catch { /* Keep the last known warning during transient failures. */ }
                 do { try await Task.sleep(for: .seconds(15)) }
                 catch { return }
-            }
-        }
-        .task(id: store.snapshot?.cockpitAPIVersion) {
-            guard let snapshot = store.snapshot else {
-                cockpitStore.updateCapability(from: nil)
-                return
-            }
-            cockpitStore.startForegroundPolling(for: snapshot)
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                store.startPolling()
-                if let snapshot = store.snapshot {
-                    cockpitStore.startForegroundPolling(for: snapshot)
-                }
-            } else {
-                store.stopPolling()
-                cockpitStore.stopForegroundPolling()
             }
         }
         // Foreground polling drives the same AttentionWatcher diff the

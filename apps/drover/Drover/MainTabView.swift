@@ -318,6 +318,20 @@ struct MainTabView: View {
                 catch { return }
             }
         }
+        // The tab root remains mounted when a non-Home destination is
+        // persisted. Keep the shared session and cockpit lifecycles here so
+        // backgrounding does not depend on `SessionsView` being selected.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                sessionStore.startPolling()
+                if let snapshot = sessionStore.snapshot {
+                    cockpitStore.startForegroundPolling(for: snapshot)
+                }
+            } else {
+                sessionStore.stopPolling()
+                cockpitStore.stopForegroundPolling()
+            }
+        }
     }
 
     /// A stable task identity lets a newer notification cancel an obsolete
