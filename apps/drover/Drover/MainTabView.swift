@@ -296,7 +296,10 @@ struct MainTabView: View {
                 cockpitStore.updateCapability(from: nil)
                 return
             }
-            cockpitStore.updateCapability(from: snapshot)
+            // This task is owned by the persistent tab root, not Home. A
+            // previously selected non-Home tab must receive the same initial
+            // cockpit refresh after a cold launch as a Home-first launch.
+            cockpitStore.startForegroundPolling(for: snapshot)
             await inboxAttentionStore.refresh(isAvailable: cockpitStore.isInsightsAvailable)
         }
         .task(id: scenePhase) {
