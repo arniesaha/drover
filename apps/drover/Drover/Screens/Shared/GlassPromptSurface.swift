@@ -70,6 +70,11 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 ScrollView {
                     inputContent
                 }
+                // The input, including a long draft, may scroll. The action
+                // row may not: reserving it a stable 44-point target keeps
+                // the complete dock within the chat's 170-point accessibility
+                // budget without clipping either preference control at rest.
+                .frame(maxHeight: fittedChatComposer ? 116 : nil)
                 .accessibilityIdentifier("composer-scroll")
             } else {
                 inputContent
@@ -102,7 +107,11 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             HStack(alignment: .top, spacing: 8) {
                 TextField(dynamicTypeSize.isAccessibilitySize ? "Message" : placeholder, text: $text, axis: .vertical)
                     .accessibilityLabel(placeholder)
-                    .font(.title3)
+                    // The dock keeps the system's selected accessibility
+                    // category, but body avoids spending a headline-sized
+                    // line on an editable field when its 44-point action row
+                    // and preference controls must fit in the same viewport.
+                    .font(fittedChatComposer ? .body : .title3)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
                     .accessibilityIdentifier("composer-input")
@@ -188,7 +197,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         HarnessPreferenceControls(
             runPreferences: runPreferences,
             isEditable: arePreferencesEditable,
-            lockedReason: preferencesLockedReason
+            lockedReason: preferencesLockedReason,
+            usesCompactAccessibilityPresentation: fittedChatComposer
         )
     }
 

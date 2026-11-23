@@ -43,6 +43,10 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let effort = app.buttons["composer-effort"]
         XCTAssertTrue(model.exists)
         XCTAssertTrue(effort.exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = dark ? "Composer preferences initially complete dark" : "Composer preferences initially complete light"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
         XCTAssertTrue(model.isHittable)
         XCTAssertTrue(app.frame.contains(model.frame))
         XCTAssertTrue(effort.isHittable)
@@ -54,11 +58,6 @@ final class AccessibilityJourneyUITests: XCTestCase {
                                  "Effort must be fully above the composer action row at rest")
         XCTAssertTrue(send.isHittable)
         XCTAssertTrue(attach.isHittable)
-        let screenshot = XCTAttachment(screenshot: app.screenshot())
-        screenshot.name = dark ? "Composer preferences initially complete dark" : "Composer preferences initially complete light"
-        screenshot.lifetime = .keepAlways
-        add(screenshot)
-
         // Exercise both initial controls, not merely their geometry. The
         // fixture catalog is local and the existing effort is re-selected.
         model.tap()
@@ -70,7 +69,15 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let selectedEffort = app.buttons["Auto (Medium)"]
         XCTAssertTrue(selectedEffort.waitForExistence(timeout: timeout))
         selectedEffort.tap()
-        XCTAssertTrue(effort.isHittable)
+        let restoredEffort = app.buttons["composer-effort"]
+        XCTAssertTrue(restoredEffort.waitForExistence(timeout: timeout))
+        XCTAssertTrue(restoredEffort.isHittable,
+                      "Effort must remain operable after a selection dismisses its picker")
+        XCTAssertLessThanOrEqual(restoredEffort.frame.maxY, attach.frame.minY)
+        let postSelection = XCTAttachment(screenshot: app.screenshot())
+        postSelection.name = dark ? "Composer preferences after effort selection dark" : "Composer preferences after effort selection light"
+        postSelection.lifetime = .keepAlways
+        add(postSelection)
     }
 
     @MainActor
@@ -163,6 +170,8 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(jump.frame.height, 44)
         XCTAssertEqual(jump.label, "Jump to latest")
         XCTAssertLessThanOrEqual(activity.frame.height, 130)
+        XCTAssertLessThanOrEqual(inputScroll.frame.height, 124,
+                                 "The scrollable input must leave room for the fixed 44-point action row")
         XCTAssertLessThanOrEqual(send.frame.maxY - inputScroll.frame.minY, 170)
         XCTAssertLessThanOrEqual(jump.frame.maxY, activity.frame.minY)
         XCTAssertLessThanOrEqual(activity.frame.maxY, inputScroll.frame.minY)
