@@ -296,7 +296,10 @@ struct MainTabView: View {
                 cockpitStore.updateCapability(from: nil)
                 return
             }
-            cockpitStore.updateCapability(from: snapshot)
+            // This task is owned by the persistent tab root, not Home. A
+            // previously selected non-Home tab must receive the same initial
+            // cockpit refresh after a cold launch as a Home-first launch.
+            cockpitStore.startForegroundPolling(for: snapshot)
             await inboxAttentionStore.refresh(isAvailable: cockpitStore.isInsightsAvailable)
         }
         .task(id: scenePhase) {
@@ -313,6 +316,20 @@ struct MainTabView: View {
                 guard let interval = workStore.pollIntervalSeconds else { return }
                 do { try await Task.sleep(for: .seconds(interval)) }
                 catch { return }
+            }
+        }
+        // The tab root remains mounted when a non-Home destination is
+        // persisted. Keep the shared session and cockpit lifecycles here so
+        // backgrounding does not depend on `SessionsView` being selected.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                sessionStore.startPolling()
+                if let snapshot = sessionStore.snapshot {
+                    cockpitStore.startForegroundPolling(for: snapshot)
+                }
+            } else {
+                sessionStore.stopPolling()
+                cockpitStore.stopForegroundPolling()
             }
         }
     }

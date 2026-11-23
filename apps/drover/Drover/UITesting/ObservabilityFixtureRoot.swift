@@ -74,6 +74,10 @@ struct ObservabilityFixtureRoot: View {
                      ProcessInfo.processInfo.environment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] == "1")
         .preferredColorScheme(appearance.appearance.colorScheme)
         .droverTint()
+        // `MainTabView` owns the live app's session lifecycle. This isolated
+        // fixture root deliberately bypasses it, so it must retain its own
+        // polling owner or Home never receives the scenario snapshot.
+        .task { sessionStore.startPolling() }
     }
 }
 

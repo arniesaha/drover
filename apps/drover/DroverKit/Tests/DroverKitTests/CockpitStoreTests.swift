@@ -622,6 +622,20 @@ struct CockpitStoreTests {
         #expect(!store.isPolling)
     }
 
+    @Test @MainActor func capabilityRemovalStopsForegroundPolling() async throws {
+        let client = CockpitClientStub(overviews: [
+            try decodeOverview(providerStatus: "ok", activitySessions: 10),
+        ])
+        let store = CockpitStore(client: client)
+
+        store.startForegroundPolling(for: try capableSnapshot(), every: 60)
+        #expect(store.isPolling)
+        store.updateCapability(from: try oldSnapshot())
+
+        #expect(!store.isCockpitAvailable)
+        #expect(!store.isPolling)
+    }
+
     @Test @MainActor func cloudConsentRequiresDisclosureAcknowledgementBeforeRequesting() async throws {
         let client = CockpitClientStub()
         let store = CockpitStore(client: client)
