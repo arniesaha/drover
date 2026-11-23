@@ -67,7 +67,14 @@ struct AnalyticsView: View {
         }
         .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
         .toolbar(.hidden, for: .navigationBar)
-        .task(id: reloadRevision) { await reload() }
+        // A persisted Analytics tab may be constructed before the root's
+        // first session snapshot advertises cockpit capability.  Retrying only
+        // on a user-driven filter revision leaves that first load permanently
+        // empty even after the root has refreshed successfully.
+        .task(id: reloadIdentity) {
+            guard store.isCockpitAvailable else { return }
+            await reload()
+        }
         .refreshable { await reload() }
     }
 
@@ -383,6 +390,10 @@ struct AnalyticsView: View {
         reloadRevision &+= 1
     }
 
+    private var reloadIdentity: ReloadIdentity {
+        ReloadIdentity(revision: reloadRevision, isCockpitAvailable: store.isCockpitAvailable)
+    }
+
     private func reload() async {
         await store.loadAnalytics(filters: AnalyticsFilters(
             days: days, hostID: host, harness: harness, provider: provider,
@@ -398,6 +409,11 @@ struct AnalyticsView: View {
     private var providerValues: [String] {
         Array(Set((store.analytics?.providerCapacity.data ?? []).map(\.provider))).sorted()
     }
+}
+
+private struct ReloadIdentity: Hashable {
+    let revision: Int
+    let isCockpitAvailable: Bool
 }
 
 /// One quota window, with its bar. The cockpit strip shows only the window
