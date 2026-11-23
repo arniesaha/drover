@@ -58,6 +58,10 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertFalse(model.frame.intersects(effort.frame))
         XCTAssertTrue(send.isHittable)
         XCTAssertTrue(attach.isHittable)
+        let settled = XCTAttachment(screenshot: app.screenshot())
+        settled.name = dark ? "Composer preferences settled dark" : "Composer preferences settled light"
+        settled.lifetime = .keepAlways
+        add(settled)
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = dark ? "Composer largest text dark" : "Composer largest text light"
         screenshot.lifetime = .keepAlways

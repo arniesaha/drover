@@ -225,7 +225,10 @@ private struct TerminalRepresentable: UIViewRepresentable {
     let onConnectFailed: (String) -> Void
 
     func makeCoordinator() -> TerminalBridge {
-        TerminalBridge(request: client.terminalRequest(sessionID: sessionID))
+        TerminalBridge(
+            request: client.terminalRequest(sessionID: sessionID),
+            connector: client.terminalConnector
+        )
     }
 
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {

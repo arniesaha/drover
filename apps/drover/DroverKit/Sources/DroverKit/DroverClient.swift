@@ -147,6 +147,9 @@ public actor DroverClient {
     /// still make normal authenticated requests, but cannot restore chat data.
     public nonisolated let credentialBindingID: UUID?
     public nonisolated let webSocketConnector: (any WebSocketConnecting)?
+    /// Test-only transports can supply a deterministic PTY stream. Production
+    /// clients leave this nil and use the URLSession terminal connector.
+    public nonisolated let terminalConnector: (any TerminalConnecting)?
     private let token: String
     private let session: URLSession
     private let retryGate: HubRetryGate
@@ -157,7 +160,8 @@ public actor DroverClient {
         credentialBindingID: UUID? = nil,
         session: URLSession = .shared,
         retryGate: HubRetryGate = .shared,
-        webSocketConnector: (any WebSocketConnecting)? = nil
+        webSocketConnector: (any WebSocketConnecting)? = nil,
+        terminalConnector: (any TerminalConnecting)? = nil
     ) {
         self.config = config
         self.credentialBindingID = credentialBindingID
@@ -165,6 +169,7 @@ public actor DroverClient {
         self.session = session
         self.retryGate = retryGate
         self.webSocketConnector = webSocketConnector
+        self.terminalConnector = terminalConnector
     }
 
     // MARK: Pairing
