@@ -290,17 +290,26 @@ struct MainTabView: View {
         .onAppear {
             if NotificationRoute.shared.pendingAttentionRef != nil { selectedTab = .inbox }
         }
-        .task { sessionStore.startPolling() }
+        // The first snapshot must bootstrap cockpit state here, rather than
+        // relying solely on the snapshot-keyed task below.  A persisted
+        // non-Home tab can otherwise never mount a child that observes the
+        // initial snapshot transition, leaving Accounts and Analytics empty
+        // until the user visits Home.
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await sessionStore.refresh()
+            guard !Task.isCancelled, scenePhase == .active else { return }
+            await startCockpitPolling(for: sessionStore.snapshot)
+            guard !Task.isCancelled, scenePhase == .active else { return }
+            sessionStore.startPolling()
+        }
         .task(id: sessionStore.snapshot?.cockpitAPIVersion) {
-            guard let snapshot = sessionStore.snapshot else {
-                cockpitStore.updateCapability(from: nil)
-                return
-            }
             // This task is owned by the persistent tab root, not Home. A
             // previously selected non-Home tab must receive the same initial
-            // cockpit refresh after a cold launch as a Home-first launch.
-            cockpitStore.startForegroundPolling(for: snapshot)
-            await inboxAttentionStore.refresh(isAvailable: cockpitStore.isInsightsAvailable)
+            // cockpit refresh after a cold launch as a Home-first launch. A
+            // snapshot can also land after backgrounding; that must update
+            // capability state without reviving the stopped foreground poller.
+            await reconcileCockpit(for: sessionStore.snapshot, isActive: scenePhase == .active)
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
@@ -322,15 +331,9 @@ struct MainTabView: View {
         // persisted. Keep the shared session and cockpit lifecycles here so
         // backgrounding does not depend on `SessionsView` being selected.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                sessionStore.startPolling()
-                if let snapshot = sessionStore.snapshot {
-                    cockpitStore.startForegroundPolling(for: snapshot)
-                }
-            } else {
-                sessionStore.stopPolling()
-                cockpitStore.stopForegroundPolling()
-            }
+            guard phase != .active else { return }
+            sessionStore.stopPolling()
+            cockpitStore.stopForegroundPolling()
         }
     }
 
@@ -343,6 +346,25 @@ struct MainTabView: View {
             return "summary:\(ids.joined(separator: ","))"
         }
         return nil
+    }
+
+    /// Applies a newly fetched snapshot at the durable tab root.  This keeps
+    /// the first cold-launch capability handoff independent of which tab is
+    /// selected, while the snapshot-keyed task above still observes later
+    /// capability changes.
+    @MainActor
+    private func startCockpitPolling(for snapshot: HarnessSnapshot?) async {
+        await reconcileCockpit(for: snapshot, isActive: true)
+    }
+
+    @MainActor
+    private func reconcileCockpit(for snapshot: HarnessSnapshot?, isActive: Bool) async {
+        guard CockpitRootLifecycle.apply(
+            snapshot: snapshot,
+            isActive: isActive,
+            cockpitStore: cockpitStore
+        ) else { return }
+        await inboxAttentionStore.refresh(isAvailable: cockpitStore.isInsightsAvailable)
     }
 
     /// UIKit is particularly sensitive to a navigation destination changing
@@ -371,6 +393,26 @@ struct MainTabView: View {
         } else if let ids = NotificationRoute.shared.consumeSummary() {
             homeNotificationRoute = .summary(ids)
         }
+    }
+}
+
+/// The tab root is the sole owner of foreground cockpit polling. Capability
+/// may still be updated from a late snapshot while backgrounded, but only an
+/// active scene is permitted to create a foreground polling task.
+@MainActor
+enum CockpitRootLifecycle {
+    @discardableResult
+    static func apply(
+        snapshot: HarnessSnapshot?,
+        isActive: Bool,
+        cockpitStore: CockpitStore
+    ) -> Bool {
+        guard isActive, let snapshot else {
+            cockpitStore.updateCapability(from: snapshot)
+            return false
+        }
+        cockpitStore.startForegroundPolling(for: snapshot)
+        return true
     }
 }
 
