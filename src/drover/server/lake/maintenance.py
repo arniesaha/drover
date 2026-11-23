@@ -418,6 +418,11 @@ def _run_compaction_process(spec: LakeSpec, *, timeout_seconds: float) -> dict:
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            # DuckDB's default scratch directory is relative to cwd. The
+            # service can intentionally run from a read-only release tree,
+            # so make the short-lived, owner-only child request directory its
+            # writable cwd rather than inheriting the server process cwd.
+            cwd=root,
             start_new_session=True,
         )
         try:
