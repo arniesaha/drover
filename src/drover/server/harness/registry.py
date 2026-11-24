@@ -1169,6 +1169,7 @@ class HarnessRegistry:
         *,
         awaiting: str | None,
         last_activity: datetime | None = None,
+        structured_startup_input: bool = False,
     ) -> None:
         stamp = _as_utc_datetime(last_activity)
         with self._connect() as con:
@@ -1217,7 +1218,12 @@ class HarnessRegistry:
                 if changed and effective_awaiting in _AWAITING_STATES
                 else ""
             )
-        if not changed:
+            startup_ready = (
+                structured_startup_input
+                and effective_awaiting == "input"
+                and not self._session_has_user_input(con, session_id)
+            )
+        if not changed or startup_ready:
             return
         self._dispatch_session_push(
             session_id=session_id,
@@ -1225,6 +1231,24 @@ class HarnessRegistry:
             harness=previous[1],
             cwd=previous[2],
             preview=preview,
+        )
+
+    @staticmethod
+    def _session_has_user_input(con: Any, session_id: str) -> bool:
+        """Whether the session has received a real person turn.
+
+        Structured drivers report ``ready`` as ``awaiting=input`` before a
+        person has asked anything. That state is needed for dispatch, but is
+        not a request for attention. This small durable fact is shared by the
+        local manager and relay/replay ingest paths.
+        """
+        return (
+            con.execute(
+                "SELECT 1 FROM harness_events WHERE session_id = ? "
+                "AND event_type = 'user_input' LIMIT 1",
+                [session_id],
+            ).fetchone()
+            is not None
         )
 
     def _dispatch_session_push(
@@ -2183,6 +2207,8 @@ class HarnessRegistry:
                     latest_activity: datetime | None = None
                     native_session_id: str | None = None
                     terminal_status = None
+                    entered_awaiting = False
+                    completed_turn = False
                     for event in projection_events:
                         raw_payload = event.get("payload")
                         if raw_payload is None:
@@ -2207,6 +2233,11 @@ class HarnessRegistry:
                             payload=inner_payload,
                             current=awaiting,
                         )
+                        if (
+                            awaiting in _AWAITING_STATES
+                            and prior_awaiting not in _AWAITING_STATES
+                        ):
+                            entered_awaiting = True
                         if awaiting != prior_awaiting:
                             attention_id = (
                                 str(event["event_id"])
@@ -2219,6 +2250,9 @@ class HarnessRegistry:
                                 if inner_payload.get("exited", 0) != 0
                                 else "completed"
                             )
+                        completed_turn = completed_turn or (
+                            inner_payload.get("turn_complete") is True
+                        )
                         candidate_native_id = inner_payload.get("native_session_id")
                         if (
                             isinstance(candidate_native_id, str)
@@ -2269,9 +2303,23 @@ class HarnessRegistry:
                             "UPDATE harness_sessions SET status = ?, awaiting = NULL, attention_id = NULL WHERE session_id = ?",
                             [terminal_status, session_id],
                         )
-                    if previous.get("awaiting") != effective_awaiting or (
+                    changed = previous.get("awaiting") != effective_awaiting
+                    terminal_changed = (
                         terminal_status and previous.get("status") != terminal_status
-                    ):
+                    )
+                    reentered_attention = (
+                        entered_awaiting
+                        and effective_awaiting in _AWAITING_STATES
+                        and not terminal_status
+                    )
+                    startup_ready = (
+                        effective_awaiting == "input"
+                        and not completed_turn
+                        and not self._session_has_user_input(con, session_id)
+                    )
+                    if (
+                        changed or terminal_changed or reentered_attention
+                    ) and not startup_ready:
                         preview = (
                             self._attention_preview(con, session_id)
                             if effective_awaiting in _AWAITING_STATES

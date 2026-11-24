@@ -296,6 +296,8 @@ class AwaitingTransition:
             return project or "Session"
         session = self._safe_text(self.title)
         if project and session:
+            if project.casefold() == session.casefold():
+                return project[:120]
             return f"{project} · {session}"[:120]
         return (project or session or "Session")[:120]
 
