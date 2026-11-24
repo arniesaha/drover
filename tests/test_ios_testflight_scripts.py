@@ -123,7 +123,10 @@ elif name == "xcrun":
             print(os.getenv("UPLOAD_STDERR", ""), file=sys.stderr)
             sys.exit(int(os.getenv("VALIDATE_EXIT" if "--validate-app" in args else "UPLOAD_EXIT", "1")))
         validating = "--validate-app" in args
-        print(json.dumps({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": ("No errors validating archive." if validating else "No errors uploading archive."), "product-errors": []} | json.loads(os.getenv("VALIDATE_RESPONSE" if validating else "UPLOAD_RESPONSE", "{}")) | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
+        supplied = json.loads(os.getenv("VALIDATE_RESPONSE" if validating else "UPLOAD_RESPONSE", "{}"))
+        replace = os.getenv("VALIDATE_RESPONSE_REPLACE") == "1" if validating else os.getenv("UPLOAD_RESPONSE_REPLACE") == "1"
+        response = supplied if replace else ({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": ("No errors validating archive." if validating else "No errors uploading archive."), "product-errors": []} | supplied)
+        print(json.dumps(response | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
         if os.getenv("UPLOAD_STDERR"):
             print(os.environ["UPLOAD_STDERR"], file=sys.stderr)
         sys.exit(int(os.getenv("VALIDATE_EXIT" if validating else "UPLOAD_EXIT", "0")))
@@ -747,13 +750,64 @@ def test_validation_accepts_warnings_only_after_positive_confirmation(chain):
     assert "--upload-app" in calls[1]["args"]
 
 
+def test_validation_accepts_real_success_shape_without_invented_prefix(chain):
+    root, _, _, upload, _ = chain
+    secret = "validation-success-private-text"
+    result = upload(
+        "--validate",
+        VALIDATE_RESPONSE_REPLACE="1",
+        VALIDATE_RESPONSE=json.dumps({"success-message": f"opaque {secret}"}),
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads((root / "upload-record.json").read_text())["upload_confirmed"]
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 2
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" in calls[1]["args"]
+    assert secret not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"success-message": ""}, "missing-confirmation"),
+        ({"success-message": None}, "missing-confirmation"),
+        (
+            {"product-errors": [{"message": "explicit error"}]},
+            "nonempty-product-errors",
+        ),
+    ],
+)
+def test_validation_rejects_empty_nonstring_or_explicit_error_before_upload(
+    chain, response, expected
+):
+    root, _, _, upload, _ = chain
+    result = upload(
+        "--validate",
+        VALIDATE_RESPONSE_REPLACE="1",
+        VALIDATE_RESPONSE=json.dumps(response),
+    )
+    assert result.returncode != 0
+    receipt = json.loads((root / "upload-record.json").read_text())
+    assert receipt["stage"] == "validation"
+    assert receipt["validation_result_contract"] == expected
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 1
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" not in calls[0]["args"]
+
+
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
         ({"VALIDATE_EXIT": "1"}, "nonzero-tool-exit"),
         ({"VALIDATE_RAW": "{not-json", "VALIDATE_EXIT": "0"}, "malformed-response"),
         (
-            {"VALIDATE_RESPONSE": '{"success-message": "validated"}'},
+            {"VALIDATE_RESPONSE": '{"success-message": ""}'},
             "missing-confirmation",
         ),
         (
