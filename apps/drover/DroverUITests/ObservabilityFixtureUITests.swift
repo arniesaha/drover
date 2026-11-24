@@ -598,6 +598,55 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testHomeDockTracksBackButtonAndInteractiveBackNavigation() {
+        let app = launchRealApp()
+        let session = app.buttons["fixture-session"]
+        let dock = app.buttons["launch-button"]
+        XCTAssertTrue(session.waitForExistence(timeout: 8))
+        XCTAssertTrue(dock.isHittable)
+
+        session.tap()
+        let chatMenu = app.buttons["chat-menu"]
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        XCTAssertFalse(dock.isHittable, "the Home dock must never be tappable over session detail")
+
+        // A short leading-edge drag starts then cancels an interactive pop.
+        // The detail and its no-dock contract must survive the cancellation.
+        let leadingEdge = app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.5))
+        leadingEdge.press(
+            forDuration: 0.08,
+            thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.18, dy: 0.5)),
+            withVelocity: .slow,
+            thenHoldForDuration: 0
+        )
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 3))
+        XCTAssertFalse(dock.isHittable, "a cancelled back gesture must not expose a phantom Home dock")
+        addSafeFixtureCapture("home-dock-after-cancelled-interactive-back", app)
+
+        // Complete the native interactive pop. Its restored Home root must
+        // bring the dock back as part of the transition, not as a later tap
+        // target appearing over detail.
+        leadingEdge.press(
+            forDuration: 0.08,
+            thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: 0.5)),
+            withVelocity: .slow,
+            thenHoldForDuration: 0
+        )
+        XCTAssertTrue(session.waitForExistence(timeout: 5))
+        XCTAssertTrue(dock.isHittable)
+        addSafeFixtureCapture("home-dock-after-completed-interactive-back", app)
+
+        session.tap()
+        XCTAssertTrue(chatMenu.waitForExistence(timeout: 5))
+        let back = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        back.tap()
+        XCTAssertTrue(session.waitForExistence(timeout: 5))
+        XCTAssertTrue(dock.isHittable, "the Home dock must restore after the Back button too")
+        addSafeFixtureCapture("home-dock-after-back-button", app)
+    }
+
+    @MainActor
     func testAnalyticsHorizontalSwipesDuringLoadingAndLiveUpdateStayInAnalytics() {
         let app = launchRealApp(delayedAnalytics: true)
         // The Home snapshot enables the Cockpit capability. Ensure it has

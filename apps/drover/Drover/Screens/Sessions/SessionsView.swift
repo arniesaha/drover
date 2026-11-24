@@ -241,11 +241,13 @@ struct SessionsView: View {
 
         }
         .background(DroverColor.bg)
-        // A safe-area inset keeps the floating control visually pinned while
-        // reserving its hit region. An overlay left the final session row
-        // underneath the pill at accessibility sizes, so tapping the row
-        // opened New Session instead of the conversation.
-        .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
+        // This is deliberately an overlay on Home's navigation source rather
+        // than a safe-area inset. During the native interactive pop, UIKit
+        // moves the source view back on screen before SwiftUI recomputes an
+        // inset; an inset therefore appeared only after the pop completed.
+        // The scroll view already reserves `dockClearance`, so this keeps the
+        // same row clearance and hit target without covering a final row.
+        .overlay(alignment: .bottomTrailing) {
             if showsNewSessionAction, store.hasLoadedOnce {
                 actionBar
                     .padding(.trailing, DroverRootPageLayout.horizontalInset)
