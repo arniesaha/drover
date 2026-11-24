@@ -2,6 +2,16 @@ name: App Store Connect inventory
 
 on:
   workflow_dispatch:
+    inputs:
+      prerelease_access_probe:
+        description: Compare the two documented same-app prerelease GET contracts
+        required: false
+        default: false
+        type: boolean
+      expected_key_id:
+        description: Optional reviewed ASC key ID, compared privately during prerelease diagnosis
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -60,6 +70,7 @@ jobs:
             raise SystemExit("ASC inventory credential unavailable; private diagnostics discarded")
         PY
     - name: Query App Store Connect inventory
+      if: ${{ !inputs.prerelease_access_probe }}
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
         DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
@@ -71,6 +82,22 @@ jobs:
           --private-key "$RUNNER_TEMP/drover-asc-inventory-key/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8" \
           --output "$RUNNER_TEMP/app-store-connect-inventory.json" \
           --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json"
+    - name: Diagnose App Store Connect prerelease access
+      if: ${{ inputs.prerelease_access_probe }}
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        EXPECTED_KEY_ID: ${{ inputs.expected_key_id }}
+      run: |
+        python3 scripts/ios/testflight_inventory.py \
+          --bundle-id com.arnab.drover \
+          --api-key-id "$DROVER_APPSTORE_API_KEY_ID" \
+          --api-issuer "$DROVER_APPSTORE_API_ISSUER_ID" \
+          --private-key "$RUNNER_TEMP/drover-asc-inventory-key/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8" \
+          --output "$RUNNER_TEMP/app-store-connect-inventory.json" \
+          --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json" \
+          --prerelease-access-probe \
+          --expected-key-id "$EXPECTED_KEY_ID"
     - name: Remove transient ASC credential
       if: always()
       run: |
