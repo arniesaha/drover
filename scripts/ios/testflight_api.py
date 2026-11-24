@@ -21,6 +21,18 @@ APPLE_ERROR_CODE_REASONS = {
     # Do not match prefixes: Apple error text stays private and untrusted.
     "FORBIDDEN.REQUIRED_AGREEMENTS": "agreement-required",
 }
+PROCESSING_STATES = frozenset({"PROCESSING", "FAILED", "INVALID", "VALID"})
+INTERNAL_BETA_STATES = frozenset(
+    {
+        "PROCESSING",
+        "PROCESSING_EXCEPTION",
+        "MISSING_EXPORT_COMPLIANCE",
+        "READY_FOR_BETA_TESTING",
+        "IN_BETA_TESTING",
+        "EXPIRED",
+        "IN_EXPORT_COMPLIANCE_REVIEW",
+    }
+)
 
 
 class Rejected(ValueError):
@@ -383,6 +395,177 @@ def inventory(
         ],
         "builds": sorted(builds, key=lambda row: (row["version"], row["build"])),
         "internal_groups": sorted(groups, key=lambda row: row["name"]),
+    }
+
+
+def candidate_build_availability(
+    client,
+    bundle_id,
+    version,
+    build,
+    internal_group,
+    *,
+    timeout=60,
+    max_pages=2,
+    max_testers=200,
+    clock=time.monotonic,
+):
+    """Read one TestFlight candidate's internal availability without mutation.
+
+    This receipt deliberately proves only ASC's current candidate/group/tester
+    relationship. It neither lists testers nor proves a particular person's
+    device can install the build.
+    """
+    if (
+        not isinstance(bundle_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,190}", bundle_id)
+        or not isinstance(version, str)
+        or not re.fullmatch(r"\d+(?:\.\d+){0,2}", version)
+        or not isinstance(build, str)
+        or not re.fullmatch(r"\d{1,18}", build)
+        or not isinstance(internal_group, str)
+        or not internal_group.strip()
+        or len(internal_group) > 191
+        or not 0 < timeout <= 120
+        or isinstance(max_pages, bool)
+        or not isinstance(max_pages, int)
+        or not 1 <= max_pages <= 2
+        or isinstance(max_testers, bool)
+        or not isinstance(max_testers, int)
+        or not 1 <= max_testers <= 200
+    ):
+        raise Rejected("invalid candidate availability bounds")
+    deadline = clock() + timeout
+
+    def collect(stage, path, params, *, pages=max_pages):
+        try:
+            return client.collection(
+                path, params=params, deadline=deadline, max_pages=pages
+            )
+        except (Rejected, Retryable) as error:
+            raise InventoryFailure(stage, error) from None
+
+    apps = collect(
+        "candidate-app",
+        "/v1/apps",
+        {"filter[bundleId]": bundle_id, "limit": 1},
+        pages=1,
+    )
+    if len(apps) != 1 or not isinstance(apps[0], dict):
+        raise Rejected("ASC candidate app record is missing or ambiguous")
+    try:
+        app_id = _inventory_text(apps[0].get("id"), "app")
+    except Rejected:
+        raise Rejected("ASC candidate app record is missing or ambiguous") from None
+
+    builds = collect(
+        "candidate-build",
+        "/v1/builds",
+        {
+            "filter[app]": app_id,
+            "filter[version]": build,
+            "filter[preReleaseVersion.version]": version,
+            "filter[preReleaseVersion.platform]": "IOS",
+            "limit": 2,
+        },
+        pages=1,
+    )
+    if len(builds) != 1 or not isinstance(builds[0], dict):
+        raise Rejected("ASC candidate build is missing or ambiguous")
+    candidate = builds[0]
+    attributes = candidate.get("attributes")
+    if not isinstance(attributes, dict):
+        raise Rejected("ASC candidate build metadata is incomplete")
+    try:
+        build_id = _inventory_text(candidate.get("id"), "build")
+    except Rejected:
+        raise Rejected("ASC candidate build metadata is incomplete") from None
+    processing_state = attributes.get("processingState")
+    expired = attributes.get("expired")
+    if processing_state not in PROCESSING_STATES or not isinstance(expired, bool):
+        raise Rejected("ASC candidate build metadata is incomplete")
+
+    try:
+        beta_detail = client.request(
+            "GET", f"/v1/builds/{build_id}/buildBetaDetail", deadline=deadline
+        )
+    except (Rejected, Retryable) as error:
+        raise InventoryFailure("candidate-beta-detail", error) from None
+    detail_data = beta_detail.get("data") if isinstance(beta_detail, dict) else None
+    detail_attributes = (
+        detail_data.get("attributes") if isinstance(detail_data, dict) else None
+    )
+    internal_state = (
+        detail_attributes.get("internalBuildState")
+        if isinstance(detail_attributes, dict)
+        else None
+    )
+    if internal_state not in INTERNAL_BETA_STATES:
+        raise Rejected("ASC candidate beta detail is incomplete")
+
+    groups = collect(
+        "candidate-group",
+        "/v1/betaGroups",
+        {
+            "filter[app]": app_id,
+            "filter[name]": internal_group,
+            "filter[isInternalGroup]": "true",
+            "limit": 2,
+        },
+        pages=1,
+    )
+    groups = [
+        row
+        for row in groups
+        if isinstance(row, dict)
+        and isinstance(row.get("attributes"), dict)
+        and row["attributes"].get("name") == internal_group
+        and row["attributes"].get("isInternalGroup") is True
+    ]
+    if len(groups) != 1:
+        raise Rejected("ASC intended internal group is missing or ambiguous")
+    try:
+        group_id = _inventory_text(groups[0].get("id"), "group")
+    except Rejected:
+        raise Rejected("ASC intended internal group is incomplete") from None
+
+    assignments = collect(
+        "candidate-group-assignment",
+        "/v1/betaGroups",
+        {"filter[id]": group_id, "filter[builds]": build_id, "limit": 2},
+        pages=1,
+    )
+    assigned = any(
+        isinstance(row, dict) and row.get("id") == group_id for row in assignments
+    )
+    testers = collect(
+        "candidate-testers",
+        f"/v1/betaGroups/{group_id}/relationships/betaTesters",
+        {"limit": min(max_testers, 100)},
+    )
+    if len(testers) > max_testers or not all(
+        isinstance(row, dict)
+        and row.get("type") == "betaTesters"
+        and isinstance(row.get("id"), str)
+        for row in testers
+    ):
+        raise Rejected("ASC internal tester relationship is incomplete")
+
+    return {
+        "version": version,
+        "build": build,
+        "processing_state": processing_state,
+        "expired": expired,
+        "internal_build_state": internal_state,
+        "group_assignment": "assigned" if assigned else "not-assigned",
+        "tester_count": len(testers),
+        "ready_for_internal_testing": (
+            processing_state == "VALID"
+            and not expired
+            and internal_state == "IN_BETA_TESTING"
+            and assigned
+            and bool(testers)
+        ),
     }
 
 
