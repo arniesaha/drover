@@ -356,7 +356,16 @@ class StructuredSessionManager:
                             # 46% of all stored events (drover#270).
                             event_id=message.event_id,
                         )
-                        registry.update_session_activity(session_id, awaiting=awaiting)
+                        registry.update_session_activity(
+                            session_id,
+                            awaiting=awaiting,
+                            structured_startup_input=(
+                                message.type == "status"
+                                and not (
+                                    payload.get("turn_complete") or "exited" in payload
+                                )
+                            ),
+                        )
                         recorded = True
                         break
                     except Exception as exc:  # noqa: BLE001

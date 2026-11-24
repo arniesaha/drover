@@ -132,6 +132,79 @@ def test_activity_is_still_recorded_when_no_sender_is_registered(registry):
     assert registry.get_session("sess-1").awaiting == "approval"
 
 
+def _structured_event(seq, event_type, payload):
+    return {
+        "event_id": f"structured-{seq}",
+        "session_id": "sess-1",
+        "event_type": event_type,
+        "payload": payload,
+        "seq": seq,
+        "created_at": datetime(2026, 8, 12, 1, seq, tzinfo=timezone.utc),
+    }
+
+
+def test_structured_startup_ready_input_is_recorded_but_does_not_alert(
+    registry, sender
+):
+    registry.ingest_structured_events(
+        [_structured_event(1, "status", {"awaiting": "input"})]
+    )
+
+    assert registry.get_session("sess-1").awaiting == "input"
+    assert sender.sent == []
+
+
+def test_local_structured_startup_ready_input_is_recorded_but_does_not_alert(
+    registry, sender
+):
+    registry.append_event(
+        session_id="sess-1",
+        event_type="status",
+        payload={"awaiting": "input"},
+        seq=1,
+    )
+
+    registry.update_session_activity(
+        "sess-1", awaiting="input", structured_startup_input=True
+    )
+
+    assert registry.get_session("sess-1").awaiting == "input"
+    assert sender.sent == []
+
+
+def test_structured_startup_ready_is_silent_in_a_combined_batch_and_on_replay(
+    registry, sender
+):
+    batch = [
+        _structured_event(1, "status", {"awaiting": "input"}),
+        _structured_event(2, "user_input", {"text": "Fix the notification"}),
+    ]
+
+    assert registry.ingest_structured_events(batch) == 2
+    assert registry.get_session("sess-1").awaiting is None
+    assert sender.sent == []
+    assert registry.ingest_structured_events(batch) == 0
+    assert sender.sent == []
+
+
+def test_structured_post_task_question_alerts_after_silent_startup(registry, sender):
+    registry.ingest_structured_events(
+        [_structured_event(1, "status", {"awaiting": "input"})]
+    )
+    registry.ingest_structured_events(
+        [
+            _structured_event(2, "user_input", {"text": "Review this"}),
+            _structured_event(3, "assistant_output", {"text": "Which option?"}),
+            _structured_event(4, "status", {"awaiting": "input"}),
+        ]
+    )
+
+    assert len(sender.sent) == 1
+    assert sender.sent[-1].session_id == "sess-1"
+    assert sender.sent[-1].needs_user
+    assert sender.sent[-1].kind == "input"
+
+
 # --- notification preview ---------------------------------------------------
 
 
@@ -449,6 +522,17 @@ def test_title_is_derived_from_first_prompt(registry, sender):
     )
     registry.update_session_activity("sess-1", awaiting="input")
     assert sender.sent[0].alert_title() == "drover · Fix capture preview"
+
+
+def test_alert_title_deduplicates_equal_project_and_prompt_labels(registry, sender):
+    registry.append_event(
+        session_id="sess-1",
+        event_type="user_input",
+        payload={"text": "drover"},
+    )
+    registry.update_session_activity("sess-1", awaiting="input")
+
+    assert sender.sent[0].alert_title() == "drover"
 
 
 @pytest.mark.parametrize("is_error,kind", [(False, "finished"), (True, "failed")])
