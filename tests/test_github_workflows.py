@@ -110,6 +110,7 @@ def test_app_store_inventory_is_manual_main_only_and_get_only():
     assert job["permissions"] == {"contents": "read"}
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ios/testflight_inventory.py" in commands
+    assert "--diagnostic-output" in commands
     for forbidden in (
         "archive.sh",
         "export_ipa.sh",
@@ -130,6 +131,12 @@ def test_app_store_inventory_is_manual_main_only_and_get_only():
         "DROVER_APPSTORE_API_KEY_ID",
         "DROVER_APPSTORE_API_ISSUER_ID",
     }
+    upload = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Upload sanitized inventory"
+    )
+    assert "app-store-connect-inventory-diagnostic.json" in upload["with"]["path"]
     assert any(
         step.get("name") == "Remove transient ASC credential"
         and step.get("if") == "always()"

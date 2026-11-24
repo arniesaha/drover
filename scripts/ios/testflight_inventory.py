@@ -13,7 +13,27 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from testflight_api import Client, Rejected, inventory
+from testflight_api import Client, InventoryFailure, Rejected, inventory
+
+DIAGNOSTIC_STAGES = frozenset(
+    {
+        "arguments",
+        "credential",
+        "client",
+        "inventory",
+        "apps",
+        "pre-release-versions",
+        "builds",
+        "internal-groups",
+        "output",
+    }
+)
+DIAGNOSTIC_CATEGORIES = frozenset(
+    {"http", "malformed", "network", "rejected", "temporary", "unknown"}
+)
+DIAGNOSTIC_HTTP_STATUSES = frozenset(
+    {400, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504}
+)
 
 
 class Parser(argparse.ArgumentParser):
@@ -84,6 +104,30 @@ def write_record(path: Path, record: dict) -> None:
         output.write("\n")
 
 
+def safe_diagnostic(error: Exception, fallback_stage: str) -> dict:
+    """Return only fixed diagnostic fields, never exception text or API data."""
+    stage = getattr(error, "inventory_stage", fallback_stage)
+    category = getattr(error, "diagnostic_category", "unknown")
+    status = getattr(error, "http_status", None)
+    result = {
+        "stage": stage if stage in DIAGNOSTIC_STAGES else "inventory",
+        "error_category": (
+            category if category in DIAGNOSTIC_CATEGORIES else "unknown"
+        ),
+    }
+    if status in DIAGNOSTIC_HTTP_STATUSES:
+        result["http_status"] = status
+    return result
+
+
+def write_diagnostic(path: Path, diagnostic: dict) -> None:
+    require(path.is_absolute() and path.parent.is_dir() and not path.exists())
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(diagnostic, output, sort_keys=True, separators=(",", ":"))
+        output.write("\n")
+
+
 def main(argv=None):
     parser = Parser(
         description="Read existing iOS TestFlight inventory without mutation."
@@ -93,8 +137,11 @@ def main(argv=None):
     parser.add_argument("--api-issuer", required=True)
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args(argv)
+    parser.add_argument("--diagnostic-output", type=Path)
+    args = None
+    stage = "arguments"
     try:
+        args = parser.parse_args(argv)
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,190}", args.bundle_id))
         require(re.fullmatch(r"[A-Z0-9]{8,20}", args.api_key_id))
         require(
@@ -103,19 +150,29 @@ def main(argv=None):
                 args.api_issuer,
             )
         )
+        stage = "credential"
         private_file(args.private_key)
-        record = inventory(
-            Client(args.private_key, args.api_key_id, args.api_issuer), args.bundle_id
-        )
+        stage = "client"
+        client = Client(args.private_key, args.api_key_id, args.api_issuer)
+        stage = "inventory"
+        record = inventory(client, args.bundle_id)
+        stage = "output"
         write_record(args.output, record)
-    except Exception:
+    except Exception as error:
         try:
-            if args.output.exists() and not args.output.is_symlink():
+            if args and args.output.exists() and not args.output.is_symlink():
                 args.output.unlink()
         except Exception:
             pass
+        diagnostic = safe_diagnostic(error, stage)
+        try:
+            if args and args.diagnostic_output:
+                write_diagnostic(args.diagnostic_output, diagnostic)
+        except Exception:
+            pass
+        details = " ".join(f"{key}={value}" for key, value in diagnostic.items())
         raise SystemExit(
-            "App Store Connect inventory unavailable; private diagnostics discarded"
+            f"App Store Connect inventory failed ({details}); private diagnostics discarded"
         )
 
 

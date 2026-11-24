@@ -69,7 +69,8 @@ jobs:
           --api-key-id "$DROVER_APPSTORE_API_KEY_ID" \
           --api-issuer "$DROVER_APPSTORE_API_ISSUER_ID" \
           --private-key "$RUNNER_TEMP/drover-asc-inventory-key/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8" \
-          --output "$RUNNER_TEMP/app-store-connect-inventory.json"
+          --output "$RUNNER_TEMP/app-store-connect-inventory.json" \
+          --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json"
     - name: Remove transient ASC credential
       if: always()
       run: |
@@ -92,6 +93,8 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: app-store-connect-inventory
-        path: ${{ runner.temp }}/app-store-connect-inventory.json
+        path: |
+          ${{ runner.temp }}/app-store-connect-inventory.json
+          ${{ runner.temp }}/app-store-connect-inventory-diagnostic.json
         if-no-files-found: ignore
         retention-days: 7
