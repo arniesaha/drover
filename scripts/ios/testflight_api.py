@@ -11,11 +11,36 @@ BASE = "https://api.appstoreconnect.apple.com"
 
 
 class Rejected(ValueError):
-    pass
+    def __init__(self, message, *, diagnostic_category="rejected", http_status=None):
+        super().__init__(message)
+        self.diagnostic_category = diagnostic_category
+        self.http_status = http_status
 
 
 class Retryable(Exception):
-    pass
+    def __init__(
+        self, *_private_details, diagnostic_category="temporary", http_status=None
+    ):
+        super().__init__()
+        self.diagnostic_category = diagnostic_category
+        self.http_status = http_status
+
+
+class InventoryFailure(Rejected):
+    """A fixed-stage, redaction-safe summary of a GET-only inventory failure."""
+
+    def __init__(self, stage, cause):
+        category = getattr(cause, "diagnostic_category", "unknown")
+        super().__init__(
+            (
+                "ASC inventory is temporarily unavailable"
+                if category in {"temporary", "network"}
+                else "ASC inventory request failed"
+            ),
+            diagnostic_category=category,
+            http_status=getattr(cause, "http_status", None),
+        )
+        self.inventory_stage = stage
 
 
 def token(key, key_id, issuer, now):
@@ -87,14 +112,18 @@ class Client:
             return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as error:
             if error.code == 429 or 500 <= error.code < 600:
-                raise Retryable() from None
+                raise Retryable(http_status=error.code) from None
             raise Rejected(
-                f"ASC {method} failed (HTTP {error.code}); check API permissions and export compliance in App Store Connect"
+                f"ASC {method} failed (HTTP {error.code}); check API permissions and export compliance in App Store Connect",
+                diagnostic_category="http",
+                http_status=error.code,
             ) from None
         except (urllib.error.URLError, TimeoutError):
-            raise Retryable() from None
+            raise Retryable(diagnostic_category="network") from None
         except (json.JSONDecodeError, UnicodeError):
-            raise Rejected("ASC returned malformed JSON") from None
+            raise Rejected(
+                "ASC returned malformed JSON", diagnostic_category="malformed"
+            ) from None
 
     def collection(self, path, *, params=None, deadline, max_pages=None):
         if max_pages is not None and (
@@ -174,16 +203,18 @@ def inventory(
         raise Rejected("invalid ASC inventory bounds")
     deadline = clock() + timeout
 
-    def collect(path, params):
+    def collect(stage, path, params):
         try:
             return client.collection(
                 path, params=params, deadline=deadline, max_pages=max_pages
             )
-        except Retryable:
-            raise Rejected("ASC inventory is temporarily unavailable") from None
+        except (Rejected, Retryable) as error:
+            raise InventoryFailure(stage, error) from None
 
     apps = collect(
-        "/v1/apps", {"filter[bundleId]": bundle_id, "limit": min(max_versions, 50)}
+        "apps",
+        "/v1/apps",
+        {"filter[bundleId]": bundle_id, "limit": min(max_versions, 50)},
     )
     if len(apps) != 1 or not isinstance(apps[0], dict):
         raise Rejected("ASC app record is missing or ambiguous")
@@ -193,6 +224,7 @@ def inventory(
         raise Rejected("ASC app record is missing or ambiguous") from None
 
     versions_data = collect(
+        "pre-release-versions",
         "/v1/preReleaseVersions",
         {
             "filter[app]": app_id,
@@ -213,6 +245,7 @@ def inventory(
         version = _inventory_text(version_data["attributes"].get("version"), "version")
         versions.append({"version": version})
         version_builds = collect(
+            "builds",
             f"/v1/preReleaseVersions/{version_id}/builds",
             {"limit": min(max_builds_per_version, 50)},
         )
@@ -235,6 +268,7 @@ def inventory(
             )
 
     groups_data = collect(
+        "internal-groups",
         "/v1/betaGroups",
         {
             "filter[app]": app_id,

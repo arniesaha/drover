@@ -5,7 +5,14 @@ import urllib.error
 from pathlib import Path
 
 import pytest
-from ios.testflight_api import Client, Rejected, distribute, inventory, token
+from ios.testflight_api import (
+    Client,
+    InventoryFailure,
+    Rejected,
+    distribute,
+    inventory,
+    token,
+)
 
 INFO = {
     "CFBundleIdentifier": "com.arnab.drover",
@@ -381,7 +388,27 @@ def test_inventory_fails_closed_on_collection_failure_without_exposing_error():
 
     with pytest.raises(Rejected, match="temporarily unavailable") as error:
         inventory(FailingClient(), "com.arnab.drover", clock=lambda: 0)
-    assert "private" not in str(error.value)
+    assert "private API body" not in str(error.value)
+
+
+def test_inventory_preserves_only_safe_stage_category_and_http_status():
+    class FailingClient(InventoryClient):
+        def collection(self, path, **kwargs):
+            assert path == "/v1/apps"
+            raise Rejected(
+                "private bearer token https://private.example/response",
+                diagnostic_category="http",
+                http_status=403,
+            )
+
+    with pytest.raises(InventoryFailure) as error:
+        inventory(FailingClient(), "com.arnab.drover", clock=lambda: 0)
+
+    failure = error.value
+    assert failure.inventory_stage == "apps"
+    assert failure.diagnostic_category == "http"
+    assert failure.http_status == 403
+    assert "private" not in str(failure)
 
 
 def test_inventory_command_writes_only_allowlisted_record(tmp_path, monkeypatch):
@@ -463,6 +490,114 @@ def test_inventory_command_rejects_an_unallowlisted_artifact_field(
     assert not output.exists()
 
 
+def test_inventory_command_writes_only_allowlisted_failure_diagnostic(
+    tmp_path, monkeypatch
+):
+    from ios import testflight_inventory as command
+
+    key = tmp_path / "AuthKey_EXAMPLE123.p8"
+    key.write_text("synthetic private key")
+    key.chmod(0o600)
+    output = tmp_path / "inventory.json"
+    diagnostic = tmp_path / "inventory-diagnostic.json"
+    monkeypatch.setattr(command, "Client", lambda *args: object())
+    monkeypatch.setattr(
+        command,
+        "inventory",
+        lambda *args: (_ for _ in ()).throw(
+            InventoryFailure(
+                "apps",
+                Rejected(
+                    "private bearer token https://private.example/response",
+                    diagnostic_category="http",
+                    http_status=403,
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(
+        SystemExit, match=r"stage=apps error_category=http http_status=403"
+    ) as error:
+        command.main(
+            [
+                "--bundle-id",
+                "com.arnab.drover",
+                "--api-key-id",
+                "EXAMPLE123",
+                "--api-issuer",
+                "11111111-2222-3333-4444-555555555555",
+                "--private-key",
+                str(key),
+                "--output",
+                str(output),
+                "--diagnostic-output",
+                str(diagnostic),
+            ]
+        )
+
+    assert "private.example" not in str(error.value)
+    assert "token=secret" not in str(error.value)
+    assert not output.exists()
+    assert json.loads(diagnostic.read_text()) == {
+        "error_category": "http",
+        "http_status": 403,
+        "stage": "apps",
+    }
+
+
+def test_inventory_command_rejects_adversarial_diagnostic_attributes(
+    tmp_path, monkeypatch
+):
+    from ios import testflight_inventory as command
+
+    class AdversarialError(Exception):
+        inventory_stage = "https://private.example/?token=secret"
+        diagnostic_category = "Bearer secret"
+        http_status = 999
+
+        def __str__(self):
+            return "private response body with token=secret"
+
+    key = tmp_path / "AuthKey_EXAMPLE123.p8"
+    key.write_text("synthetic private key")
+    key.chmod(0o600)
+    diagnostic = tmp_path / "inventory-diagnostic.json"
+    monkeypatch.setattr(command, "Client", lambda *args: object())
+    monkeypatch.setattr(
+        command,
+        "inventory",
+        lambda *args: (_ for _ in ()).throw(AdversarialError()),
+    )
+
+    with pytest.raises(
+        SystemExit, match=r"stage=inventory error_category=unknown"
+    ) as error:
+        command.main(
+            [
+                "--bundle-id",
+                "com.arnab.drover",
+                "--api-key-id",
+                "EXAMPLE123",
+                "--api-issuer",
+                "11111111-2222-3333-4444-555555555555",
+                "--private-key",
+                str(key),
+                "--output",
+                str(tmp_path / "inventory.json"),
+                "--diagnostic-output",
+                str(diagnostic),
+            ]
+        )
+
+    assert "private.example" not in str(error.value)
+    assert "secret" not in str(error.value)
+    assert json.loads(diagnostic.read_text()) == {
+        "error_category": "unknown",
+        "stage": "inventory",
+    }
+
+
 def test_http_errors_never_expose_key_or_body(key):
     class Opener:
         def open(self, request, timeout):
@@ -474,6 +609,8 @@ def test_http_errors_never_expose_key_or_body(key):
     with pytest.raises(Rejected, match="HTTP 403") as error:
         client.request("GET", "/v1/apps", deadline=5)
     assert "PRIVATE" not in str(error.value)
+    assert error.value.diagnostic_category == "http"
+    assert error.value.http_status == 403
 
 
 def test_transient_errors_are_bounded():
