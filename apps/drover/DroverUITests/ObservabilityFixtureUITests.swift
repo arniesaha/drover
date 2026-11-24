@@ -365,10 +365,28 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testHomeGenuineEmptyStateUsesBrandedArtwork() {
+        let app = launch(emptyHome: true)
+        tab(app, "home").tap()
+
+        let artwork = app.images["home-empty-state-artwork"]
+        let caption = app.staticTexts["home-empty-state-caption"]
+        XCTAssertTrue(artwork.waitForExistence(timeout: 8))
+        XCTAssertTrue(caption.exists)
+        XCTAssertEqual(caption.label, "Nothing running")
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+
+        // Keep the verification image in the result bundle; the worker exports
+        // it to the task's scratch directory rather than creating /tmp output.
+        addSafeFixtureCapture("home-empty-state", app)
+    }
+
+    @MainActor
     private func launch(
         large: Bool = false, dark: Bool = false, fleetFilters: Bool = false,
         selectedTab: String? = nil,
-        declutter: Bool = false, reduceTransparency: Bool = false
+        declutter: Bool = false, reduceTransparency: Bool = false,
+        emptyHome: Bool = false
     ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -379,6 +397,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         }
         if declutter { app.launchEnvironment["DROVER_UI_TEST_HOME_DECLUTTER"] = "1" }
         if reduceTransparency { app.launchEnvironment["DROVER_UI_TEST_REDUCE_TRANSPARENCY"] = "1" }
+        if emptyHome { app.launchEnvironment["DROVER_UI_TEST_EMPTY_HOME"] = "1" }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         }

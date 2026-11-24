@@ -155,7 +155,7 @@ enum FixtureScenarioData {
                     "harnesses": [codexRow],
                 ],
             ]],
-            "sessions": coreJourney.sessions.map { session in
+            "sessions": ProcessInfo.processInfo.environment["DROVER_UI_TEST_EMPTY_HOME"] == "1" ? [] : coreJourney.sessions.map { session in
                 var payload: [String: Any] = [
                     "session_id": session.id,
                     "host_id": coreJourney.hostID,
