@@ -310,7 +310,56 @@ def test_cursor_status_parses_authenticated_json(tmp_path):
     status = adapter.status()
 
     assert status.state == "authenticated"
+    assert status.label is None
+    assert status.detail == "Cursor Agent CLI; account identity unavailable"
+
+
+def test_cursor_status_exposes_only_validated_email_identity(tmp_path):
+    cli = tmp_path / "cursor-agent"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' "
+        '\'{"isAuthenticated":true,"userInfo":{"email":"person@example.com","userId":123},"accessToken":"private"}\'\n'
+    )
+    cli.chmod(0o755)
+    adapter = CommandAuthAdapter(
+        harness="cursor",
+        status_command=[str(cli), "status", "--format", "json"],
+        login_command=[str(cli), "login"],
+    )
+
+    status = adapter.status()
+
+    assert status.state == "authenticated"
+    assert status.label == "person@example.com"
     assert status.detail == "Cursor Agent CLI"
+    assert "private" not in (status.detail or "")
+
+
+@pytest.mark.parametrize(
+    "email", [None, "not-an-email", 42, "person\x1b[31m@example.com"]
+)
+def test_cursor_status_does_not_use_malformed_account_identity(email):
+    output = json.dumps({"isAuthenticated": True, "userInfo": {"email": email}})
+
+    status = _parse_cursor_status(output, returncode=0)
+
+    assert status.state == "authenticated"
+    assert status.label is None
+    assert status.detail == "Cursor Agent CLI; account identity unavailable"
+
+
+def test_cursor_status_reports_locked_keychain_without_claiming_logged_out():
+    status = _parse_cursor_status(
+        "Error: macOS login keychain is locked; run security unlock-keychain",
+        returncode=1,
+    )
+
+    assert status.state == "unknown"
+    assert (
+        status.detail
+        == "Cursor credentials are unavailable because the login keychain is locked"
+    )
 
 
 @pytest.mark.parametrize(
