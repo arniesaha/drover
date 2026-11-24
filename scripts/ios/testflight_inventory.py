@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from testflight_api import (
     APPLE_ERROR_CATEGORIES,
+    APPLE_ERROR_REASONS,
     Client,
     InventoryFailure,
     Rejected,
@@ -130,6 +131,9 @@ def safe_diagnostic(error: Exception, fallback_stage: str) -> dict:
     apple = getattr(error, "apple_error_category", None)
     if apple in APPLE_ERROR_CATEGORIES:
         result["apple_error_category"] = apple
+    reason = getattr(error, "apple_error_reason", None)
+    if reason in APPLE_ERROR_REASONS:
+        result["apple_error_reason"] = reason
     return result
 
 
@@ -163,6 +167,9 @@ def allowlisted_probe(record: dict) -> dict:
             if "apple_error_category" in row:
                 allowed.add("apple_error_category")
                 require(row["apple_error_category"] in APPLE_ERROR_CATEGORIES)
+            if "apple_error_reason" in row:
+                allowed.add("apple_error_reason")
+                require(row["apple_error_reason"] in APPLE_ERROR_REASONS)
         require(set(row) == allowed)
         contracts.append({key: row[key] for key in sorted(row)})
     require({row["contract"] for row in contracts} == PROBE_CONTRACTS)
@@ -194,6 +201,7 @@ def main(argv=None):
     parser.add_argument("--diagnostic-output", type=Path)
     parser.add_argument("--prerelease-access-probe", action="store_true")
     parser.add_argument("--expected-key-id")
+    parser.add_argument("--expected-key-id-env", action="store_true")
     args = None
     stage = "arguments"
     try:
@@ -213,7 +221,12 @@ def main(argv=None):
         stage = "inventory"
         if args.prerelease_access_probe:
             require(args.diagnostic_output)
-            expected_key_id = args.expected_key_id or None
+            require(not (args.expected_key_id and args.expected_key_id_env))
+            expected_key_id = (
+                os.environ.get("EXPECTED_KEY_ID")
+                if args.expected_key_id_env
+                else args.expected_key_id
+            ) or None
             if expected_key_id is not None:
                 require(re.fullmatch(r"[A-Z0-9]{8,20}", expected_key_id))
             probe = prerelease_access_probe(

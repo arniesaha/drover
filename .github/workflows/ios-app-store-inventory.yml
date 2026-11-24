@@ -8,10 +8,6 @@ on:
         required: false
         default: false
         type: boolean
-      expected_key_id:
-        description: Optional reviewed ASC key ID, compared privately during prerelease diagnosis
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -87,7 +83,7 @@ jobs:
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
         DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
-        EXPECTED_KEY_ID: ${{ inputs.expected_key_id }}
+        EXPECTED_KEY_ID: ${{ secrets.DROVER_APPSTORE_EXPECTED_KEY_ID }}
       run: |
         python3 scripts/ios/testflight_inventory.py \
           --bundle-id com.arnab.drover \
@@ -97,7 +93,7 @@ jobs:
           --output "$RUNNER_TEMP/app-store-connect-inventory.json" \
           --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json" \
           --prerelease-access-probe \
-          --expected-key-id "$EXPECTED_KEY_ID"
+          --expected-key-id-env
     - name: Remove transient ASC credential
       if: always()
       run: |

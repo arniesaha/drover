@@ -15,6 +15,12 @@ MAX_PROBE_ERROR_BYTES = 16 * 1024
 APPLE_ERROR_CATEGORIES = frozenset(
     {"forbidden", "unauthorized", "not-found", "parameter", "rate-limited", "unknown"}
 )
+APPLE_ERROR_REASONS = frozenset({"agreement-required", "unknown"})
+APPLE_ERROR_CODE_REASONS = {
+    # This exact code was returned by the protected prerelease diagnostic.
+    # Do not match prefixes: Apple error text stays private and untrusted.
+    "FORBIDDEN.REQUIRED_AGREEMENTS": "agreement-required",
+}
 
 
 class Rejected(ValueError):
@@ -25,11 +31,13 @@ class Rejected(ValueError):
         diagnostic_category="rejected",
         http_status=None,
         apple_error_category=None,
+        apple_error_reason=None,
     ):
         super().__init__(message)
         self.diagnostic_category = diagnostic_category
         self.http_status = http_status
         self.apple_error_category = apple_error_category
+        self.apple_error_reason = apple_error_reason
 
 
 class Retryable(Exception):
@@ -55,38 +63,40 @@ class InventoryFailure(Rejected):
             diagnostic_category=category,
             http_status=getattr(cause, "http_status", None),
             apple_error_category=getattr(cause, "apple_error_category", None),
+            apple_error_reason=getattr(cause, "apple_error_reason", None),
         )
         self.inventory_stage = stage
 
 
-def _apple_error_category(error):
+def _apple_error_details(error):
     """Classify a bounded ASC error body without retaining any of its text."""
     try:
         raw = error.read(MAX_PROBE_ERROR_BYTES + 1)
         if not isinstance(raw, bytes) or len(raw) > MAX_PROBE_ERROR_BYTES:
-            return "unknown"
+            return "unknown", "unknown"
         payload = json.loads(raw.decode("utf-8"))
         errors = payload.get("errors") if isinstance(payload, dict) else None
         if not isinstance(errors, list) or len(errors) != 1:
-            return "unknown"
+            return "unknown", "unknown"
         code = errors[0].get("code") if isinstance(errors[0], dict) else None
         if not isinstance(code, str) or len(code) > 128:
-            return "unknown"
+            return "unknown", "unknown"
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return "unknown"
+        return "unknown", "unknown"
 
     normalized = code.upper()
+    reason = APPLE_ERROR_CODE_REASONS.get(normalized, "unknown")
     if normalized.startswith("FORBIDDEN"):
-        return "forbidden"
+        return "forbidden", reason
     if normalized.startswith("UNAUTHORIZED"):
-        return "unauthorized"
+        return "unauthorized", reason
     if normalized.startswith("NOT_FOUND"):
-        return "not-found"
+        return "not-found", reason
     if normalized.startswith("PARAMETER"):
-        return "parameter"
+        return "parameter", reason
     if normalized.startswith("RATE_LIMIT"):
-        return "rate-limited"
-    return "unknown"
+        return "rate-limited", reason
+    return "unknown", reason
 
 
 def token(key, key_id, issuer, now):
@@ -167,8 +177,8 @@ class Client:
                 raise Rejected("ASC response exceeded size limit")
             return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as error:
-            apple_error_category = (
-                _apple_error_category(error) if diagnostic_error else None
+            apple_error_category, apple_error_reason = (
+                _apple_error_details(error) if diagnostic_error else (None, None)
             )
             if error.code == 429 or 500 <= error.code < 600:
                 raise Retryable(http_status=error.code) from None
@@ -177,6 +187,7 @@ class Client:
                 diagnostic_category="http",
                 http_status=error.code,
                 apple_error_category=apple_error_category,
+                apple_error_reason=apple_error_reason,
             ) from None
         except (urllib.error.URLError, TimeoutError):
             raise Retryable(diagnostic_category="network") from None
@@ -385,7 +396,31 @@ def _probe_failure(contract, error):
         result["http_status"] = error.http_status
     if getattr(error, "apple_error_category", None) in APPLE_ERROR_CATEGORIES:
         result["apple_error_category"] = error.apple_error_category
+    if getattr(error, "apple_error_reason", None) in APPLE_ERROR_REASONS:
+        result["apple_error_reason"] = error.apple_error_reason
     return result
+
+
+def _probe_collection_page(client, path, *, params, deadline):
+    """Read one validated collection page without traversing pagination links."""
+    page = client.request(
+        "GET",
+        path,
+        params=params,
+        deadline=deadline,
+        diagnostic_error=True,
+        max_response_bytes=MAX_PROBE_RESPONSE_BYTES,
+    )
+    if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+        raise Rejected("ASC returned malformed collection")
+    links = page.get("links")
+    if links is not None:
+        if not isinstance(links, dict):
+            raise Rejected("ASC returned malformed collection")
+        next_link = links.get("next")
+        if next_link is not None and not isinstance(next_link, str):
+            raise Rejected("ASC returned malformed pagination")
+    return page["data"]
 
 
 def prerelease_access_probe(
@@ -416,13 +451,11 @@ def prerelease_access_probe(
         raise Rejected("invalid ASC prerelease access probe bounds")
     deadline = clock() + timeout
     try:
-        apps = client.collection(
+        apps = _probe_collection_page(
+            client,
             "/v1/apps",
             params={"filter[bundleId]": bundle_id, "limit": 1},
             deadline=deadline,
-            max_pages=1,
-            diagnostic_error=True,
-            max_response_bytes=MAX_PROBE_RESPONSE_BYTES,
         )
     except (Rejected, Retryable) as error:
         raise InventoryFailure("apps", error) from None
@@ -435,13 +468,11 @@ def prerelease_access_probe(
 
     def compare(contract, path, params):
         try:
-            client.collection(
+            _probe_collection_page(
+                client,
                 path,
                 params=params,
                 deadline=deadline,
-                max_pages=1,
-                diagnostic_error=True,
-                max_response_bytes=MAX_PROBE_RESPONSE_BYTES,
             )
         except (Rejected, Retryable) as error:
             return _probe_failure(contract, error)
@@ -467,7 +498,9 @@ def prerelease_access_probe(
             compare(
                 "app-scoped",
                 f"/v1/apps/{app_id}/preReleaseVersions",
-                {"filter[platform]": "IOS", "limit": 1},
+                # Apple documents this app-bound route with `limit`; its current
+                # DocC contract does not list filter[platform]. Do not assume it.
+                {"limit": 1},
             ),
         ],
     }
