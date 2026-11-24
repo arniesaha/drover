@@ -17,7 +17,7 @@ APPLE_ERROR_CATEGORIES = frozenset(
 )
 APPLE_ERROR_REASONS = frozenset({"agreement-required", "unknown"})
 APPLE_ERROR_CODE_REASONS = {
-    # This exact code was returned by the protected prerelease diagnostic.
+    # Prepared fixed classification only; it is not evidence of a live response.
     # Do not match prefixes: Apple error text stays private and untrusted.
     "FORBIDDEN.REQUIRED_AGREEMENTS": "agreement-required",
 }
