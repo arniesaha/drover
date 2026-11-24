@@ -59,6 +59,11 @@ _SECRET_KEY_NAME_RE = (
     r"[A-Z0-9_-]*"
 )
 _URL_RE = re.compile(r"https?://[^\s)'\"]+")
+_CURSOR_EMAIL_RE = re.compile(
+    r"(?i)(?=.{3,254}$)[a-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
 # Hyphenated one-time codes. Group widths vary by provider -- codex issues
 # `P1KY-AS6MU` (4 then 5), so pinning every group to four characters silently
 # dropped the code and left the device page with nothing to enter.
@@ -423,6 +428,12 @@ def _parse_cursor_status(output: str, returncode: int) -> HarnessAuthStatus:
     surface while still giving users an actionable sign-in state.
     """
 
+    if returncode != 0 and _cursor_keychain_is_locked(output):
+        return HarnessAuthStatus(
+            "cursor",
+            "unknown",
+            detail="Cursor credentials are unavailable because the login keychain is locked",
+        )
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
@@ -442,8 +453,44 @@ def _parse_cursor_status(output: str, returncode: int) -> HarnessAuthStatus:
             "cursor", "unauthenticated", detail="Cursor login required"
         )
     if data.get("isAuthenticated") is True:
-        return HarnessAuthStatus("cursor", "authenticated", detail="Cursor Agent CLI")
+        email = _cursor_status_email(data)
+        return HarnessAuthStatus(
+            "cursor",
+            "authenticated",
+            label=email,
+            detail=(
+                "Cursor Agent CLI"
+                if email is not None
+                else "Cursor Agent CLI; account identity unavailable"
+            ),
+        )
     return HarnessAuthStatus("cursor", "unknown", detail="Cursor status was incomplete")
+
+
+def _cursor_keychain_is_locked(output: str) -> bool:
+    """Classify the macOS credential-store failure without preserving its text."""
+    lowered = output.lower()
+    return "keychain" in lowered and "locked" in lowered
+
+
+def _cursor_status_email(data: dict[str, Any]) -> str | None:
+    """Return Cursor's only reviewed display identity from status JSON.
+
+    ``status --format json`` also carries token-presence booleans and optional
+    profile fields. The daemon needs neither. Restrict the public account
+    identity to a syntactically valid ``userInfo.email`` so a future CLI field
+    cannot become a label or leak into provider records by accident.
+    """
+    user_info = data.get("userInfo")
+    if not isinstance(user_info, dict):
+        return None
+    email = user_info.get("email")
+    if not isinstance(email, str):
+        return None
+    normalized = email.strip().lower()
+    if not _CURSOR_EMAIL_RE.fullmatch(normalized):
+        return None
+    return normalized
 
 
 def _spawn_on_pty(command: Sequence[str]) -> tuple[subprocess.Popen[Any], int]:
