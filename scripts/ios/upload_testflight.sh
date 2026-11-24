@@ -109,17 +109,23 @@ def altool_result_contract(response, returncode, verb):
         return "nonzero-tool-exit"
     if not isinstance(response, dict):
         return "malformed-response"
-    message = response.get("success-message")
-    if not isinstance(message, str) or not re.match(
-        rf"^No errors {verb}\b", message.strip()
-    ):
-        return "missing-confirmation"
     for field in ("product-errors", "product-warnings"):
         value = response.get(field)
         if value is not None and not isinstance(value, list):
             return f"malformed-{field}"
     if response.get("product-errors"):
         return "nonempty-product-errors"
+    message = response.get("success-message")
+    if not isinstance(message, str) or not message.strip():
+        return "missing-confirmation"
+    # The current altool manual defines validation as either success or a
+    # returned error list, and its zero exit status as success. The protected
+    # validation-only run observed a nonempty string success-message without
+    # product errors or warnings. That is the structured positive validation
+    # signal; an undocumented English prefix is not. Upload confirmation keeps
+    # its existing stricter prefix because no equivalent upload evidence exists.
+    if verb != "validating" and not re.match(rf"^No errors {verb}\b", message.strip()):
+        return "missing-confirmation"
     return None
 
 
