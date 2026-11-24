@@ -103,7 +103,7 @@ def write_receipt(path, receipt):
         output.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
-def altool_result_contract(response, returncode, verb):
+def altool_result_contract(response, returncode, operation):
     """Classify fixed altool evidence without retaining its messages or body."""
     if returncode != 0:
         return "nonzero-tool-exit"
@@ -118,14 +118,16 @@ def altool_result_contract(response, returncode, verb):
     message = response.get("success-message")
     if not isinstance(message, str) or not message.strip():
         return "missing-confirmation"
-    # The current altool manual defines validation as either success or a
-    # returned error list, and its zero exit status as success. The protected
-    # validation-only run observed a nonempty string success-message without
-    # product errors or warnings. That is the structured positive validation
-    # signal; an undocumented English prefix is not. Upload confirmation keeps
-    # its existing stricter prefix because no equivalent upload evidence exists.
-    if verb != "validating" and not re.match(rf"^No errors {verb}\b", message.strip()):
-        return "missing-confirmation"
+    # altool documents a zero exit as success and describes both validation and
+    # upload as returning either success or an error list. Protected runs have
+    # now observed this same object shape for each operation: a nonempty string
+    # success-message and no product error collection. Treat that structural
+    # conjunction as the positive signal; an undocumented English prefix is
+    # not part of the tool contract. Upload confirmation still only means the
+    # transfer was accepted: Apple processing and group assignment remain
+    # separate downstream checks.
+    if operation not in {"validating", "uploading"}:
+        return "unsupported-operation"
     return None
 
 
