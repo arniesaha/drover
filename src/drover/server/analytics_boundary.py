@@ -68,6 +68,7 @@ _COCKPIT_QUERY_FIELDS = frozenset(
         "harness_cursor",
         "host_cursor",
         "model_cursor",
+        "include_provider_capacity",
     }
 )
 _PROJECT_ACTIVITY_QUERY_FIELDS = frozenset({"project", "days", "limit"})

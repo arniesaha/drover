@@ -125,6 +125,13 @@ public final class CockpitStore {
         (cockpitAPIVersion ?? 0) >= 1
     }
 
+    /// Version two permits the Analytics tab to omit account capacity because
+    /// Accounts is now its dedicated destination. Older hosts retain the
+    /// original response, avoiding an unknown-query failure.
+    public var supportsProviderFreeAnalytics: Bool {
+        (cockpitAPIVersion ?? 0) >= 2
+    }
+
     public var isInsightsAvailable: Bool {
         isCockpitAvailable && cockpitSections.contains("insights")
     }

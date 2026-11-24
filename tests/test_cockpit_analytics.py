@@ -1347,6 +1347,25 @@ def test_cockpit_analytics_isolates_activity_failure():
     assert payload["activity"]["data"] is None
 
 
+def test_analytics_can_omit_provider_capacity_without_reading_accounts(
+    low_coverage_analytics_db,
+):
+    provider = _FlakyProviderService(_provider_account())
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=provider,
+        connect=lambda: low_coverage_analytics_db,
+    )
+
+    payload = service.analytics(
+        AnalyticsFilters(days=7, include_provider_capacity=False)
+    )
+
+    assert "provider_capacity" not in payload
+    assert payload["activity"]["status"] == "ok"
+    assert provider.calls == 0
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="clonefile requires macOS")
 def test_file_backed_activity_runs_outside_the_server_duckdb_instance(
     tmp_path, monkeypatch
@@ -1679,7 +1698,7 @@ def test_a_healthy_activity_section_is_untouched_by_the_budget():
     # No real analytics store here, so activity reports error rather than ok --
     # what matters is that the budget never fired.
     assert "interrupted" not in recorded
-    assert payload["cockpit_api_version"] == 1
+    assert payload["cockpit_api_version"] == 2
 
 
 def test_an_abandoned_activity_query_blocks_the_next_attempt(monkeypatch):
@@ -2299,6 +2318,14 @@ def test_analytics_metric_filter_re_ranks_dimensions_and_projects():
     assert parsed.metric == "tokens"
     parsed_sessions = _parse_cockpit_query("metric=sessions&days=7")
     assert parsed_sessions.metric == "sessions"
+
+    without_capacity = _parse_cockpit_query("days=7&include_provider_capacity=false")
+    assert without_capacity.include_provider_capacity is False
+
+    with pytest.raises(
+        ValueError, match="include_provider_capacity must be true or false"
+    ):
+        _parse_cockpit_query("include_provider_capacity=no")
 
     with pytest.raises(ValueError, match="metric must be 'tokens' or 'sessions'"):
         _parse_cockpit_query("metric=unknown&days=7")

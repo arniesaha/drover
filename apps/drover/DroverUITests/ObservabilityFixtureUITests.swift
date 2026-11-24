@@ -110,6 +110,41 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testAnalyticsDefersProviderCapacityToAccounts() {
+        let app = launch()
+
+        tab(app, "analytics").tap()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["analytics-drover-observed"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertFalse(
+            app.descendants(matching: .any)["analytics-provider-reported"].exists
+        )
+        addSafeFixtureCapture("analytics-without-provider-accounts", app)
+
+        tab(app, "accounts").tap()
+        XCTAssertTrue(
+            app.scrollViews["provider-accounts-scroll"].waitForExistence(timeout: 5)
+        )
+        addSafeFixtureCapture("accounts-retains-provider-accounts", app)
+    }
+
+    @MainActor
+    func testLocalContentAnalysisNamesTheConnectedServer() {
+        let app = launch()
+        tab(app, "settings").tap()
+
+        let local = app.staticTexts["Recommended · analyzed on the connected server"]
+        XCTAssertTrue(local.waitForExistence(timeout: 8))
+        let settings = app.scrollViews.firstMatch
+        for _ in 0..<8 where !local.isHittable { settings.swipeUp() }
+        XCTAssertTrue(local.isHittable)
+        XCTAssertTrue(app.descendants(matching: .any)["content-analysis-propagation-warning"].exists)
+        addSafeFixtureCapture("content-analysis-connected-server", app)
+    }
+
+    @MainActor
     func testDeclutterFixtureLightReduceTransparencyScreenshots() {
         let app = launch(declutter: true, reduceTransparency: true)
         let fleet = app.scrollViews["fleet-list"]
@@ -618,6 +653,17 @@ final class ObservabilityFixtureUITests: XCTestCase {
         try? FileManager.default.createDirectory(at: targetDir, withIntermediateDirectories: true)
         let targetFile = targetDir.appendingPathComponent("\(name).png")
         try? screenshot.pngRepresentation.write(to: targetFile)
+    }
+
+    /// The dedicated Analytics/Accounts regression has no private live data.
+    /// Keep its captures inside the result bundle so the caller can export and
+    /// inspect just these fixture images into an audited scratch location.
+    @MainActor
+    private func addSafeFixtureCapture(_ name: String, _ app: XCUIApplication) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     /// System tabs use their stable, product-visible destination titles; this

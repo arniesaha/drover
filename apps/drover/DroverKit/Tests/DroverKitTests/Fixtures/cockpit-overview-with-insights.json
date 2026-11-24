@@ -1,5 +1,5 @@
 {
-  "cockpit_api_version": 1,
+  "cockpit_api_version": 2,
   "provider_capacity": {
     "status": "unavailable",
     "observed_at": null,

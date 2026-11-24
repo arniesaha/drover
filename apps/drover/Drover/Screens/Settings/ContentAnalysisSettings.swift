@@ -163,7 +163,7 @@ struct ContentAnalysisSettings: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         case .local:
-            Label("Recommended · analyzed on this device", systemImage: "checkmark.shield")
+            Label("Recommended · analyzed on the connected server", systemImage: "checkmark.shield")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         case .cloud:

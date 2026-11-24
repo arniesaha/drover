@@ -262,6 +262,7 @@ public actor DroverClient {
             ("harness_cursor", filters.harnessCursor),
             ("host_cursor", filters.hostCursor),
             ("model_cursor", filters.modelCursor),
+            ("include_provider_capacity", filters.includeProviderCapacity ? nil : "false"),
         ])
         let data = try await request(
             url: url, method: "GET", body: nil,

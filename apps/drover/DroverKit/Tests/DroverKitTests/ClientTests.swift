@@ -544,6 +544,18 @@ struct ClientTests {
     _ = try await client().analytics(filters: AnalyticsFilters(metric: .tokens))
 }
 
+@Test func analyticsCanOmitProviderCapacityForTheDedicatedAccountsScreen() async throws {
+    mock.handler = { request in
+        #expect(request.url?.path == "/analytics")
+        #expect(request.url?.query == "days=7&include_provider_capacity=false")
+        return (200, emptyAnalyticsJSONWithoutProviderCapacity)
+    }
+
+    _ = try await client().analytics(filters: AnalyticsFilters(
+        includeProviderCapacity: false
+    ))
+}
+
 @Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
     mock.handler = { request in
         #expect(request.url?.path == "/insights")
@@ -747,6 +759,12 @@ private let emptyAnalyticsJSON = Data(#"""
 {"cockpit_api_version":1,
  "filters":{"days":30,"host_id":"mac mini","harness":"codex","provider":"openai","model":"gpt-5.6-sol","project_key":"arniesaha/drover"},
  "provider_capacity":{"status":"unavailable","observed_at":null,"coverage":null,"data":[]},
+ "activity":{"status":"error","observed_at":null,"coverage":null,"data":null}}
+"""#.utf8)
+
+private let emptyAnalyticsJSONWithoutProviderCapacity = Data(#"""
+{"cockpit_api_version":2,
+ "filters":{"days":7,"host_id":null,"harness":null,"provider":null,"model":null,"project_key":null},
  "activity":{"status":"error","observed_at":null,"coverage":null,"data":null}}
 """#.utf8)
 

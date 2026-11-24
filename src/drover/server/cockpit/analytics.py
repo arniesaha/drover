@@ -44,6 +44,9 @@ class AnalyticsFilters:
     harness_cursor: str | None = None
     host_cursor: str | None = None
     model_cursor: str | None = None
+    # Analytics can omit quota cards once a client has a dedicated Accounts
+    # destination. Default true preserves the established response contract.
+    include_provider_capacity: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.days, bool) or not isinstance(self.days, int):
@@ -56,6 +59,8 @@ class AnalyticsFilters:
             raise ValueError(f"limit must be within [1, {_MAX_BREAKDOWNS}]")
         if self.metric is not None and self.metric not in ("tokens", "sessions"):
             raise ValueError("metric must be 'tokens' or 'sessions'")
+        if not isinstance(self.include_provider_capacity, bool):
+            raise ValueError("include_provider_capacity must be a boolean")
 
 
 @dataclass(frozen=True)

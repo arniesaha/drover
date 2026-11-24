@@ -39,7 +39,7 @@ from drover.server.providers.types import ProviderRefreshDeferred
 
 log = logging.getLogger("drover.cockpit")
 
-COCKPIT_API_VERSION = 1
+COCKPIT_API_VERSION = 2
 COCKPIT_SECTIONS = (
     "provider_capacity",
     "activity",
@@ -148,12 +148,14 @@ class CockpitService:
 
             if selected_config(self.duckdb_path).backend == "legacy":
                 require_analytical_store(self.duckdb_path)
-        return {
+        response = {
             "cockpit_api_version": COCKPIT_API_VERSION,
             "filters": asdict(filters),
-            "provider_capacity": self._provider_capacity(filters),
             "activity": self._activity(filters),
         }
+        if filters.include_provider_capacity:
+            response["provider_capacity"] = self._provider_capacity(filters)
+        return response
 
     def _provider_capacity(self, filters: AnalyticsFilters) -> dict[str, Any]:
         if self.provider_usage is None:
