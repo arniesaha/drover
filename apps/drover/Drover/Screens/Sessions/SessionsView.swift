@@ -132,38 +132,37 @@ struct SessionsView: View {
 
                         // Home is the live fleet: needs-you and working sessions
                         // stay together, while decisions and findings live in Inbox.
-                        if runningSessions.isEmpty, store.hasLoadedOnce {
-                            if filterState.isFiltered {
-                                StateView(
-                                    kind: .empty,
-                                    title: "No matching running sessions",
-                                    message: "Try clearing the active filter to see running work.",
-                                    actionTitle: "Clear filters",
-                                    action: { filterState.clear(); filterState.save(to: defaults) }
-                                )
-                            } else {
-                                StateView(
-                                    kind: .empty,
-                                    title: "Nothing running",
-                                    message: "Start a new session when you're ready."
-                                )
+                        // Attention is rendered independently of working rows: an
+                        // otherwise-idle fleet must never hide a real question or
+                        // approval behind the decorative empty state.
+                        if !store.needsYou.isEmpty {
+                            Button {
+                                onOpenInbox()
+                            } label: {
+                                Label("\(store.needsYou.count) item\(store.needsYou.count == 1 ? "" : "s") need your attention", systemImage: "tray.full")
+                                    .font(DroverTypeScale.section)
+                                    .foregroundStyle(DroverTheme.accent)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(DroverSpace.x3)
                             }
-                        } else {
-                            if !store.needsYou.isEmpty {
-                                Button {
-                                    onOpenInbox()
-                                } label: {
-                                    Label("\(store.needsYou.count) item\(store.needsYou.count == 1 ? "" : "s") need your attention", systemImage: "tray.full")
-                                        .font(DroverTypeScale.section)
-                                        .foregroundStyle(DroverTheme.accent)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .padding(DroverSpace.x3)
-                                }
-                                .buttonStyle(.plain)
-                                .background(DroverTheme.accentSubtle,
-                                            in: RoundedRectangle(cornerRadius: DroverRadius.control, style: .continuous))
-                                .accessibilityIdentifier("home-open-inbox")
-                            }
+                            .buttonStyle(.plain)
+                            .background(DroverTheme.accentSubtle,
+                                        in: RoundedRectangle(cornerRadius: DroverRadius.control, style: .continuous))
+                            .accessibilityIdentifier("home-open-inbox")
+                        }
+
+                        switch sessionContentState {
+                        case .filteredEmpty:
+                            StateView(
+                                kind: .empty,
+                                title: "No matching running sessions",
+                                message: "Try clearing the active filter to see running work.",
+                                actionTitle: "Clear filters",
+                                action: { filterState.clear(); filterState.save(to: defaults) }
+                            )
+                        case .empty:
+                            HomeEmptyState()
+                        case .running:
                             Text("Running now")
                                 .font(DroverTypeScale.section)
                                 .foregroundStyle(DroverTheme.textPrimary)
@@ -173,6 +172,8 @@ struct SessionsView: View {
                                     .id(session.id)
                             }
                             .animation(.easeInOut(duration: 0.2), value: runningSessions.map(\.id))
+                        case .loading, .error, .actionRequired:
+                            EmptyView()
                         }
 
                     }
@@ -560,6 +561,17 @@ struct SessionsView: View {
         return filterState.filter(store.working)
     }
 
+    private var sessionContentState: HomeSessionContentState {
+        HomeSessionContentState.select(
+            hasLoadedOnce: store.hasLoadedOnce,
+            isReachable: store.isReachable,
+            hasRunningSessions: !runningSessions.isEmpty,
+            hasActionRequiredSessions: !store.needsYou.isEmpty,
+            hasError: store.lastError != nil,
+            isFiltered: filterState.isFiltered
+        )
+    }
+
     /// How far behind the snapshot every card below is drawn from.
     ///
     /// Recomputed on each render, which is what keeps the age honest: a failed
@@ -761,6 +773,26 @@ struct SessionsView: View {
         )
         try? WidgetSnapshotStore.writeSnapshot(widgetSnapshot)
         WidgetCenter.shared.reloadAllTimelines()
+    }
+}
+
+private struct HomeEmptyState: View {
+    var body: some View {
+        VStack(spacing: DroverSpace.x3) {
+            Image("DroverHero")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 220, maxHeight: 155)
+                .accessibilityLabel("Drover dog artwork")
+                .accessibilityIdentifier("home-empty-state-artwork")
+
+            Text("Nothing running")
+                .droverText(.subtitle)
+                .foregroundStyle(DroverTheme.textSecondary)
+                .accessibilityIdentifier("home-empty-state-caption")
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, DroverSpace.x8)
     }
 }
 
