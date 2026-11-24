@@ -10,6 +10,7 @@ from ios.testflight_api import (
     Client,
     InventoryFailure,
     Rejected,
+    candidate_build_availability,
     distribute,
     inventory,
     prerelease_access_probe,
@@ -411,6 +412,175 @@ def test_inventory_preserves_only_safe_stage_category_and_http_status():
     assert failure.diagnostic_category == "http"
     assert failure.http_status == 403
     assert "private" not in str(failure)
+
+
+class AvailabilityClient:
+    def __init__(
+        self,
+        *,
+        processing_state="VALID",
+        expired=False,
+        internal_state="IN_BETA_TESTING",
+        assigned=True,
+        testers=2,
+        candidate=True,
+    ):
+        self.calls = []
+        self.processing_state = processing_state
+        self.expired = expired
+        self.internal_state = internal_state
+        self.assigned = assigned
+        self.testers = testers
+        self.candidate = candidate
+
+    def collection(self, path, *, params=None, deadline, max_pages=None):
+        self.calls.append(("GET", path, params, max_pages))
+        if path == "/v1/apps":
+            return [{"id": "private-app"}]
+        if path == "/v1/builds":
+            return (
+                [
+                    {
+                        "id": "private-build",
+                        "attributes": {
+                            "processingState": self.processing_state,
+                            "expired": self.expired,
+                        },
+                    }
+                ]
+                if self.candidate
+                else []
+            )
+        if path == "/v1/betaGroups":
+            if "filter[builds]" in params:
+                return [{"id": "private-group"}] if self.assigned else []
+            return [
+                {
+                    "id": "private-group",
+                    "attributes": {
+                        "name": "Drover Internal",
+                        "isInternalGroup": True,
+                    },
+                }
+            ]
+        if path == "/v1/betaGroups/private-group/relationships/betaTesters":
+            return [
+                {"id": f"private-tester-{index}", "type": "betaTesters"}
+                for index in range(self.testers)
+            ]
+        raise AssertionError(path)
+
+    def request(self, method, path, *, deadline, **kwargs):
+        self.calls.append((method, path, kwargs, None))
+        assert method == "GET"
+        assert path == "/v1/builds/private-build/buildBetaDetail"
+        return {"data": {"attributes": {"internalBuildState": self.internal_state}}}
+
+
+def test_candidate_build_availability_reports_only_readiness_status_and_count():
+    client = AvailabilityClient()
+
+    result = candidate_build_availability(
+        client,
+        "com.arnab.drover",
+        "0.2.0",
+        "26",
+        "Drover Internal",
+        clock=lambda: 0,
+    )
+
+    assert result == {
+        "build": "26",
+        "expired": False,
+        "group_assignment": "assigned",
+        "internal_build_state": "IN_BETA_TESTING",
+        "processing_state": "VALID",
+        "ready_for_internal_testing": True,
+        "tester_count": 2,
+        "version": "0.2.0",
+    }
+    assert all(call[0] == "GET" for call in client.calls)
+    assert "private-" not in json.dumps(result)
+    assert next(call for call in client.calls if call[1] == "/v1/builds")[2] == {
+        "filter[app]": "private-app",
+        "filter[version]": "26",
+        "filter[preReleaseVersion.version]": "0.2.0",
+        "filter[preReleaseVersion.platform]": "IOS",
+        "limit": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"internal_state": "READY_FOR_BETA_TESTING"}, False),
+        ({"assigned": False}, False),
+        ({"testers": 0}, False),
+        ({"expired": True}, False),
+    ],
+)
+def test_candidate_build_availability_distinguishes_ready_assignment_and_testers(
+    kwargs, expected
+):
+    result = candidate_build_availability(
+        AvailabilityClient(**kwargs),
+        "com.arnab.drover",
+        "0.2.0",
+        "26",
+        "Drover Internal",
+        clock=lambda: 0,
+    )
+
+    assert result["ready_for_internal_testing"] is expected
+
+
+def test_candidate_build_availability_rejects_missing_or_ambiguous_candidate():
+    with pytest.raises(Rejected, match="candidate build"):
+        candidate_build_availability(
+            AvailabilityClient(candidate=False),
+            "com.arnab.drover",
+            "0.2.0",
+            "26",
+            "Drover Internal",
+            clock=lambda: 0,
+        )
+
+
+def test_candidate_build_availability_rejects_an_unbounded_tester_relationship():
+    with pytest.raises(Rejected, match="tester relationship"):
+        candidate_build_availability(
+            AvailabilityClient(testers=201),
+            "com.arnab.drover",
+            "0.2.0",
+            "26",
+            "Drover Internal",
+            clock=lambda: 0,
+        )
+
+
+def test_candidate_availability_output_and_errors_are_strictly_allowlisted():
+    from ios import testflight_inventory as command
+
+    record = {
+        "version": "0.2.0",
+        "build": "26",
+        "processing_state": "VALID",
+        "expired": False,
+        "internal_build_state": "IN_BETA_TESTING",
+        "group_assignment": "assigned",
+        "tester_count": 2,
+        "ready_for_internal_testing": True,
+    }
+    assert command.allowlisted_candidate_availability(record) == record
+    with pytest.raises(command.Rejected):
+        command.allowlisted_candidate_availability(record | {"private": "secret"})
+    assert command.safe_diagnostic(
+        InventoryFailure(
+            "candidate-build",
+            Rejected("private body", diagnostic_category="http", http_status=403),
+        ),
+        "inventory",
+    ) == {"stage": "candidate-build", "error_category": "http", "http_status": 403}
 
 
 def test_prerelease_probe_compares_only_the_two_same_app_contracts():
@@ -907,6 +1077,52 @@ def test_production_workflow_passes_distribution_arguments():
         s.get("if") == "always()" and s.get("name") == "Remove temporary credentials"
         for s in job["steps"]
     )
+
+
+def test_inventory_workflow_candidate_availability_is_main_only_and_get_only():
+    import yaml
+
+    workflow = yaml.safe_load(
+        (
+            Path(__file__).parents[1] / ".github/workflows/ios-app-store-inventory.yml"
+        ).read_text()
+    )
+    job = workflow["jobs"]["inventory"]
+    assert job["if"] == "github.ref == 'refs/heads/main'"
+    checkout = next(
+        step for step in job["steps"] if step.get("uses") == "actions/checkout@v4"
+    )
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
+    step = next(
+        step
+        for step in job["steps"]
+        if step.get("name")
+        == "Verify existing internal TestFlight candidate availability"
+    )
+    assert (
+        step["if"]
+        == "${{ inputs.candidate_build_availability && !inputs.prerelease_access_probe }}"
+    )
+    assert "--candidate-build-availability" in step["run"]
+    assert "--candidate-version" in step["run"]
+    assert "--candidate-build" in step["run"]
+    assert "--internal-group" in step["run"]
+    assert "upload_testflight.sh" not in step["run"]
+    assert "upload-app" not in step["run"]
+    assert "inputs.candidate_" not in step["run"]
+    assert step["env"] == {
+        "DROVER_APPSTORE_API_KEY_ID": "${{ secrets.DROVER_APPSTORE_API_KEY_ID }}",
+        "DROVER_APPSTORE_API_ISSUER_ID": "${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}",
+        "CANDIDATE_VERSION": "${{ inputs.candidate_version }}",
+        "CANDIDATE_BUILD": "${{ inputs.candidate_build }}",
+        "CANDIDATE_INTERNAL_GROUP": "${{ inputs.candidate_internal_group }}",
+    }
+    for variable in (
+        "$CANDIDATE_VERSION",
+        "$CANDIDATE_BUILD",
+        "$CANDIDATE_INTERNAL_GROUP",
+    ):
+        assert variable in step["run"]
 
 
 @pytest.mark.parametrize("fails", [False, True])

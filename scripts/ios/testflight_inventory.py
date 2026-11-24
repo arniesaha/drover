@@ -19,6 +19,7 @@ from testflight_api import (
     Client,
     InventoryFailure,
     Rejected,
+    candidate_build_availability,
     inventory,
     prerelease_access_probe,
 )
@@ -33,6 +34,12 @@ DIAGNOSTIC_STAGES = frozenset(
         "pre-release-versions",
         "builds",
         "internal-groups",
+        "candidate-app",
+        "candidate-build",
+        "candidate-beta-detail",
+        "candidate-group",
+        "candidate-group-assignment",
+        "candidate-testers",
         "output",
     }
 )
@@ -45,6 +52,18 @@ DIAGNOSTIC_HTTP_STATUSES = frozenset(
 PROBE_CONTRACTS = frozenset({"global-filtered", "app-scoped"})
 PROBE_RESULTS = frozenset({"ok", "rejected"})
 KEY_IDENTITY_RESULTS = frozenset({"matches", "mismatch", "not-compared"})
+CANDIDATE_PROCESSING_STATES = frozenset({"PROCESSING", "FAILED", "INVALID", "VALID"})
+CANDIDATE_INTERNAL_STATES = frozenset(
+    {
+        "PROCESSING",
+        "PROCESSING_EXCEPTION",
+        "MISSING_EXPORT_COMPLIANCE",
+        "READY_FOR_BETA_TESTING",
+        "IN_BETA_TESTING",
+        "EXPIRED",
+        "IN_EXPORT_COMPLIANCE_REVIEW",
+    }
+)
 
 
 class Parser(argparse.ArgumentParser):
@@ -189,6 +208,43 @@ def write_probe(path: Path, probe: dict) -> None:
         output.write("\n")
 
 
+def allowlisted_candidate_availability(record: dict) -> dict:
+    require(
+        isinstance(record, dict)
+        and set(record)
+        == {
+            "version",
+            "build",
+            "processing_state",
+            "expired",
+            "internal_build_state",
+            "group_assignment",
+            "tester_count",
+            "ready_for_internal_testing",
+        }
+        and re.fullmatch(r"\d+(?:\.\d+){0,2}", record["version"] or "")
+        and re.fullmatch(r"\d{1,18}", record["build"] or "")
+        and record["processing_state"] in CANDIDATE_PROCESSING_STATES
+        and isinstance(record["expired"], bool)
+        and record["internal_build_state"] in CANDIDATE_INTERNAL_STATES
+        and record["group_assignment"] in {"assigned", "not-assigned"}
+        and isinstance(record["tester_count"], int)
+        and not isinstance(record["tester_count"], bool)
+        and 0 <= record["tester_count"] <= 200
+        and isinstance(record["ready_for_internal_testing"], bool)
+    )
+    return {key: record[key] for key in sorted(record)}
+
+
+def write_candidate_availability(path: Path, record: dict) -> None:
+    require(path.is_absolute() and path.parent.is_dir() and not path.exists())
+    record = allowlisted_candidate_availability(record)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(record, output, sort_keys=True, separators=(",", ":"))
+        output.write("\n")
+
+
 def main(argv=None):
     parser = Parser(
         description="Read existing iOS TestFlight inventory without mutation."
@@ -200,6 +256,10 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--diagnostic-output", type=Path)
     parser.add_argument("--prerelease-access-probe", action="store_true")
+    parser.add_argument("--candidate-build-availability", action="store_true")
+    parser.add_argument("--candidate-version")
+    parser.add_argument("--candidate-build")
+    parser.add_argument("--internal-group")
     parser.add_argument("--expected-key-id")
     parser.add_argument("--expected-key-id-env", action="store_true")
     args = None
@@ -219,7 +279,15 @@ def main(argv=None):
         stage = "client"
         client = Client(args.private_key, args.api_key_id, args.api_issuer)
         stage = "inventory"
+        require(
+            not (args.prerelease_access_probe and args.candidate_build_availability)
+        )
         if args.prerelease_access_probe:
+            require(
+                not any(
+                    (args.candidate_version, args.candidate_build, args.internal_group)
+                )
+            )
             require(args.diagnostic_output)
             require(not (args.expected_key_id and args.expected_key_id_env))
             expected_key_id = (
@@ -238,6 +306,23 @@ def main(argv=None):
             stage = "output"
             write_probe(args.diagnostic_output, probe)
             return
+        if args.candidate_build_availability:
+            require(
+                args.candidate_version and args.candidate_build and args.internal_group
+            )
+            availability = candidate_build_availability(
+                client,
+                args.bundle_id,
+                args.candidate_version,
+                args.candidate_build,
+                args.internal_group,
+            )
+            stage = "output"
+            write_candidate_availability(args.output, availability)
+            return
+        require(
+            not any((args.candidate_version, args.candidate_build, args.internal_group))
+        )
         record = inventory(client, args.bundle_id)
         stage = "output"
         write_record(args.output, record)

@@ -8,6 +8,26 @@ on:
         required: false
         default: false
         type: boolean
+      candidate_build_availability:
+        description: Verify one existing internal TestFlight candidate with GET-only reads
+        required: false
+        default: false
+        type: boolean
+      candidate_version:
+        description: Existing marketing version for candidate availability only
+        required: false
+        default: '0.2.0'
+        type: string
+      candidate_build:
+        description: Existing build number for candidate availability only
+        required: false
+        default: '26'
+        type: string
+      candidate_internal_group:
+        description: Existing internal beta group for candidate availability only
+        required: false
+        default: Drover Internal
+        type: string
 
 permissions:
   contents: read
@@ -66,7 +86,7 @@ jobs:
             raise SystemExit("ASC inventory credential unavailable; private diagnostics discarded")
         PY
     - name: Query App Store Connect inventory
-      if: ${{ !inputs.prerelease_access_probe }}
+      if: ${{ !inputs.prerelease_access_probe && !inputs.candidate_build_availability }}
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
         DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
@@ -94,6 +114,26 @@ jobs:
           --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json" \
           --prerelease-access-probe \
           --expected-key-id-env
+    - name: Verify existing internal TestFlight candidate availability
+      if: ${{ inputs.candidate_build_availability && !inputs.prerelease_access_probe }}
+      env:
+        DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
+        DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        CANDIDATE_BUILD: ${{ inputs.candidate_build }}
+        CANDIDATE_INTERNAL_GROUP: ${{ inputs.candidate_internal_group }}
+      run: |
+        python3 scripts/ios/testflight_inventory.py \
+          --bundle-id com.arnab.drover \
+          --api-key-id "$DROVER_APPSTORE_API_KEY_ID" \
+          --api-issuer "$DROVER_APPSTORE_API_ISSUER_ID" \
+          --private-key "$RUNNER_TEMP/drover-asc-inventory-key/AuthKey_${DROVER_APPSTORE_API_KEY_ID}.p8" \
+          --output "$RUNNER_TEMP/app-store-connect-candidate-availability.json" \
+          --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json" \
+          --candidate-build-availability \
+          --candidate-version "$CANDIDATE_VERSION" \
+          --candidate-build "$CANDIDATE_BUILD" \
+          --internal-group "$CANDIDATE_INTERNAL_GROUP"
     - name: Remove transient ASC credential
       if: always()
       run: |
@@ -118,6 +158,7 @@ jobs:
         name: app-store-connect-inventory
         path: |
           ${{ runner.temp }}/app-store-connect-inventory.json
+          ${{ runner.temp }}/app-store-connect-candidate-availability.json
           ${{ runner.temp }}/app-store-connect-inventory-diagnostic.json
         if-no-files-found: ignore
         retention-days: 7
