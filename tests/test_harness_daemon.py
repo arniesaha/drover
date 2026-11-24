@@ -2188,7 +2188,7 @@ def test_harnessd_provider_usage_uses_configured_agy_probe(tmp_path):
     assert body["accounts"][0]["windows"][0]["used_percent"] == 42.0
 
 
-def test_harnessd_provider_usage_shows_authenticated_cursor_with_unreported_quota(
+def test_harnessd_provider_usage_shows_authenticated_cursor_identity_with_unreported_quota(
     tmp_path,
 ):
     server, state, base_url = _start_test_server(tmp_path, api_token="secret")
@@ -2197,7 +2197,9 @@ def test_harnessd_provider_usage_shows_authenticated_cursor_with_unreported_quot
         {
             "cursor": StaticAuthAdapter(
                 "cursor",
-                status_value=HarnessAuthStatus("cursor", "authenticated"),
+                status_value=HarnessAuthStatus(
+                    "cursor", "authenticated", label="person@example.com"
+                ),
             )
         }
     )
@@ -2218,15 +2220,80 @@ def test_harnessd_provider_usage_shows_authenticated_cursor_with_unreported_quot
     assert len(body["accounts"]) == 1
     account = body["accounts"][0]
     assert account["provider"] == "cursor"
-    assert account["account_label"] == "Cursor"
-    assert account["account_identity"] is None
+    assert account["account_label"] == "person@example.com"
+    assert account["account_identity"] == "person@example.com"
     assert account["plan_label"] is None
     assert account["harnesses"] == ["cursor"]
     assert account["usage_status"] == "usage_unavailable"
     assert account["status"] == "usage_unavailable"
-    assert account["source"] == "harness-inventory"
+    assert account["source"] == "cursor-cli-status"
     assert account["error_category"] == "quota_unsupported"
     assert account["windows"] == []
+
+
+def test_harnessd_provider_usage_shows_connected_cursor_without_guessed_identity(
+    tmp_path,
+):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"cursor": replace(DEFAULT_PRESETS["cursor"], enabled=True)}
+    state.auth = AuthFlowManager(
+        {
+            "cursor": StaticAuthAdapter(
+                "cursor", status_value=HarnessAuthStatus("cursor", "authenticated")
+            )
+        }
+    )
+    state.provider_usage_cache.refresh_once()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    account = body["accounts"][0]
+    assert account["account_label"] == "Cursor account (identity unavailable)"
+    assert account["account_identity"] is None
+    assert account["error_category"] == "quota_unsupported"
+
+
+def test_harnessd_cursor_account_switch_replaces_cached_identity(tmp_path):
+    server, state, base_url = _start_test_server(tmp_path, api_token="secret")
+    state.presets = {"cursor": replace(DEFAULT_PRESETS["cursor"], enabled=True)}
+    status = [HarnessAuthStatus("cursor", "authenticated", label="first@example.com")]
+
+    class _SwitchingCursorAuth:
+        def status(self):
+            return status[0]
+
+        def command(self):
+            return []
+
+    state.auth = AuthFlowManager({"cursor": _SwitchingCursorAuth()})
+    state.provider_usage_cache.refresh_once()
+    status[0] = HarnessAuthStatus("cursor", "authenticated", label="second@example.com")
+    state.provider_usage_cache.refresh_once()
+    try:
+        request = urllib.request.Request(
+            f"{base_url}/providers/usage",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    finally:
+        state.pty.close_all()
+        server.shutdown()
+        server.server_close()
+
+    assert [account["account_label"] for account in body["accounts"]] == [
+        "second@example.com"
+    ]
+    assert body["accounts"][0]["account_identity"] == "second@example.com"
 
 
 def test_harnessd_provider_usage_omits_unauthenticated_cursor(tmp_path):

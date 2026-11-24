@@ -1541,6 +1541,7 @@ class ProviderUsageRefreshCache:
         self._snapshots: dict[tuple[str, tuple[str, ...]], ProviderAccountSnapshot] = {}
         self._in_flight: dict[tuple[str, tuple[str, ...]], _InFlightProviderProbe] = {}
         self._cursor_authenticated = False
+        self._cursor_account_label: str | None = None
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._wake = threading.Event()
@@ -1600,32 +1601,48 @@ class ProviderUsageRefreshCache:
     ) -> list[DetectedProvider]:
         """Return inventory records that have the account state needed here.
 
-        Cursor's status command proves authentication but does not report a
-        subscription identity or quota. Probe it only from the refresh worker:
-        the HTTP projection remains cache-only, and an unauthenticated CLI is
-        never presented as a provider account.
+        Cursor's status command proves authentication and may provide its
+        reviewed email identity, but does not report a subscription quota.
+        Probe it only from the refresh worker: the HTTP projection remains
+        cache-only, and an unauthenticated CLI is never presented as a
+        provider account.
         """
         detected = detect_provider_accounts(self.state.capabilities())
         if not any(account.provider == "cursor" for account in detected):
             return detected
         if refresh_cursor_auth:
             try:
-                authenticated = (
-                    self.state.auth.status("cursor").get("state") == "authenticated"
-                )
+                status = self.state.auth.status("cursor")
+                authenticated = status.get("state") == "authenticated"
+                label = status.get("label") if authenticated else None
+                cursor_account_label = label if isinstance(label, str) else None
             except KeyError:
                 # A configured preset may outlive an adapter that is no longer
                 # available on PATH. It cannot substantiate an account.
                 authenticated = False
+                cursor_account_label = None
             with self._lock:
                 self._cursor_authenticated = authenticated
+                self._cursor_account_label = cursor_account_label
         with self._lock:
             cursor_authenticated = self._cursor_authenticated
-        return [
-            account
-            for account in detected
-            if account.provider != "cursor" or cursor_authenticated
-        ]
+            cursor_account_label = self._cursor_account_label
+        accounts: list[DetectedProvider] = []
+        for account in detected:
+            if account.provider != "cursor":
+                accounts.append(account)
+                continue
+            if not cursor_authenticated:
+                continue
+            accounts.append(
+                replace(
+                    account,
+                    account_label=(
+                        cursor_account_label or "Cursor account (identity unavailable)"
+                    ),
+                )
+            )
+        return accounts
 
     def _refresh_provider(self, detected: DetectedProvider) -> None:
         key = _provider_cache_key(detected)
@@ -4477,11 +4494,15 @@ def _provider_usage_unavailable_snapshot(
     from drover.server.providers.types import ProviderAccountSnapshot
 
     observed_at = datetime.now(timezone.utc)
+    source = (
+        "cursor-cli-status" if detected.provider == "cursor" else "harness-inventory"
+    )
     fingerprint = json.dumps(
         {
             "provider": detected.provider,
+            "account_label": detected.account_label,
             "host_id": detected.host_id,
-            "source": "harness-inventory",
+            "source": source,
             "status": "usage_unavailable",
             "error_category": error_category,
         },
@@ -4498,7 +4519,7 @@ def _provider_usage_unavailable_snapshot(
         status="usage_unavailable",
         observed_at=observed_at,
         windows=(),
-        source="harness-inventory",
+        source=source,
         error_category=error_category,
     )
 
