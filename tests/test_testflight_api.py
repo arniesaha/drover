@@ -1,5 +1,6 @@
 """ASC processing and distribution use deterministic fakes, never the network."""
 
+import io
 import json
 import urllib.error
 from pathlib import Path
@@ -11,6 +12,7 @@ from ios.testflight_api import (
     Rejected,
     distribute,
     inventory,
+    prerelease_access_probe,
     token,
 )
 
@@ -411,6 +413,180 @@ def test_inventory_preserves_only_safe_stage_category_and_http_status():
     assert "private" not in str(failure)
 
 
+def test_prerelease_probe_compares_only_the_two_same_app_contracts():
+    class ProbeClient:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, path, *, params=None, deadline, **kwargs):
+            self.calls.append((method, path, params, deadline, kwargs))
+            if path == "/v1/apps":
+                return {"data": [{"id": "private-app-id"}]}
+            if path == "/v1/preReleaseVersions":
+                raise Rejected(
+                    "private response body",
+                    diagnostic_category="http",
+                    http_status=403,
+                    apple_error_category="forbidden",
+                )
+            if path == "/v1/apps/private-app-id/preReleaseVersions":
+                return {"data": []}
+            raise AssertionError(path)
+
+    client = ProbeClient()
+    result = prerelease_access_probe(
+        client,
+        "com.arnab.drover",
+        configured_key_id="CONFIGURED123",
+        expected_key_id="CONFIGURED123",
+        clock=lambda: 0,
+    )
+
+    assert result == {
+        "configured_key_identity": "matches",
+        "probe": "pre-release-access",
+        "contracts": [
+            {
+                "contract": "global-filtered",
+                "error_category": "http",
+                "http_status": 403,
+                "apple_error_category": "forbidden",
+                "result": "rejected",
+            },
+            {"contract": "app-scoped", "result": "ok"},
+        ],
+    }
+    assert {call[1] for call in client.calls} == {
+        "/v1/apps",
+        "/v1/preReleaseVersions",
+        "/v1/apps/private-app-id/preReleaseVersions",
+    }
+    assert all(call[0] == "GET" for call in client.calls)
+    assert all(call[2].get("limit") == 1 for call in client.calls)
+    assert client.calls[-1][2] == {"limit": 1}
+    assert "private" not in json.dumps(result)
+
+
+def test_prerelease_probe_classifies_an_allowlisted_apple_error_without_body(key):
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "PRIVATE REASON",
+                {},
+                io.BytesIO(
+                    b'{"errors":[{"code":"FORBIDDEN.REQUIRED_AGREEMENTS",'
+                    b'"detail":"private bearer token"}]}'
+                ),
+            )
+
+    client = Client(key[0], "KEY", "issuer", opener=Opener(), clock=lambda: 0)
+    with pytest.raises(Rejected) as error:
+        client.request(
+            "GET", "/v1/preReleaseVersions", deadline=5, diagnostic_error=True
+        )
+
+    assert error.value.diagnostic_category == "http"
+    assert error.value.http_status == 403
+    assert error.value.apple_error_category == "forbidden"
+    assert error.value.apple_error_reason == "agreement-required"
+    assert "PRIVATE" not in str(error.value)
+    assert "token" not in str(error.value)
+
+
+def test_prerelease_probe_uses_three_bounded_gets_and_ignores_next_page(key):
+    class ProbeClock:
+        value = 0
+
+        def now(self):
+            return self.value
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, limit):
+            assert limit == 64 * 1024 + 1
+            return json.dumps(self.payload).encode()
+
+    class Opener:
+        def __init__(self, clock):
+            self.clock = clock
+            self.urls = []
+            self.timeouts = []
+            self.responses = iter(
+                [
+                    {"data": [{"id": "private-app-id"}]},
+                    {
+                        "data": [{"id": "private-version-id"}],
+                        "links": {
+                            "next": "https://api.appstoreconnect.apple.com/v1/preReleaseVersions?cursor=private"
+                        },
+                    },
+                    {"data": []},
+                ]
+            )
+
+        def open(self, request, timeout):
+            self.urls.append(request.full_url)
+            self.timeouts.append(timeout)
+            self.clock.value = 44
+            return Response(next(self.responses))
+
+    clock = ProbeClock()
+    opener = Opener(clock)
+    client = Client(key[0], "KEY", "issuer", opener=opener, clock=clock.now)
+
+    result = prerelease_access_probe(
+        client,
+        "com.arnab.drover",
+        configured_key_id="CONFIGURED123",
+        clock=clock.now,
+    )
+
+    assert result["contracts"] == [
+        {"contract": "global-filtered", "result": "ok"},
+        {"contract": "app-scoped", "result": "ok"},
+    ]
+    assert len(opener.urls) == 3
+    assert opener.timeouts == [30, 1, 1]
+    assert all("cursor=private" not in url for url in opener.urls)
+    assert "filter%5Bplatform%5D=IOS" in opener.urls[1]
+    assert "filter%5Bplatform%5D" not in opener.urls[2]
+
+
+def test_apple_error_reason_requires_an_exact_allowlisted_code(key):
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "PRIVATE REASON",
+                {},
+                io.BytesIO(
+                    b'{"errors":[{"code":"FORBIDDEN.REQUIRED_AGREEMENTS.EVIL",'
+                    b'"detail":"private bearer token"}]}'
+                ),
+            )
+
+    client = Client(key[0], "KEY", "issuer", opener=Opener(), clock=lambda: 0)
+    with pytest.raises(Rejected) as error:
+        client.request(
+            "GET", "/v1/preReleaseVersions", deadline=5, diagnostic_error=True
+        )
+
+    assert error.value.apple_error_category == "forbidden"
+    assert error.value.apple_error_reason == "unknown"
+    assert "EVIL" not in str(error.value)
+
+
 def test_inventory_command_writes_only_allowlisted_record(tmp_path, monkeypatch):
     from ios import testflight_inventory as command
 
@@ -422,7 +598,7 @@ def test_inventory_command_writes_only_allowlisted_record(tmp_path, monkeypatch)
     monkeypatch.setattr(
         command,
         "inventory",
-        lambda *args: {
+        lambda *args, **kwargs: {
             "versions": [{"version": "2.0"}],
             "builds": [{"version": "2.0", "build": "42", "processing_state": "VALID"}],
             "internal_groups": [{"name": "Drover Internal"}],
@@ -464,7 +640,7 @@ def test_inventory_command_rejects_an_unallowlisted_artifact_field(
     monkeypatch.setattr(
         command,
         "inventory",
-        lambda *args: {
+        lambda *args, **kwargs: {
             "versions": [],
             "builds": [],
             "internal_groups": [],
@@ -595,6 +771,81 @@ def test_inventory_command_rejects_adversarial_diagnostic_attributes(
     assert json.loads(diagnostic.read_text()) == {
         "error_category": "unknown",
         "stage": "inventory",
+    }
+
+
+def test_inventory_command_writes_fixed_prerelease_probe_without_inventory(
+    tmp_path, monkeypatch
+):
+    from ios import testflight_inventory as command
+
+    key = tmp_path / "AuthKey_EXAMPLE123.p8"
+    key.write_text("synthetic private key")
+    key.chmod(0o600)
+    output = tmp_path / "inventory.json"
+    diagnostic = tmp_path / "inventory-diagnostic.json"
+    monkeypatch.setattr(command, "Client", lambda *args: object())
+    monkeypatch.setattr(
+        command,
+        "inventory",
+        lambda *args: pytest.fail("normal inventory must not run in probe mode"),
+    )
+    received = {}
+
+    def probe(*args, **kwargs):
+        received.update(kwargs)
+        return {
+            "probe": "pre-release-access",
+            "configured_key_identity": "matches",
+            "contracts": [
+                {
+                    "contract": "global-filtered",
+                    "result": "rejected",
+                    "error_category": "http",
+                    "http_status": 403,
+                    "apple_error_category": "forbidden",
+                },
+                {"contract": "app-scoped", "result": "ok"},
+            ],
+        }
+
+    monkeypatch.setattr(command, "prerelease_access_probe", probe)
+    monkeypatch.setenv("EXPECTED_KEY_ID", "EXAMPLE123")
+
+    command.main(
+        [
+            "--bundle-id",
+            "com.arnab.drover",
+            "--api-key-id",
+            "EXAMPLE123",
+            "--api-issuer",
+            "11111111-2222-3333-4444-555555555555",
+            "--private-key",
+            str(key),
+            "--output",
+            str(output),
+            "--diagnostic-output",
+            str(diagnostic),
+            "--prerelease-access-probe",
+            "--expected-key-id-env",
+        ]
+    )
+
+    assert not output.exists()
+    assert received["expected_key_id"] == "EXAMPLE123"
+    assert json.loads(diagnostic.read_text()) == {
+        "contracts": [
+            {
+                "apple_error_category": "forbidden",
+                "contract": "global-filtered",
+                "error_category": "http",
+                "http_status": 403,
+                "result": "rejected",
+            },
+            {"contract": "app-scoped", "result": "ok"},
+        ],
+        "configured_key_identity": "matches",
+        "probe": "pre-release-access",
     }
 
 

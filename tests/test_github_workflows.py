@@ -101,6 +101,9 @@ def test_production_testflight_requires_exact_sha_ci_instead_of_repeating_tests(
 def test_app_store_inventory_is_manual_main_only_and_get_only():
     workflow = load_workflow("ios-app-store-inventory.yml")
     assert set(workflow["on"]) == {"workflow_dispatch"}
+    dispatch = workflow["on"]["workflow_dispatch"]
+    assert dispatch["inputs"]["prerelease_access_probe"]["type"] == "boolean"
+    assert "expected_key_id" not in dispatch["inputs"]
     assert workflow["permissions"] == {"contents": "read"}
     assert set(workflow["jobs"]) == {"inventory"}
     job = workflow["jobs"]["inventory"]
@@ -111,6 +114,9 @@ def test_app_store_inventory_is_manual_main_only_and_get_only():
     commands = "\n".join(step.get("run", "") for step in job["steps"])
     assert "scripts/ios/testflight_inventory.py" in commands
     assert "--diagnostic-output" in commands
+    assert "--prerelease-access-probe" in commands
+    assert "--expected-key-id-env" in commands
+    assert '"$EXPECTED_KEY_ID"' not in commands
     for forbidden in (
         "archive.sh",
         "export_ipa.sh",
@@ -131,6 +137,19 @@ def test_app_store_inventory_is_manual_main_only_and_get_only():
         "DROVER_APPSTORE_API_KEY_ID",
         "DROVER_APPSTORE_API_ISSUER_ID",
     }
+    probe = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Diagnose App Store Connect prerelease access"
+    )
+    assert set(probe["env"]) == {
+        "DROVER_APPSTORE_API_KEY_ID",
+        "DROVER_APPSTORE_API_ISSUER_ID",
+        "EXPECTED_KEY_ID",
+    }
+    assert probe["env"]["EXPECTED_KEY_ID"] == (
+        "${{ secrets.DROVER_APPSTORE_EXPECTED_KEY_ID }}"
+    )
     upload = next(
         step
         for step in job["steps"]

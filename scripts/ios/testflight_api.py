@@ -1,20 +1,43 @@
 """Bounded ASC processing/compliance/internal distribution; never log API bodies."""
 
 import base64
+import hmac
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 BASE = "https://api.appstoreconnect.apple.com"
+MAX_PROBE_RESPONSE_BYTES = 64 * 1024
+MAX_PROBE_ERROR_BYTES = 16 * 1024
+APPLE_ERROR_CATEGORIES = frozenset(
+    {"forbidden", "unauthorized", "not-found", "parameter", "rate-limited", "unknown"}
+)
+APPLE_ERROR_REASONS = frozenset({"agreement-required", "unknown"})
+APPLE_ERROR_CODE_REASONS = {
+    # Prepared fixed classification only; it is not evidence of a live response.
+    # Do not match prefixes: Apple error text stays private and untrusted.
+    "FORBIDDEN.REQUIRED_AGREEMENTS": "agreement-required",
+}
 
 
 class Rejected(ValueError):
-    def __init__(self, message, *, diagnostic_category="rejected", http_status=None):
+    def __init__(
+        self,
+        message,
+        *,
+        diagnostic_category="rejected",
+        http_status=None,
+        apple_error_category=None,
+        apple_error_reason=None,
+    ):
         super().__init__(message)
         self.diagnostic_category = diagnostic_category
         self.http_status = http_status
+        self.apple_error_category = apple_error_category
+        self.apple_error_reason = apple_error_reason
 
 
 class Retryable(Exception):
@@ -39,8 +62,41 @@ class InventoryFailure(Rejected):
             ),
             diagnostic_category=category,
             http_status=getattr(cause, "http_status", None),
+            apple_error_category=getattr(cause, "apple_error_category", None),
+            apple_error_reason=getattr(cause, "apple_error_reason", None),
         )
         self.inventory_stage = stage
+
+
+def _apple_error_details(error):
+    """Classify a bounded ASC error body without retaining any of its text."""
+    try:
+        raw = error.read(MAX_PROBE_ERROR_BYTES + 1)
+        if not isinstance(raw, bytes) or len(raw) > MAX_PROBE_ERROR_BYTES:
+            return "unknown", "unknown"
+        payload = json.loads(raw.decode("utf-8"))
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if not isinstance(errors, list) or len(errors) != 1:
+            return "unknown", "unknown"
+        code = errors[0].get("code") if isinstance(errors[0], dict) else None
+        if not isinstance(code, str) or len(code) > 128:
+            return "unknown", "unknown"
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "unknown", "unknown"
+
+    normalized = code.upper()
+    reason = APPLE_ERROR_CODE_REASONS.get(normalized, "unknown")
+    if normalized.startswith("FORBIDDEN"):
+        return "forbidden", reason
+    if normalized.startswith("UNAUTHORIZED"):
+        return "unauthorized", reason
+    if normalized.startswith("NOT_FOUND"):
+        return "not-found", reason
+    if normalized.startswith("PARAMETER"):
+        return "parameter", reason
+    if normalized.startswith("RATE_LIMIT"):
+        return "rate-limited", reason
+    return "unknown", reason
 
 
 def token(key, key_id, issuer, now):
@@ -83,7 +139,17 @@ class Client:
             urllib.request.ProxyHandler({}), NoRedirect()
         )
 
-    def request(self, method, path, *, params=None, body=None, deadline):
+    def request(
+        self,
+        method,
+        path,
+        *,
+        params=None,
+        body=None,
+        deadline,
+        diagnostic_error=False,
+        max_response_bytes=2 * 1024 * 1024,
+    ):
         remaining = deadline - self.clock()
         if remaining <= 0:
             raise Rejected(
@@ -106,17 +172,22 @@ class Client:
         )
         try:
             with self.opener.open(request, timeout=min(30, remaining)) as response:
-                raw = response.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
+                raw = response.read(max_response_bytes + 1)
+            if len(raw) > max_response_bytes:
                 raise Rejected("ASC response exceeded size limit")
             return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as error:
+            apple_error_category, apple_error_reason = (
+                _apple_error_details(error) if diagnostic_error else (None, None)
+            )
             if error.code == 429 or 500 <= error.code < 600:
                 raise Retryable(http_status=error.code) from None
             raise Rejected(
                 f"ASC {method} failed (HTTP {error.code}); check API permissions and export compliance in App Store Connect",
                 diagnostic_category="http",
                 http_status=error.code,
+                apple_error_category=apple_error_category,
+                apple_error_reason=apple_error_reason,
             ) from None
         except (urllib.error.URLError, TimeoutError):
             raise Retryable(diagnostic_category="network") from None
@@ -125,7 +196,16 @@ class Client:
                 "ASC returned malformed JSON", diagnostic_category="malformed"
             ) from None
 
-    def collection(self, path, *, params=None, deadline, max_pages=None):
+    def collection(
+        self,
+        path,
+        *,
+        params=None,
+        deadline,
+        max_pages=None,
+        diagnostic_error=False,
+        max_response_bytes=2 * 1024 * 1024,
+    ):
         if max_pages is not None and (
             isinstance(max_pages, bool)
             or not isinstance(max_pages, int)
@@ -137,7 +217,14 @@ class Client:
         while path:
             if max_pages is not None and pages >= max_pages:
                 raise Rejected("ASC collection exceeded page limit")
-            page = self.request("GET", path, params=params, deadline=deadline)
+            page = self.request(
+                "GET",
+                path,
+                params=params,
+                deadline=deadline,
+                diagnostic_error=diagnostic_error,
+                max_response_bytes=max_response_bytes,
+            )
             pages += 1
             if not isinstance(page, dict) or not isinstance(page.get("data"), list):
                 raise Rejected("ASC returned malformed collection")
@@ -296,6 +383,126 @@ def inventory(
         ],
         "builds": sorted(builds, key=lambda row: (row["version"], row["build"])),
         "internal_groups": sorted(groups, key=lambda row: row["name"]),
+    }
+
+
+def _probe_failure(contract, error):
+    result = {
+        "contract": contract,
+        "result": "rejected",
+        "error_category": getattr(error, "diagnostic_category", "unknown"),
+    }
+    if getattr(error, "http_status", None) is not None:
+        result["http_status"] = error.http_status
+    if getattr(error, "apple_error_category", None) in APPLE_ERROR_CATEGORIES:
+        result["apple_error_category"] = error.apple_error_category
+    if getattr(error, "apple_error_reason", None) in APPLE_ERROR_REASONS:
+        result["apple_error_reason"] = error.apple_error_reason
+    return result
+
+
+def _probe_collection_page(client, path, *, params, deadline):
+    """Read one validated collection page without traversing pagination links."""
+    page = client.request(
+        "GET",
+        path,
+        params=params,
+        deadline=deadline,
+        diagnostic_error=True,
+        max_response_bytes=MAX_PROBE_RESPONSE_BYTES,
+    )
+    if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+        raise Rejected("ASC returned malformed collection")
+    links = page.get("links")
+    if links is not None:
+        if not isinstance(links, dict):
+            raise Rejected("ASC returned malformed collection")
+        next_link = links.get("next")
+        if next_link is not None and not isinstance(next_link, str):
+            raise Rejected("ASC returned malformed pagination")
+    return page["data"]
+
+
+def prerelease_access_probe(
+    client,
+    bundle_id,
+    *,
+    configured_key_id,
+    expected_key_id=None,
+    timeout=45,
+    clock=time.monotonic,
+):
+    """Compare documented prerelease reads for one resolved app, GET-only."""
+    if (
+        not isinstance(bundle_id, str)
+        or not bundle_id.strip()
+        or len(bundle_id) > 191
+        or not isinstance(configured_key_id, str)
+        or not re.fullmatch(r"[A-Z0-9]{8,20}", configured_key_id)
+        or (
+            expected_key_id is not None
+            and (
+                not isinstance(expected_key_id, str)
+                or not re.fullmatch(r"[A-Z0-9]{8,20}", expected_key_id)
+            )
+        )
+        or not 0 < timeout <= 60
+    ):
+        raise Rejected("invalid ASC prerelease access probe bounds")
+    deadline = clock() + timeout
+    try:
+        apps = _probe_collection_page(
+            client,
+            "/v1/apps",
+            params={"filter[bundleId]": bundle_id, "limit": 1},
+            deadline=deadline,
+        )
+    except (Rejected, Retryable) as error:
+        raise InventoryFailure("apps", error) from None
+    if len(apps) != 1 or not isinstance(apps[0], dict):
+        raise Rejected("ASC app record is missing or ambiguous")
+    try:
+        app_id = _inventory_text(apps[0].get("id"), "app")
+    except Rejected:
+        raise Rejected("ASC app record is missing or ambiguous") from None
+
+    def compare(contract, path, params):
+        try:
+            _probe_collection_page(
+                client,
+                path,
+                params=params,
+                deadline=deadline,
+            )
+        except (Rejected, Retryable) as error:
+            return _probe_failure(contract, error)
+        return {"contract": contract, "result": "ok"}
+
+    return {
+        "probe": "pre-release-access",
+        "configured_key_identity": (
+            "not-compared"
+            if expected_key_id is None
+            else (
+                "matches"
+                if hmac.compare_digest(configured_key_id, expected_key_id)
+                else "mismatch"
+            )
+        ),
+        "contracts": [
+            compare(
+                "global-filtered",
+                "/v1/preReleaseVersions",
+                {"filter[app]": app_id, "filter[platform]": "IOS", "limit": 1},
+            ),
+            compare(
+                "app-scoped",
+                f"/v1/apps/{app_id}/preReleaseVersions",
+                # Apple documents this app-bound route with `limit`; its current
+                # DocC contract does not list filter[platform]. Do not assume it.
+                {"limit": 1},
+            ),
+        ],
     }
 
 
