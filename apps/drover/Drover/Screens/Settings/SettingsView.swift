@@ -33,16 +33,17 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 0) {
                 ScreenHeader(
                     title: "Settings",
                     subtitle: "Appearance, connection, and preferences"
                 )
-                if environment.isDemoMode {
-                    demoSection
-                    supportLinks
-                } else {
-                    enterDemoButton
+                VStack(alignment: .leading, spacing: DroverRootPageLayout.sectionSpacing) {
+                    if environment.isDemoMode {
+                        demoSection
+                        supportLinks
+                    } else {
+                        enterDemoButton
 
                     // Scanning is the intended route; the two fields below are the
                     // recovery path for when a camera is unavailable.
@@ -129,15 +130,17 @@ struct SettingsView: View {
 
                     // Credential-deletion and local-cleanup failures retain an
                     // explicit retry path even after the app disconnects.
-                    if environment.client != nil || environment.hasTokenConfigured
-                        || environment.hasPendingLocalCleanup {
-                        signOutButton
+                        if environment.client != nil || environment.hasTokenConfigured
+                            || environment.hasPendingLocalCleanup {
+                            signOutButton
+                        }
                     }
                 }
+                .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+                .padding(.top, DroverRootPageLayout.firstControlGap)
+                .padding(.bottom, DroverRootPageLayout.dockClearance)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 14)
-            .padding(.bottom, 28)
+            .padding(.top, DroverRootPageLayout.topInset)
         }
         .background(DroverColor.bg)
         .scrollDismissesKeyboard(.interactively)

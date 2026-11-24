@@ -21,47 +21,53 @@ struct AnalyticsView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ScreenHeader(
                     title: "Analytics",
                     subtitle: "Observed activity over time"
                 )
-                filterStrip
 
-                if let notice = store.analyticsRefreshNotice {
-                    AnalyticsRefreshBanner(message: notice)
-                }
+                VStack(alignment: .leading, spacing: DroverRootPageLayout.sectionSpacing) {
+                    filterStrip
 
-                if let notice = store.analyticsProjectionNotice {
-                    AnalyticsProjectionBanner(message: notice)
-                }
+                    if let notice = store.analyticsRefreshNotice {
+                        AnalyticsRefreshBanner(message: notice)
+                    }
 
-                // Hidden while a reload is in flight: showing a failure and a
-                // spinner at once reads as "it failed again", and a Retry that
-                // stays tappable mid-request just queues duplicate work.
-                if let busy = store.analyticsError, busy.hasPrefix("Hub busy,") {
-                    Label(busy, systemImage: "clock")
-                        .droverText(.subtitle)
-                } else if let error = store.analyticsError, !store.isLoadingAnalytics {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label(error, systemImage: "exclamationmark.circle")
-                            .droverText(.nested, accented: true)
-                        Button("Retry") { Task { await reload() } }
-                            .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
-                            .disabled(store.isLoadingAnalytics)
+                    if let notice = store.analyticsProjectionNotice {
+                        AnalyticsProjectionBanner(message: notice)
+                    }
+
+                    // Hidden while a reload is in flight: showing a failure and a
+                    // spinner at once reads as "it failed again", and a Retry that
+                    // stays tappable mid-request just queues duplicate work.
+                    if let busy = store.analyticsError, busy.hasPrefix("Hub busy,") {
+                        Label(busy, systemImage: "clock")
+                            .droverText(.subtitle)
+                    } else if let error = store.analyticsError, !store.isLoadingAnalytics {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(error, systemImage: "exclamationmark.circle")
+                                .droverText(.nested, accented: true)
+                            Button("Retry") { Task { await reload() } }
+                                .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
+                                .disabled(store.isLoadingAnalytics)
+                        }
+                    }
+
+                    if let snapshot = store.analytics {
+                        observedSection(snapshot)
+                    } else if store.isLoadingAnalytics {
+                        ProgressView("Loading analytics…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 50)
+                            .accessibilityIdentifier("analytics-loading")
                     }
                 }
-
-                if let snapshot = store.analytics {
-                    observedSection(snapshot)
-                } else if store.isLoadingAnalytics {
-                    ProgressView("Loading analytics…")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 50)
-                        .accessibilityIdentifier("analytics-loading")
-                }
+                .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+                .padding(.top, DroverRootPageLayout.firstControlGap)
+                .padding(.bottom, DroverRootPageLayout.dockClearance)
             }
-            .padding(14)
+            .padding(.top, DroverRootPageLayout.topInset)
         }
         .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
         .toolbar(.hidden, for: .navigationBar)
