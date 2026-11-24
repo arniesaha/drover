@@ -1109,7 +1109,20 @@ def test_inventory_workflow_candidate_availability_is_main_only_and_get_only():
     assert "--internal-group" in step["run"]
     assert "upload_testflight.sh" not in step["run"]
     assert "upload-app" not in step["run"]
-    assert "candidate_internal_group" in step["run"]
+    assert "inputs.candidate_" not in step["run"]
+    assert step["env"] == {
+        "DROVER_APPSTORE_API_KEY_ID": "${{ secrets.DROVER_APPSTORE_API_KEY_ID }}",
+        "DROVER_APPSTORE_API_ISSUER_ID": "${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}",
+        "CANDIDATE_VERSION": "${{ inputs.candidate_version }}",
+        "CANDIDATE_BUILD": "${{ inputs.candidate_build }}",
+        "CANDIDATE_INTERNAL_GROUP": "${{ inputs.candidate_internal_group }}",
+    }
+    for variable in (
+        "$CANDIDATE_VERSION",
+        "$CANDIDATE_BUILD",
+        "$CANDIDATE_INTERNAL_GROUP",
+    ):
+        assert variable in step["run"]
 
 
 @pytest.mark.parametrize("fails", [False, True])

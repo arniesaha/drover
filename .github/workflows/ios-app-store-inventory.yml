@@ -119,6 +119,9 @@ jobs:
       env:
         DROVER_APPSTORE_API_KEY_ID: ${{ secrets.DROVER_APPSTORE_API_KEY_ID }}
         DROVER_APPSTORE_API_ISSUER_ID: ${{ secrets.DROVER_APPSTORE_API_ISSUER_ID }}
+        CANDIDATE_VERSION: ${{ inputs.candidate_version }}
+        CANDIDATE_BUILD: ${{ inputs.candidate_build }}
+        CANDIDATE_INTERNAL_GROUP: ${{ inputs.candidate_internal_group }}
       run: |
         python3 scripts/ios/testflight_inventory.py \
           --bundle-id com.arnab.drover \
@@ -128,9 +131,9 @@ jobs:
           --output "$RUNNER_TEMP/app-store-connect-candidate-availability.json" \
           --diagnostic-output "$RUNNER_TEMP/app-store-connect-inventory-diagnostic.json" \
           --candidate-build-availability \
-          --candidate-version "${{ inputs.candidate_version }}" \
-          --candidate-build "${{ inputs.candidate_build }}" \
-          --internal-group "${{ inputs.candidate_internal_group }}"
+          --candidate-version "$CANDIDATE_VERSION" \
+          --candidate-build "$CANDIDATE_BUILD" \
+          --internal-group "$CANDIDATE_INTERNAL_GROUP"
     - name: Remove transient ASC credential
       if: always()
       run: |
