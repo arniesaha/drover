@@ -507,13 +507,15 @@ public struct AnalyticsFilters: Sendable, Equatable {
     public var harnessCursor: String?
     public var hostCursor: String?
     public var modelCursor: String?
+    public var includeProviderCapacity: Bool
 
     public init(days: Int = 7, hostID: String? = nil, harness: String? = nil,
                 provider: String? = nil, model: String? = nil,
                 projectKey: String? = nil, limit: Int = 25,
                 metric: DistributionRank? = nil,
                 projectCursor: String? = nil, harnessCursor: String? = nil,
-                hostCursor: String? = nil, modelCursor: String? = nil) {
+                hostCursor: String? = nil, modelCursor: String? = nil,
+                includeProviderCapacity: Bool = true) {
         self.days = days
         self.hostID = hostID
         self.harness = harness
@@ -526,6 +528,7 @@ public struct AnalyticsFilters: Sendable, Equatable {
         self.harnessCursor = harnessCursor
         self.hostCursor = hostCursor
         self.modelCursor = modelCursor
+        self.includeProviderCapacity = includeProviderCapacity
     }
 }
 
@@ -551,7 +554,8 @@ public struct AppliedAnalyticsFilters: Decodable, Sendable, Equatable {
 public struct AnalyticsSnapshot: Decodable, Sendable, Equatable {
     public let cockpitAPIVersion: Int
     public let filters: AppliedAnalyticsFilters
-    public let providerCapacity: SectionEnvelope<[ProviderAccount]>
+    /// Accounts owns provider capacity. Analytics API v2 may omit it.
+    public let providerCapacity: SectionEnvelope<[ProviderAccount]>?
     public let activity: SectionEnvelope<ActivitySummary>
 
     private enum CodingKeys: String, CodingKey {

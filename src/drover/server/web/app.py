@@ -278,6 +278,7 @@ _COCKPIT_QUERY_FIELDS = frozenset(
         "harness_cursor",
         "host_cursor",
         "model_cursor",
+        "include_provider_capacity",
     }
 )
 
@@ -308,6 +309,11 @@ def _parse_cockpit_query(query: str):
             values[numeric] = int(values[numeric])
         except ValueError as exc:
             raise ValueError(f"{numeric} must be an integer") from exc
+    if "include_provider_capacity" in values:
+        value = values["include_provider_capacity"]
+        if value not in {"true", "false"}:
+            raise ValueError("include_provider_capacity must be true or false")
+        values["include_provider_capacity"] = value == "true"
     return AnalyticsFilters(**values)
 
 

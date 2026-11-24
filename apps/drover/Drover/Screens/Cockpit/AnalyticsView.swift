@@ -8,7 +8,6 @@ struct AnalyticsView: View {
     @State private var days = 7
     @State private var host: String?
     @State private var harness: String?
-    @State private var provider: String?
     @State private var model: String?
     @State private var project: String?
     // Reload from the view lifecycle after filter state commits. A task created
@@ -22,48 +21,53 @@ struct AnalyticsView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ScreenHeader(
                     title: "Analytics",
                     subtitle: "Observed activity over time"
                 )
-                filterStrip
 
-                if let notice = store.analyticsRefreshNotice {
-                    AnalyticsRefreshBanner(message: notice)
-                }
+                VStack(alignment: .leading, spacing: DroverRootPageLayout.sectionSpacing) {
+                    filterStrip
 
-                if let notice = store.analyticsProjectionNotice {
-                    AnalyticsProjectionBanner(message: notice)
-                }
+                    if let notice = store.analyticsRefreshNotice {
+                        AnalyticsRefreshBanner(message: notice)
+                    }
 
-                // Hidden while a reload is in flight: showing a failure and a
-                // spinner at once reads as "it failed again", and a Retry that
-                // stays tappable mid-request just queues duplicate work.
-                if let busy = store.analyticsError, busy.hasPrefix("Hub busy,") {
-                    Label(busy, systemImage: "clock")
-                        .droverText(.subtitle)
-                } else if let error = store.analyticsError, !store.isLoadingAnalytics {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label(error, systemImage: "exclamationmark.circle")
-                            .droverText(.nested, accented: true)
-                        Button("Retry") { Task { await reload() } }
-                            .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
-                            .disabled(store.isLoadingAnalytics)
+                    if let notice = store.analyticsProjectionNotice {
+                        AnalyticsProjectionBanner(message: notice)
+                    }
+
+                    // Hidden while a reload is in flight: showing a failure and a
+                    // spinner at once reads as "it failed again", and a Retry that
+                    // stays tappable mid-request just queues duplicate work.
+                    if let busy = store.analyticsError, busy.hasPrefix("Hub busy,") {
+                        Label(busy, systemImage: "clock")
+                            .droverText(.subtitle)
+                    } else if let error = store.analyticsError, !store.isLoadingAnalytics {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label(error, systemImage: "exclamationmark.circle")
+                                .droverText(.nested, accented: true)
+                            Button("Retry") { Task { await reload() } }
+                                .accessibilityIdentifier(AnalyticsRetryPresentation.identifier)
+                                .disabled(store.isLoadingAnalytics)
+                        }
+                    }
+
+                    if let snapshot = store.analytics {
+                        observedSection(snapshot)
+                    } else if store.isLoadingAnalytics {
+                        ProgressView("Loading analytics…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 50)
+                            .accessibilityIdentifier("analytics-loading")
                     }
                 }
-
-                if let snapshot = store.analytics {
-                    observedSection(snapshot)
-                    providerSection(snapshot)
-                } else if store.isLoadingAnalytics {
-                    ProgressView("Loading analytics…")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 50)
-                        .accessibilityIdentifier("analytics-loading")
-                }
+                .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+                .padding(.top, DroverRootPageLayout.firstControlGap)
+                .padding(.bottom, DroverRootPageLayout.dockClearance)
             }
-            .padding(14)
+            .padding(.top, DroverRootPageLayout.topInset)
         }
         .background(Rectangle().fill(DroverColor.bg).ignoresSafeArea(edges: .top))
         .toolbar(.hidden, for: .navigationBar)
@@ -105,9 +109,6 @@ struct AnalyticsView: View {
                     AnalyticsFilterMenu(title: "Harness", selection: harness, values: harnessValues) {
                         harness = $0; scheduleReload()
                     }
-                    AnalyticsFilterMenu(title: "Provider", selection: provider, values: providerValues) {
-                        provider = $0; scheduleReload()
-                    }
                     AnalyticsFilterMenu(title: "Model", selection: model, values: modelValues) {
                         model = $0; scheduleReload()
                     }
@@ -123,47 +124,7 @@ struct AnalyticsView: View {
     }
 
     private var activeFilterCount: Int {
-        [host, harness, provider, model, project].compactMap { $0 }.count
-    }
-
-    @ViewBuilder
-    private func providerSection(_ snapshot: AnalyticsSnapshot) -> some View {
-        let accounts = snapshot.providerCapacity.data ?? []
-        let section = ProviderSectionPresentation(
-            status: snapshot.providerCapacity.status,
-            // Without this the server's actual reason never reaches the user
-            // here, unlike ProviderCapacitySection, and every failure reads as
-            // the same generic sentence.
-            message: store.analyticsError,
-            hasRetainedValues: !accounts.isEmpty
-        )
-        if !accounts.isEmpty || snapshot.providerCapacity.status != .ok {
-            VStack(alignment: .leading, spacing: 10) {
-                CockpitSectionHeading(title: "Subscriptions", source: "Provider reported", action: nil)
-                if let warning = section.warningText {
-                    CockpitCard {
-                        Label(warning, systemImage: "gauge.with.dots.needle.33percent")
-                            .droverText(.nested)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if let observedAt = snapshot.providerCapacity.observedAt {
-                            Text("Last section update \(observedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .droverText(.subtitle)
-                        }
-                    }
-                    .accessibilityIdentifier("analytics-provider-warning")
-                }
-                if !accounts.isEmpty {
-                    // One row per subscription, not per host — the same Codex
-                    // account signed in on three machines was three identical
-                    // rows with nothing to tell them apart.
-                    ForEach(ProviderSubscriptionGrouping.group(accounts)) { subscription in
-                        ProviderAccountCard(subscription: subscription, section: section)
-                    }
-                }
-            }
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("analytics-provider-reported")
-        }
+        [host, harness, model, project].compactMap { $0 }.count
     }
 
     @ViewBuilder
@@ -396,8 +357,9 @@ struct AnalyticsView: View {
 
     private func reload() async {
         await store.loadAnalytics(filters: AnalyticsFilters(
-            days: days, hostID: host, harness: harness, provider: provider,
-            model: model, projectKey: project, metric: rank
+            days: days, hostID: host, harness: harness, model: model,
+            projectKey: project, metric: rank,
+            includeProviderCapacity: !store.supportsProviderFreeAnalytics
         ))
     }
 
@@ -406,9 +368,6 @@ struct AnalyticsView: View {
     private var harnessValues: [String] { store.analyticsHarnesses.map(\.key).sorted() }
     private var modelValues: [String] { store.analyticsModels.map(\.key).sorted() }
     private var projectValues: [String] { store.analyticsProjects.map(\.projectKey).sorted() }
-    private var providerValues: [String] {
-        Array(Set((store.analytics?.providerCapacity.data ?? []).map(\.provider))).sorted()
-    }
 }
 
 private struct ReloadIdentity: Hashable {

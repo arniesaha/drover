@@ -117,6 +117,18 @@ struct CockpitStoreTests {
         #expect(!store.isInsightsAvailable)
     }
 
+    @Test @MainActor func providerFreeAnalyticsRequiresTheV2HostContract() throws {
+        let store = CockpitStore(client: CockpitClientStub())
+
+        store.updateCapability(from: try capableSnapshot())
+        #expect(!store.supportsProviderFreeAnalytics)
+
+        store.updateCapability(from: try HarnessSnapshot.decode(from: Data(
+            #"{"hosts":[],"sessions":[],"cockpit_api_version":2,"cockpit_sections":["provider_capacity","activity"]}"#.utf8
+        )))
+        #expect(store.supportsProviderFreeAnalytics)
+    }
+
     @Test @MainActor func refreshUsesIndependentSectionStateAndRetainsLastGoodValues() async throws {
         let client = CockpitClientStub(overviews: [
             try decodeOverview(providerStatus: "ok", activitySessions: 10),

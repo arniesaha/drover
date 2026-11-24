@@ -41,8 +41,9 @@ struct InboxView: View {
                 Text(Segment.history.rawValue).tag(Segment.history)
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+            .padding(.top, DroverRootPageLayout.firstControlGap)
+            .padding(.bottom, DroverRootPageLayout.firstControlGap)
             .accessibilityIdentifier("inbox-segments")
 
             Group {
@@ -114,7 +115,9 @@ struct InboxView: View {
                     .padding(.vertical, 40)
                 }
             }
-            .padding(14)
+            .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+            .padding(.top, DroverRootPageLayout.topInset)
+            .padding(.bottom, DroverRootPageLayout.dockClearance)
         }
         .accessibilityIdentifier("inbox-needs-you")
         .refreshable { await refresh() }

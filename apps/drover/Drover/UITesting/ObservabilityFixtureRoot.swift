@@ -85,6 +85,16 @@ enum ObservabilityFixtureData {
     static let hostTitles = ["studio": "Mac Studio", "mini": "Mac Mini",
         "laptop": "Work laptop with a long descriptive host name", "nas": "NAS"]
 
+    static let contentAnalysisStatus = encode([
+        "enabled": true,
+        "backend": "local",
+        "external_disclosure_accepted": false,
+        "pending_model_jobs": 0,
+        "consent_epoch": 3,
+        "propagation": "partial",
+        "hosts": [["host_id": "gpu-pc", "state": "disconnected"]],
+    ])
+
     static var homeSnapshot: Data {
         if isDeclutterFixture { return declutterSnapshot }
         if ProcessInfo.processInfo.environment["DROVER_UI_TEST_FLEET_FILTERS"] == "1" {

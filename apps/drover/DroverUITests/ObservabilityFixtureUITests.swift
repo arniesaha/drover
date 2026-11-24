@@ -110,6 +110,97 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testAnalyticsDefersProviderCapacityToAccounts() {
+        let app = launch()
+
+        tab(app, "analytics").tap()
+        XCTAssertTrue(
+            app.descendants(matching: .any)["analytics-drover-observed"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertFalse(
+            app.descendants(matching: .any)["analytics-provider-reported"].exists
+        )
+        addSafeFixtureCapture("analytics-without-provider-accounts", app)
+
+        tab(app, "accounts").tap()
+        XCTAssertTrue(
+            app.scrollViews["provider-accounts-scroll"].waitForExistence(timeout: 5)
+        )
+        addSafeFixtureCapture("accounts-retains-provider-accounts", app)
+    }
+
+    @MainActor
+    func testLocalContentAnalysisNamesTheConnectedServer() {
+        let app = launch()
+        tab(app, "settings").tap()
+
+        let local = app.staticTexts["Recommended · analyzed on the connected server"]
+        XCTAssertTrue(local.waitForExistence(timeout: 8))
+        let settings = app.scrollViews.firstMatch
+        for _ in 0..<8 where !local.isHittable { settings.swipeUp() }
+        XCTAssertTrue(local.isHittable)
+        XCTAssertTrue(app.descendants(matching: .any)["content-analysis-propagation-warning"].exists)
+        addSafeFixtureCapture("content-analysis-connected-server", app)
+    }
+
+    @MainActor
+    func testRootTabsShareOnePageShell() {
+        for destination in ["home", "inbox", "analytics", "accounts", "settings"] {
+            // Starting each root directly avoids capturing a compact TabView
+            // transition half-way through a replacement. Every screen gets
+            // the same fixture viewport, theme and scroll origin.
+            let app = launch(dark: true, selectedTab: destination)
+            let title = app.staticTexts["screen-title-\(destination)"]
+            XCTAssertTrue(title.waitForExistence(timeout: 8), "missing \(destination) title")
+            XCTAssertTrue(title.isHittable, "\(destination) title must be settled and visible")
+            XCTAssertEqual(title.frame.minX, 16, accuracy: 2, "\(destination) title gutter")
+            XCTAssertTrue(app.frame.contains(title.frame), "\(destination) title must remain visible")
+            addSafeFixtureCapture("root-shell-\(destination)-dark", app)
+        }
+    }
+
+    @MainActor
+    func testRootShellKeepsNestedAnalyticsAndInboxControlsReachable() {
+        let app = launch()
+
+        let analyticsTitle = selectRoot(app, destination: "analytics")
+        XCTAssertEqual(analyticsTitle.frame.minX, 16, accuracy: 2)
+        let hosts = app.buttons["analytics-dimension-hosts"]
+        XCTAssertTrue(hosts.waitForExistence(timeout: 8))
+        hosts.tap()
+        let rank = app.segmentedControls["analytics-rank-toggle-hosts"]
+        XCTAssertTrue(rank.waitForExistence(timeout: 5))
+        rank.buttons["Tokens"].tap()
+        XCTAssertTrue(
+            app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "ranked by tokens"))
+                .firstMatch.waitForExistence(timeout: 5)
+        )
+        addSafeFixtureCapture("root-shell-analytics-interaction-light", app)
+
+        let inboxTitle = selectRoot(app, destination: "inbox")
+        XCTAssertEqual(inboxTitle.frame.minX, 16, accuracy: 2)
+        let segments = app.segmentedControls["inbox-segments"]
+        XCTAssertTrue(segments.waitForExistence(timeout: 5))
+        segments.buttons["Insights"].tap()
+        XCTAssertTrue(app.descendants(matching: .any)["insights-filters"].waitForExistence(timeout: 5))
+        addSafeFixtureCapture("root-shell-inbox-interaction-light", app)
+    }
+
+    @MainActor
+    func testRootShellLargestTextKeepsFirstControlsClear() {
+        let app = launch(large: true)
+        let title = selectRoot(app, destination: "analytics")
+        XCTAssertEqual(title.frame.minX, 16, accuracy: 2)
+        let days = app.buttons["7 days"].firstMatch
+        let filters = app.buttons["Filters"].firstMatch
+        XCTAssertTrue(days.isHittable)
+        XCTAssertTrue(filters.isHittable)
+        XCTAssertFalse(days.frame.intersects(filters.frame))
+        addSafeFixtureCapture("root-shell-analytics-largest-light", app)
+    }
+
+    @MainActor
     func testDeclutterFixtureLightReduceTransparencyScreenshots() {
         let app = launch(declutter: true, reduceTransparency: true)
         let fleet = app.scrollViews["fleet-list"]
@@ -276,6 +367,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
     @MainActor
     private func launch(
         large: Bool = false, dark: Bool = false, fleetFilters: Bool = false,
+        selectedTab: String? = nil,
         declutter: Bool = false, reduceTransparency: Bool = false
     ) -> XCUIApplication {
         continueAfterFailure = false
@@ -291,6 +383,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
         }
         if dark { app.launchArguments += ["-drover.appearance", "dark"] }
+        if let selectedTab { app.launchEnvironment["DROVER_UI_TEST_SELECTED_TAB"] = selectedTab }
         app.launch()
         return app
     }
@@ -620,10 +713,36 @@ final class ObservabilityFixtureUITests: XCTestCase {
         try? screenshot.pngRepresentation.write(to: targetFile)
     }
 
+    /// The dedicated Analytics/Accounts regression has no private live data.
+    /// Keep its captures inside the result bundle so the caller can export and
+    /// inspect just these fixture images into an audited scratch location.
+    @MainActor
+    private func addSafeFixtureCapture(_ name: String, _ app: XCUIApplication) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     /// System tabs use their stable, product-visible destination titles; this
     /// replaces the retired custom floating-dock selectors.
     @MainActor
     private func tab(_ app: XCUIApplication, _ destination: String) -> XCUIElement {
         app.tabBars.buttons[destination.capitalized]
+    }
+
+    /// Tab selection animates a complete root replacement. Wait for the
+    /// selected root to settle before a screenshot so fixture evidence never
+    /// captures an in-between page transition.
+    @MainActor
+    private func selectRoot(_ app: XCUIApplication, destination: String) -> XCUIElement {
+        tab(app, destination).tap()
+        let title = app.staticTexts["screen-title-\(destination)"]
+        XCTAssertTrue(title.waitForExistence(timeout: 8), "missing \(destination) title")
+        XCTAssertTrue(title.isHittable, "\(destination) title must be settled and visible")
+        let settled = expectation(description: "\(destination) root transition settles")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { settled.fulfill() }
+        wait(for: [settled], timeout: 1)
+        return title
     }
 }

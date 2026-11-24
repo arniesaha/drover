@@ -176,9 +176,9 @@ struct SessionsView: View {
                         }
 
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.top, 8)
-                    .padding(.bottom, 16)
+                    .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+                    .padding(.top, DroverRootPageLayout.topInset)
+                    .padding(.bottom, DroverRootPageLayout.dockClearance)
                 }
                 .accessibilityIdentifier("fleet-list")
                 .refreshable {
@@ -247,7 +247,9 @@ struct SessionsView: View {
         // opened New Session instead of the conversation.
         .safeAreaInset(edge: .bottom, alignment: .trailing, spacing: 0) {
             if showsNewSessionAction, store.hasLoadedOnce {
-                actionBar.padding(.trailing, 18).padding(.vertical, 18)
+                actionBar
+                    .padding(.trailing, DroverRootPageLayout.horizontalInset)
+                    .padding(.vertical, DroverRootPageLayout.horizontalInset)
             }
         }
         // The design's chrome row *is* this screen's header, so the navigation
@@ -398,17 +400,17 @@ struct SessionsView: View {
                             }
                         }
                     )
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, DroverRootPageLayout.horizontalInset)
                 }
 
                 if store.overview.projects.count > 1 {
                     projectStrip
-                        .padding(.horizontal, 14)
+                        .padding(.horizontal, DroverRootPageLayout.horizontalInset)
                 }
 
                 if filterState.isFiltered {
                     filterBanner
-                        .padding(.horizontal, 14)
+                        .padding(.horizontal, DroverRootPageLayout.horizontalInset)
                 }
             }
         }

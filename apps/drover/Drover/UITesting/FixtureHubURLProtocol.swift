@@ -235,6 +235,8 @@ final class FixtureHubURLProtocol: URLProtocol, @unchecked Sendable {
             let metric = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "metric" })?.value
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.analytics(metric: metric))
+        case ("GET", "/insights/content-analysis"):
+            return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.contentAnalysisStatus)
         case ("GET", "/insights"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.insights)
         case ("GET", "/sessions/history"):

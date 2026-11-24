@@ -46,6 +46,16 @@ enum DroverTypeScale {
     static let caption = Font.system(.caption2, design: .monospaced)
 }
 
+/// Shared root-screen geometry. Each root owns its content, but their headers,
+/// first controls and dock clearance should begin from the same anchors.
+enum DroverRootPageLayout {
+    static let horizontalInset = DroverSpace.x4
+    static let topInset = DroverSpace.x1
+    static let firstControlGap = DroverSpace.x3
+    static let sectionSpacing = DroverSpace.x4
+    static let dockClearance: CGFloat = 96
+}
+
 /// Consistent top-level anatomy. The title is always app-owned rather than a
 /// mixture of bespoke wordmarks and navigation-bar titles.
 struct ScreenHeader<Actions: View, Filters: View>: View {
@@ -85,6 +95,7 @@ struct ScreenHeader<Actions: View, Filters: View>: View {
                     Text(title)
                         .font(DroverTypeScale.title)
                         .foregroundStyle(DroverTheme.textPrimary)
+                        .accessibilityIdentifier("screen-title-\(title.lowercased())")
                     if let subtitle {
                         Text(subtitle)
                             .font(DroverTypeScale.meta)
@@ -102,7 +113,7 @@ struct ScreenHeader<Actions: View, Filters: View>: View {
             }
             filters()
         }
-        .padding(.horizontal, DroverSpace.x4)
+        .padding(.horizontal, DroverRootPageLayout.horizontalInset)
         .padding(.vertical, DroverSpace.x3)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(DroverTheme.canvas)
