@@ -63,13 +63,18 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: fittedChatComposer ? 2 : 12) {
             if scrollsInput {
                 // Keep one focused input as its height changes. Swapping
                 // ViewThatFits candidates mid-entry used to drop keystrokes.
                 ScrollView {
                     inputContent
                 }
+                // The input, including a long draft, may scroll. The action
+                // row may not: reserving it a stable 44-point target keeps
+                // the complete dock within the chat's 170-point accessibility
+                // budget without clipping either preference control at rest.
+                .frame(maxHeight: fittedChatComposer ? 116 : nil)
                 .accessibilityIdentifier("composer-scroll")
             } else {
                 inputContent
@@ -79,8 +84,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 18)
-        .padding(.top, attachments.isEmpty ? 16 : 14)
-        .padding(.bottom, 14)
+        .padding(.top, fittedChatComposer ? 4 : (attachments.isEmpty ? 16 : 14))
+        .padding(.bottom, fittedChatComposer ? 4 : 14)
         .background {
             if !floatsInChat {
                 RoundedRectangle(cornerRadius: 30, style: .continuous)
@@ -94,7 +99,7 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
     }
 
     private var inputContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: fittedChatComposer ? 2 : 12) {
             if !attachments.isEmpty {
                 attachmentStrip
             }
@@ -102,7 +107,11 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
             HStack(alignment: .top, spacing: 8) {
                 TextField(dynamicTypeSize.isAccessibilitySize ? "Message" : placeholder, text: $text, axis: .vertical)
                     .accessibilityLabel(placeholder)
-                    .font(.title3)
+                    // The dock keeps the system's selected accessibility
+                    // category, but body avoids spending a headline-sized
+                    // line on an editable field when its 44-point action row
+                    // and preference controls must fit in the same viewport.
+                    .font(fittedChatComposer ? .body : .title3)
                     .lineLimit(1...5)
                     .textFieldStyle(.plain)
                     .accessibilityIdentifier("composer-input")
@@ -162,6 +171,14 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         }
     }
 
+    /// Chat intentionally caps the composer at accessibility sizes so the
+    /// transcript stays useful. The fitted preference row needs the compact
+    /// surrounding rhythm to remain completely above Attach and Send at rest.
+    /// Launch keeps its existing generous form spacing.
+    private var fittedChatComposer: Bool {
+        floatsInChat && dynamicTypeSize.isAccessibilitySize && showsPreferences
+    }
+
     /// Dismissal lives in the composer, at the trailing end of the text line.
     ///
     /// It began on an input accessory bar, which cost a second strip of
@@ -180,7 +197,8 @@ struct GlassPromptSurface<AttachmentButton: View>: View {
         HarnessPreferenceControls(
             runPreferences: runPreferences,
             isEditable: arePreferencesEditable,
-            lockedReason: preferencesLockedReason
+            lockedReason: preferencesLockedReason,
+            usesCompactAccessibilityPresentation: fittedChatComposer
         )
     }
 

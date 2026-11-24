@@ -31,8 +31,6 @@ final class AccessibilityJourneyUITests: XCTestCase {
         openFixtureChat(in: app)
         let send = app.buttons["composer-send"]
         let attach = app.buttons["composer-attach"]
-        let scroll = app.scrollViews["composer-scroll"]
-        if scroll.exists && !send.isHittable { scroll.swipeUp() }
         XCTAssertTrue(send.waitForExistence(timeout: timeout))
         XCTAssertTrue(send.isHittable)
         XCTAssertTrue(attach.isHittable)
@@ -45,23 +43,41 @@ final class AccessibilityJourneyUITests: XCTestCase {
         let effort = app.buttons["composer-effort"]
         XCTAssertTrue(model.exists)
         XCTAssertTrue(effort.exists)
-        // Preferences can wrap below the first visible row at XXXL. Scroll
-        // within the composer until the model choice is a real hit target.
-        for _ in 0..<3 where !model.isHittable { scroll.swipeUp() }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = dark ? "Composer preferences initially complete dark" : "Composer preferences initially complete light"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
         XCTAssertTrue(model.isHittable)
         XCTAssertTrue(app.frame.contains(model.frame))
-        // At XXXL the preferences wrap inside the scrollable input. Reach
-        // the second chip there while Send stays outside that scroll view.
-        for _ in 0..<3 where !effort.isHittable { scroll.swipeUp() }
         XCTAssertTrue(effort.isHittable)
         XCTAssertTrue(app.frame.contains(effort.frame))
         XCTAssertFalse(model.frame.intersects(effort.frame))
+        XCTAssertLessThanOrEqual(model.frame.maxY, attach.frame.minY,
+                                 "Model must be fully above the composer action row at rest")
+        XCTAssertLessThanOrEqual(effort.frame.maxY, attach.frame.minY,
+                                 "Effort must be fully above the composer action row at rest")
         XCTAssertTrue(send.isHittable)
         XCTAssertTrue(attach.isHittable)
-        let screenshot = XCTAttachment(screenshot: app.screenshot())
-        screenshot.name = dark ? "Composer largest text dark" : "Composer largest text light"
-        screenshot.lifetime = .keepAlways
-        add(screenshot)
+        // Exercise both initial controls, not merely their geometry. The
+        // fixture catalog is local and the existing effort is re-selected.
+        model.tap()
+        XCTAssertTrue(app.navigationBars["Model"].waitForExistence(timeout: timeout))
+        app.buttons["Done"].tap()
+        XCTAssertTrue(model.waitForExistence(timeout: timeout))
+
+        effort.tap()
+        let selectedEffort = app.buttons["Auto (Medium)"]
+        XCTAssertTrue(selectedEffort.waitForExistence(timeout: timeout))
+        selectedEffort.tap()
+        let restoredEffort = app.buttons["composer-effort"]
+        XCTAssertTrue(restoredEffort.waitForExistence(timeout: timeout))
+        XCTAssertTrue(restoredEffort.isHittable,
+                      "Effort must remain operable after a selection dismisses its picker")
+        XCTAssertLessThanOrEqual(restoredEffort.frame.maxY, attach.frame.minY)
+        let postSelection = XCTAttachment(screenshot: app.screenshot())
+        postSelection.name = dark ? "Composer preferences after effort selection dark" : "Composer preferences after effort selection light"
+        postSelection.lifetime = .keepAlways
+        add(postSelection)
     }
 
     @MainActor
@@ -154,6 +170,8 @@ final class AccessibilityJourneyUITests: XCTestCase {
         XCTAssertGreaterThanOrEqual(jump.frame.height, 44)
         XCTAssertEqual(jump.label, "Jump to latest")
         XCTAssertLessThanOrEqual(activity.frame.height, 130)
+        XCTAssertLessThanOrEqual(inputScroll.frame.height, 124,
+                                 "The scrollable input must leave room for the fixed 44-point action row")
         XCTAssertLessThanOrEqual(send.frame.maxY - inputScroll.frame.minY, 170)
         XCTAssertLessThanOrEqual(jump.frame.maxY, activity.frame.minY)
         XCTAssertLessThanOrEqual(activity.frame.maxY, inputScroll.frame.minY)
@@ -361,8 +379,17 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testCoreJourneyFixtureKeepsPrimaryNavigationReachable() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_PREFERENCES"] = "1"
+        app.launch()
+        checkCoreJourneyPrimaryNavigation(in: app, capturePrefix: "Fixture")
+    }
+
+    @MainActor
     func testCoreJourneyReduceMotionFixtureKeepsPrimaryNavigationReachable() throws {
         let app = coreJourneyApp(assertReduceMotion: true)
+        app.launchEnvironment["DROVER_UI_TEST_CHAT_PREFERENCES"] = "1"
         app.launch()
 
         let motionState = app.staticTexts["fixture-reduce-motion-state"]
@@ -378,10 +405,16 @@ final class AccessibilityJourneyUITests: XCTestCase {
         }
         XCTAssertEqual(motionState.label, "Reduce Motion fixture enabled")
 
+        checkCoreJourneyPrimaryNavigation(in: app, capturePrefix: "Reduce Motion fixture")
+    }
+
+    @MainActor
+    private func checkCoreJourneyPrimaryNavigation(in app: XCUIApplication, capturePrefix: String) {
+
         let fleet = app.scrollViews["fleet-list"]
         XCTAssertTrue(fleet.waitForExistence(timeout: timeout))
         let home = XCTAttachment(screenshot: app.screenshot())
-        home.name = "Reduce Motion fixture Home XXXL"
+        home.name = "\(capturePrefix) Home XXXL"
         home.lifetime = .keepAlways
         add(home)
 
@@ -389,8 +422,18 @@ final class AccessibilityJourneyUITests: XCTestCase {
         // to Home before opening and dismissing the root's launch sheet.
         openFixtureChat(in: app)
         XCTAssertTrue(app.textFields["composer-input"].isHittable)
+        let model = app.buttons["composer-model"]
+        let effort = app.buttons["composer-effort"]
+        let attach = app.buttons["composer-attach"]
+        let send = app.buttons["composer-send"]
+        XCTAssertTrue(model.isHittable)
+        XCTAssertTrue(effort.isHittable)
+        XCTAssertTrue(attach.isHittable)
+        XCTAssertTrue(send.isHittable)
+        XCTAssertLessThanOrEqual(model.frame.maxY, attach.frame.minY)
+        XCTAssertLessThanOrEqual(effort.frame.maxY, attach.frame.minY)
         let chat = XCTAttachment(screenshot: app.screenshot())
-        chat.name = "Reduce Motion fixture session composer XXXL"
+        chat.name = "\(capturePrefix) session composer XXXL"
         chat.lifetime = .keepAlways
         add(chat)
 
@@ -404,7 +447,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
         launch.tap()
         XCTAssertTrue(app.buttons["launch-confirm-button"].waitForExistence(timeout: timeout))
         let launchSheet = XCTAttachment(screenshot: app.screenshot())
-        launchSheet.name = "Reduce Motion fixture launch sheet XXXL"
+        launchSheet.name = "\(capturePrefix) launch sheet XXXL"
         launchSheet.lifetime = .keepAlways
         add(launchSheet)
         app.buttons["Cancel"].tap()
@@ -417,7 +460,7 @@ final class AccessibilityJourneyUITests: XCTestCase {
             app.descendants(matching: .any)["screen-header-accounts"].waitForExistence(timeout: timeout)
         )
         let accountsCapture = XCTAttachment(screenshot: app.screenshot())
-        accountsCapture.name = "Reduce Motion fixture Accounts XXXL"
+        accountsCapture.name = "\(capturePrefix) Accounts XXXL"
         accountsCapture.lifetime = .keepAlways
         add(accountsCapture)
     }

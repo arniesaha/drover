@@ -49,8 +49,11 @@ final class TerminalBridge: NSObject, TerminalViewDelegate, @unchecked Sendable 
     /// leaves a black screen with nothing on it to explain itself (#170).
     var onConnectFailed: ((String) -> Void)?
 
-    init(request: URLRequest) {
-        stream = TerminalStream(request: request)
+    init(request: URLRequest, connector: (any TerminalConnecting)? = nil) {
+        stream = TerminalStream(
+            request: request,
+            connector: connector ?? URLSessionTerminalConnector()
+        )
         super.init()
     }
 

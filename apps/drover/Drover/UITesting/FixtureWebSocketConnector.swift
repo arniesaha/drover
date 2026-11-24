@@ -66,4 +66,25 @@ struct FixtureWebSocketConnector: WebSocketConnecting {
         }
     }
 }
+
+/// Synthetic PTY transport for the DEBUG-only capability journey. It never
+/// opens a socket and emits one harmless prompt so TerminalScreen itself can
+/// be reviewed without creating a real shell or sending input.
+struct FixtureTerminalConnector: TerminalConnecting {
+    func connect(_ request: URLRequest) -> TerminalConnection {
+        let frames = AsyncThrowingStream<String, Error> { continuation in
+            guard request.url?.host == "fixture.drover.invalid",
+                  request.url?.scheme == "wss"
+            else {
+                continuation.finish(throwing: URLError(.unsupportedURL))
+                return
+            }
+            continuation.yield(#"{"type":"output","data":"Fixture terminal ready\r\n$ "}"#)
+            // Deliberately remain attached: there is no synthetic process to
+            // terminate and no production terminal is involved.
+            continuation.onTermination = { _ in }
+        }
+        return TerminalConnection(frames: frames, send: { _ in })
+    }
+}
 #endif

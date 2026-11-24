@@ -44,7 +44,8 @@ struct UITestScenarioTransport {
             config: config,
             token: FixtureScenarioData.syntheticBearerToken,
             credentialBindingID: FixtureScenarioData.coreJourney.credentialBindingID,
-            session: URLSession(configuration: sessionConfiguration)
+            session: URLSession(configuration: sessionConfiguration),
+            terminalConnector: FixtureTerminalConnector()
         )
         self.receiptState = receiptState
     }

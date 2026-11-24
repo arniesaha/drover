@@ -126,6 +126,7 @@ enum FixtureScenarioData {
     static let legacyHostID = "fixture-legacy-host"
     static let legacyHostName = "Legacy Mac"
     static let labSessionID = "fixture-lab-session"
+    static let terminalSessionID = "fixture-terminal-session"
     static let codexApprovalSessionID = "fixture-codex-approval"
 
     static func longStreamingSnapshotData() -> Data {
@@ -188,18 +189,27 @@ enum FixtureScenarioData {
     /// the unusual fixture adapter; a second, pre-#418 host advertises no
     /// matrix at all and must offer nothing to launch.
     static func capabilitySnapshotData() -> Data {
-        func session(_ id: String, harness: String) -> [String: Any] {
-            [
+        func session(
+            _ id: String,
+            harness: String,
+            mode: String = "structured",
+            preview: String? = nil,
+            awaiting: String? = "approval"
+        ) -> [String: Any] {
+            var value: [String: Any] = [
                 "session_id": id,
                 "host_id": coreJourney.hostID,
                 "harness": harness,
-                "mode": "structured",
+                "mode": mode,
                 "status": "working",
-                "awaiting": "approval",
                 "cwd": "/fixture/project",
-                "preview": "Capability fixture: \(harness)",
+                "preview": preview ?? "Capability fixture: \(harness)",
                 "last_activity": "2026-09-04T00:00:00Z",
             ]
+            if let awaiting {
+                value["awaiting"] = awaiting
+            }
+            return value
         }
         return jsonData([
             "hosts": [
@@ -224,6 +234,13 @@ enum FixtureScenarioData {
             ],
             "sessions": [
                 session(labSessionID, harness: capabilityLabHarness),
+                session(
+                    terminalSessionID,
+                    harness: capabilityLabHarness,
+                    mode: "pty",
+                    preview: "Fixture terminal journey",
+                    awaiting: nil
+                ),
                 session(codexApprovalSessionID, harness: "codex"),
             ],
             "cwd_suggestions": [],
