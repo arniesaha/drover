@@ -117,10 +117,11 @@ elif name == "xcrun":
         print("26.5")
     else:
         key = pathlib.Path(os.environ["API_PRIVATE_KEYS_DIR"]) / "AuthKey_EXAMPLE123.p8"
-        if os.getenv("UPLOAD_RAW"):
-            print(os.environ["UPLOAD_RAW"])
+        raw_response = os.getenv("VALIDATE_RAW" if "--validate-app" in args else "UPLOAD_RAW")
+        if raw_response:
+            print(raw_response)
             print(os.getenv("UPLOAD_STDERR", ""), file=sys.stderr)
-            sys.exit(1)
+            sys.exit(int(os.getenv("VALIDATE_EXIT" if "--validate-app" in args else "UPLOAD_EXIT", "1")))
         validating = "--validate-app" in args
         print(json.dumps({"tool-version": "8.003", "tool-path": "/synthetic/altool", "success-message": ("No errors validating archive." if validating else "No errors uploading archive."), "product-errors": []} | json.loads(os.getenv("VALIDATE_RESPONSE" if validating else "UPLOAD_RESPONSE", "{}")) | {"private": key.read_text() + os.environ["LEAK_SENTINEL"]}))
         if os.getenv("UPLOAD_STDERR"):
@@ -713,6 +714,7 @@ def test_validation_failure_prevents_upload_and_retains_diagnostics(chain):
     assert result.returncode != 0
     record = json.loads((root / "upload-record.json").read_text())
     assert record["stage"] == "validation"
+    assert record["validation_result_contract"] == "nonzero-tool-exit"
     assert record["upload_confirmed"] is False
     assert "CFBundleDisplayName" in record["diagnostic_messages"][0]
     calls = [
@@ -721,6 +723,87 @@ def test_validation_failure_prevents_upload_and_retains_diagnostics(chain):
     assert len(calls) == 1
     assert "--validate-app" in calls[0]["args"]
     assert "--upload-app" not in calls[0]["args"]
+
+
+def test_validation_accepts_warnings_only_after_positive_confirmation(chain):
+    root, _, _, upload, _ = chain
+    result = upload(
+        "--validate",
+        VALIDATE_RESPONSE=json.dumps(
+            {
+                "product-warnings": [
+                    {"code": 90725, "message": "synthetic future SDK warning"}
+                ]
+            }
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads((root / "upload-record.json").read_text())["upload_confirmed"]
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 2
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" in calls[1]["args"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"VALIDATE_EXIT": "1"}, "nonzero-tool-exit"),
+        ({"VALIDATE_RAW": "{not-json", "VALIDATE_EXIT": "0"}, "malformed-response"),
+        (
+            {"VALIDATE_RESPONSE": '{"success-message": "validated"}'},
+            "missing-confirmation",
+        ),
+        (
+            {"VALIDATE_RESPONSE": '{"product-errors":"not-a-list"}'},
+            "malformed-product-errors",
+        ),
+        (
+            {"VALIDATE_RESPONSE": '{"product-warnings":"not-a-list"}'},
+            "malformed-product-warnings",
+        ),
+    ],
+)
+def test_validation_failure_receipt_identifies_safe_contract_boundary(
+    chain, extra, expected
+):
+    root, _, _, upload, _ = chain
+    result = upload("--validate", **extra)
+    assert result.returncode != 0
+    receipt = json.loads((root / "upload-record.json").read_text())
+    assert receipt["stage"] == "validation"
+    assert receipt["validation_result_contract"] == expected
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 1
+    assert "--validate-app" in calls[0]["args"]
+    assert "--upload-app" not in calls[0]["args"]
+
+
+def test_validation_error_contract_redacts_adversarial_message(chain):
+    root, _, _, upload, _ = chain
+    result = upload(
+        "--validate",
+        VALIDATE_RESPONSE=json.dumps(
+            {
+                "product-errors": [
+                    {
+                        "code": 90360,
+                        "message": f"private key={KEY_ID} issuer={ISSUER} token=validation-secret",
+                    }
+                ]
+            }
+        ),
+    )
+    assert result.returncode != 0
+    receipt = json.loads((root / "upload-record.json").read_text())
+    assert receipt["validation_result_contract"] == "nonempty-product-errors"
+    evidence = json.dumps(receipt) + result.stdout + result.stderr
+    for secret in (KEY_ID, ISSUER, "validation-secret"):
+        assert secret not in evidence
 
 
 def test_validation_runs_before_upload(chain):

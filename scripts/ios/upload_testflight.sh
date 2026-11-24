@@ -103,6 +103,26 @@ def write_receipt(path, receipt):
         output.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
+def altool_result_contract(response, returncode, verb):
+    """Classify fixed altool evidence without retaining its messages or body."""
+    if returncode != 0:
+        return "nonzero-tool-exit"
+    if not isinstance(response, dict):
+        return "malformed-response"
+    message = response.get("success-message")
+    if not isinstance(message, str) or not re.match(
+        rf"^No errors {verb}\b", message.strip()
+    ):
+        return "missing-confirmation"
+    for field in ("product-errors", "product-warnings"):
+        value = response.get(field)
+        if value is not None and not isinstance(value, list):
+            return f"malformed-{field}"
+    if response.get("product-errors"):
+        return "nonempty-product-errors"
+    return None
+
+
 def main():
     parser = Parser(
         description="Upload a verified IPA; confirmation does not imply Apple processing or device acceptance."
@@ -213,22 +233,14 @@ def main():
                 response = json.loads(raw_text)
             except json.JSONDecodeError:
                 response = None
-            # altool has punctuated this line differently across Xcode releases --
-            # "archive", the full path, the basename, with and without a trailing
-            # period. An exact-match set fails the run *after* the bytes are at
-            # Apple: no receipt is written, and the operator's natural retry
-            # becomes a second build. Match the invariant part, and keep the
-            # product-errors check as the real gate.
-            message = (
-                response.get("success-message") if isinstance(response, dict) else None
+            # altool varies punctuation around this confirmation. The bounded
+            # contract accepts a confirmed warning-only response, but never a
+            # nonzero tool result, malformed evidence, missing confirmation, or
+            # nonempty product-errors collection.
+            result_contract = altool_result_contract(
+                response, result.returncode, verb
             )
-            confirmed = isinstance(message, str) and re.match(
-                rf"^No errors {verb}\b", message.strip()
-            )
-            product_errors = (
-                response.get("product-errors") if isinstance(response, dict) else None
-            )
-            if result.returncode != 0 or not confirmed or product_errors:
+            if result_contract is not None:
                 stderr = errors_path.read_text(errors="ignore")[: 1024 * 1024]
                 messages = diagnostic_messages(
                     response,
@@ -237,17 +249,17 @@ def main():
                 )
                 codes = set(diagnostic_codes(response))
                 codes.update(stderr_diagnostic_codes(stderr))
-                write_receipt(
-                    args.record,
-                    {
-                        "diagnostic_codes": sorted(codes)[:20],
-                        "diagnostic_messages": messages,
-                        "stage": stage,
-                        "ipa_sha256": digest,
-                        "tool_exit_code": result.returncode,
-                        "upload_confirmed": False,
-                    },
-                )
+                receipt = {
+                    "diagnostic_codes": sorted(codes)[:20],
+                    "diagnostic_messages": messages,
+                    "stage": stage,
+                    "ipa_sha256": digest,
+                    "tool_exit_code": result.returncode,
+                    "upload_confirmed": False,
+                }
+                if stage == "validation":
+                    receipt["validation_result_contract"] = result_contract
+                write_receipt(args.record, receipt)
                 for diagnostic in messages:
                     print(f"Apple {stage}: {json.dumps(diagnostic)}", file=sys.stderr)
                 raise Rejected(f"{stage} rejected; sanitized failure receipt written")
