@@ -625,13 +625,22 @@ def test_upload_accepts_every_altool_confirmation_wording(chain, message):
     )
 
 
-def test_upload_still_rejects_an_unrelated_success_message(chain):
+def test_upload_accepts_observed_success_shape_without_invented_prefix(chain):
     root, _, _, upload, _ = chain
-    result = upload(UPLOAD_RESPONSE=json.dumps({"success-message": "Uploaded 1 file."}))
-    assert result.returncode != 0
+    secret = "upload-success-private-text"
+    result = upload(
+        UPLOAD_RESPONSE_REPLACE="1",
+        UPLOAD_RESPONSE=json.dumps({"success-message": f"opaque {secret}"}),
+    )
+    assert result.returncode == 0, result.stderr
     record = json.loads((root / "upload-record.json").read_text())
-    assert record["upload_confirmed"] is False
-    assert record["diagnostic_codes"] == []
+    assert record["upload_confirmed"] is True
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert len(calls) == 1
+    assert "--upload-app" in calls[0]["args"]
+    assert secret not in result.stdout + result.stderr
 
 
 def test_upload_accepts_xcode_26_6_named_file_confirmation(chain):
