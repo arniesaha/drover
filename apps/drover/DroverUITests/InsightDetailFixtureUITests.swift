@@ -54,7 +54,7 @@ final class InsightDetailFixtureUITests: XCTestCase {
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch.exists)
         addScreenshot(named: "historical-insights-current-empty", app: app)
         app.segmentedControls["insights-collection"].buttons["Historical"].tap()
-        XCTAssertTrue(app.staticTexts["3 loaded findings"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label ==[c] %@", "3 loaded findings")).firstMatch.waitForExistence(timeout: 8))
         let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 8))
         XCTAssertTrue(row.label.contains("Historical evidence"))
