@@ -62,4 +62,24 @@ struct ResultReadReceiptsTests {
         #expect(receipts.unread(in: history).isEmpty)
         #expect(receipts.unread(in: [result("session-23", seq: 24)]).count == 1)
     }
+    @Test func terminationIsNotAResponseAndDoesNotReplaceActualCompletion() {
+        let stop = HarnessMessage(id: "stop", seq: 679, type: .status,
+                                  payload: ["session_status": .string("terminated"), "turn_complete": .bool(true)])
+        let exit = HarnessMessage(id: "exit", seq: 680, type: .status,
+                                  payload: ["exited": .number(143)])
+        #expect(ResultReadReceipts.completedResponse(in: [stop, exit]) == nil)
+        let response = HarnessMessage(id: "answer", seq: 675, type: .assistantOutput, text: "Actual result")
+        #expect(ResultReadReceipts.completedResponse(in: [response, stop, exit]) == nil)
+        let complete = HarnessMessage(id: "original", seq: 677, type: .status,
+                                      payload: ["turn_complete": .bool(true), "awaiting": .string("input")])
+        let messages = [response, complete, stop, exit]
+        #expect(ResultReadReceipts.completedResponse(in: messages)?.completion.id == "original")
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        var session = result(); session.attentionID = "original"
+        receipts.viewed(sessionID: session.id, response: response, messages: messages)
+        #expect(receipts.unread(in: [session]).isEmpty)
+        let newTurn = HarnessMessage(seq: 681, type: .userInput, text: "Next task")
+        #expect(ResultReadReceipts.completedResponse(in: messages + [newTurn]) == nil)
+    }
 }

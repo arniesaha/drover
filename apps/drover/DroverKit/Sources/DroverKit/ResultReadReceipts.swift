@@ -12,6 +12,24 @@ public struct ResultReadReceipts {
         prefix = "drover.result-read.v1." + hub + "."
     }
 
+    /// Lifecycle termination is not response completion. Preserve the real
+    /// completed-turn identity even when the process subsequently stops.
+    public static func completedResponse(in messages: [HarnessMessage]) -> (response: HarnessMessage, completion: HarnessMessage)? {
+        guard let response = messages.last(where: {
+            $0.type == .assistantOutput && !$0.isThinking && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }), let completion = messages.last(where: {
+            guard $0.type == .status, $0.seq >= response.seq,
+                  $0.payload["session_status"] == nil, $0.payload["exited"] == nil else { return false }
+            return $0.payload["turn_complete"]?.boolValue == true
+                || $0.payload["awaiting"]?.stringValue == "input"
+        }), !messages.contains(where: {
+            $0.seq > response.seq && $0.seq <= completion.seq && $0.type == .userInput
+        }), !messages.contains(where: {
+            $0.seq > completion.seq && ($0.type == .userInput || $0.type == .assistantOutput)
+        }) else { return nil }
+        return (response, completion)
+    }
+
     public static func generation(_ session: SessionSummary) -> String? {
         guard session.hostRetiredAt == nil,
               session.attention == .done || session.attention == .errored else { return nil }
@@ -52,20 +70,9 @@ public struct ResultReadReceipts {
     /// a loaded transcript or a session destination appearing/disappearing.
     public func viewed(sessionID: String, response: HarnessMessage, messages: [HarnessMessage]) {
         guard response.type == .assistantOutput, !response.isThinking,
-              !response.text.isEmpty,
-              let latestResponse = messages.last(where: {
-                  $0.type == .assistantOutput && !$0.isThinking && !$0.text.isEmpty
-              }), latestResponse.seq == response.seq,
-              let completion = messages.last(where: {
-                  $0.type == .status && (
-                      $0.payload["turn_complete"]?.boolValue == true
-                      || $0.payload["exited"] != nil
-                      || $0.payload["awaiting"]?.stringValue == "input"
-                  )
-              }), completion.seq >= response.seq,
-              !messages.contains(where: {
-                  $0.seq > completion.seq && ($0.type == .userInput || $0.type == .assistantOutput)
-              }) else { return }
+              let result = Self.completedResponse(in: messages),
+              result.response.seq == response.seq else { return }
+        let completion = result.completion
         var generations = ["attention:" + completion.id]
         if let timestamp = completion.timestamp {
             generations.append("activity:\(timestamp.timeIntervalSince1970)")
