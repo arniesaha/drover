@@ -1265,6 +1265,11 @@ class InsightsService:
         self._scope_cache[key] = (expires_at, value)
 
     def _check_action(self, finding: Finding) -> dict[str, Any]:
+        if _is_retired_rule(finding):
+            return {
+                "available": False,
+                "reason": "Check Again is unavailable because this is historical evidence from a retired rule.",
+            }
         try:
             self._check_scope_cached(finding)
         except InvalidInsightTransition as exc:
@@ -1570,7 +1575,16 @@ def _serialize_finding(finding: Finding) -> dict[str, Any]:
         "resolved_at": _wire_datetime(finding.resolved_at),
         "dismissed_at": _wire_datetime(finding.dismissed_at),
         "regressed_at": _wire_datetime(finding.regressed_at),
+        "historical": _is_retired_rule(finding),
     }
+
+
+def _is_retired_rule(finding: Finding) -> bool:
+    """Rules no current analyzer emits; open evidence remains historical."""
+    return (
+        finding.analyzer_id == "deterministic.telemetry_coverage"
+        and finding.rule_id == "telemetry.flow_coverage"
+    )
 
 
 def _encode_cursor(rank: int, last_seen: datetime, finding_id: str) -> str:

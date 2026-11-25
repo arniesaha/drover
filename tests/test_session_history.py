@@ -154,6 +154,29 @@ def test_cursor_round_trip_and_is_bound_to_its_filters():
         parse_history_query({"host": ["linux"], "cursor": [token]})
 
 
+def test_running_completed_turn_is_finished_in_history_without_hiding_real_input(fleet):
+    registry, path = fleet
+    _session(registry, path, "completed-turn", T0, status="running")
+    registry.ingest_structured_events(
+        [{
+            "event_id": "seq-60",
+            "session_id": "completed-turn",
+            "event_type": "status",
+            "seq": 60,
+            "payload": {
+                "awaiting": "input",
+                "turn_complete": True,
+                "reason": {"kind": "completed"},
+            },
+        }]
+    )
+    _session(registry, path, "real-input", T0 - timedelta(minutes=1), status="running")
+    registry.update_session_activity("real-input", awaiting="input")
+
+    states = {item["id"]: item["state"] for item in _page(path)["items"]}
+    assert states == {"completed-turn": "finished", "real-input": "awaiting"}
+
+
 def test_text_search_query_is_built_only_from_word_terms():
     assert (
         text_search_query("Fix   the Flaky-test") == "fix:* & the:* & flaky:* & test:*"
