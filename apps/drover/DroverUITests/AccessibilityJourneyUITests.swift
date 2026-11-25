@@ -632,7 +632,8 @@ final class AccessibilityJourneyUITests: XCTestCase {
 
         XCUIDevice.shared.press(.home)
         app.activate()
-        XCTAssertTrue(artwork.waitForExistence(timeout: timeout))
+        // The core fixture retries one hub-busy response on foreground refresh.
+        XCTAssertTrue(artwork.waitForExistence(timeout: 15))
         XCTAssertTrue(app.tabBars.buttons["Home"].isSelected)
         XCTAssertTrue(app.buttons["New Session"].isHittable)
         let returned = XCTAttachment(screenshot: app.screenshot())
