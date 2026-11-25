@@ -1,0 +1,65 @@
+import Foundation
+import Testing
+@testable import DroverKit
+
+struct ResultReadReceiptsTests {
+    private func result(_ id: String = "gpu", seq: Int = 82, host: String = "gpu") -> SessionSummary {
+        var session = SessionSummary.fixture(id: id, status: "running", awaiting: "input", hostID: host)
+        session.notificationKind = .finished
+        session.recapSourceSeq = 1 // Deliberately stale async recap must NOT suppress a new result.
+        session.attentionID = "completed-\(seq)"
+        session.lastActivity = Date(timeIntervalSince1970: Double(seq))
+        return session
+    }
+
+    @Test func pollingRelaunchPartialSnapshotsAndNewSessionNeverReadAResult() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        var working = result(); working.awaiting = nil; working.notificationKind = nil
+        receipts.bootstrap([working])
+        let completed = result()
+        #expect(receipts.unread(in: [completed]).map(\.id) == ["gpu"])
+        #expect(receipts.unread(in: []).isEmpty)
+        receipts.bootstrap([])
+        #expect(ResultReadReceipts(hub: "studio", defaults: defaults).unread(in: [completed]).count == 1)
+        #expect(receipts.unread(in: [working, completed]).count == 1)
+        #expect(completed.attention == .done)
+    }
+
+    @Test func actualVisibleGenerationOnlyAndSecondTurnResurfaces() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        let completed = result()
+        receipts.bootstrap([completed])
+        let response = HarnessMessage(seq: 82, type: .assistantOutput, text: "Final response")
+        let completion = HarnessMessage(id: "completed-82", seq: 83, type: .status,
+                                       payload: ["turn_complete": .bool(true)])
+        let messages = [response, completion]
+        receipts.viewed(sessionID: "gpu", response: HarnessMessage(seq: 40, type: .assistantOutput, text: "Earlier"), messages: messages)
+        #expect(receipts.unread(in: [completed]).count == 1)
+        receipts.viewed(sessionID: "gpu", response: HarnessMessage(seq: 82, type: .toolResult, text: "Not a response"), messages: messages)
+        #expect(receipts.unread(in: [completed]).count == 1)
+        receipts.viewed(sessionID: "gpu", response: HarnessMessage(seq: 82, type: .assistantOutput, text: "Final response"), messages: messages)
+        #expect(receipts.unread(in: [completed]).isEmpty)
+        #expect(receipts.unread(in: [result(seq: 120)]).count == 1)
+        // Opening/reading a working turn never acknowledges its future completion.
+        let workingMessages = [HarnessMessage(seq: 120, type: .assistantOutput, text: "Streaming")]
+        receipts.viewed(sessionID: "gpu", response: workingMessages[0], messages: workingMessages)
+        #expect(receipts.unread(in: [result(seq: 120)]).count == 1)
+        #expect(ResultReadReceipts(hub: "other", defaults: defaults).unread(in: [completed]).count == 1)
+        var question = result(seq: 120); question.notificationKind = .input
+        #expect(question.attention == .needsInput)
+        #expect(receipts.unread(in: [question]).isEmpty)
+    }
+
+    @Test func migrationDoesNotFloodAndDismissIsGenerationSpecific() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        let history = (1...23).map { result("session-\($0)", seq: $0) }
+        receipts.bootstrap(history)
+        #expect(receipts.unread(in: history).map(\.id) == ["session-23"])
+        receipts.dismiss(history.last!)
+        #expect(receipts.unread(in: history).isEmpty)
+        #expect(receipts.unread(in: [result("session-23", seq: 24)]).count == 1)
+    }
+}

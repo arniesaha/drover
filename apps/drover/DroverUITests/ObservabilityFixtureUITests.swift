@@ -222,8 +222,14 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(fleet.waitForExistence(timeout: 8))
         let runningRow = app.buttons["gpu-drover-running"]
         XCTAssertTrue(runningRow.waitForExistence(timeout: 5))
+        // Reachability is a scroll contract: a partially visible row can be
+        // hittable while its bottom is still beneath the floating action dock.
+        let launchButton = app.buttons["launch-button"]
+        for _ in 0..<3 where runningRow.frame.maxY >= launchButton.frame.minY {
+            fleet.swipeUp()
+        }
         XCTAssertTrue(runningRow.isHittable)
-        XCTAssertLessThan(runningRow.frame.maxY, app.buttons["launch-button"].frame.minY)
+        XCTAssertLessThan(runningRow.frame.maxY, launchButton.frame.minY)
         screenshot("home-last-row-above-floating-dock-light", app)
     }
 
@@ -444,6 +450,83 @@ final class ObservabilityFixtureUITests: XCTestCase {
         if dark { app.launchArguments += ["-drover.appearance", "dark"] }
         app.launch()
         return app
+    }
+
+    @MainActor
+    func testFinishedResultStaysOnActualHomeUntilResponseViewed() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_UNREAD_RESULT"] = "1"
+        app.launch()
+        let newResponses = app.staticTexts["home-new-responses"]
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+        XCTAssertFalse(app.images["home-empty-state-artwork"].exists)
+        XCTAssertTrue(app.buttons["fixture-session"].isHittable)
+        addSafeFixtureCapture("actual-home-23-finished-one-unread", app)
+
+        // Navigation and relaunch must not acknowledge a delivered result.
+        tab(app, "accounts").tap()
+        tab(app, "home").tap()
+        XCTAssertTrue(newResponses.exists)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "Fixture ready: fixture-session"
+        )).firstMatch.waitForExistence(timeout: 8))
+        addSafeFixtureCapture("actual-visible-final-response", app)
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        addSafeFixtureCapture("actual-home-result-reviewed", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+    }
+
+    @MainActor
+    func testBackgroundCompletionAndViewedWorkingTurnDoNotLoseResults() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_UNREAD_RESULT"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_RESULT_LIFECYCLE"] = "first"
+        app.launch()
+        let newResponses = app.staticTexts["home-new-responses"]
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Working response generation first")).firstMatch.waitForExistence(timeout: 8))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+        addSafeFixtureCapture("actual-background-result-unread", app)
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Final response generation first")).firstMatch.waitForExistence(timeout: 8))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        // Same session and persisted receipt, distinct second turn.
+        app.terminate()
+        app.launchEnvironment["DROVER_UI_TEST_RESULT_LIFECYCLE"] = "second"
+        app.launch()
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
+        addSafeFixtureCapture("actual-second-turn-resurfaces", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
     }
 
     @MainActor

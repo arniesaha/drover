@@ -1,6 +1,7 @@
 import Foundation
 
 #if DEBUG
+import UIKit
 /// Mutable state for the deterministic HTTP hub. Only a synthetic client turn
 /// ID, receipt count, and lookup count are persisted; request text and any
 /// credential are deliberately discarded.
@@ -18,6 +19,7 @@ final class FixtureReceiptState: @unchecked Sendable {
     private let defaults: UserDefaults
     let kind: FixtureScenarioKind
     let delaysAnalytics: Bool
+    private var backgroundObserver: NSObjectProtocol?
     private var analyticsReleased = false
     private var pendingAnalytics: [UUID: @Sendable () -> Void] = [:]
 
@@ -33,6 +35,18 @@ final class FixtureReceiptState: @unchecked Sendable {
             preconditionFailure("Could not create isolated fixture defaults")
         }
         self.defaults = defaults
+        if let phase = ProcessInfo.processInfo.environment["DROVER_UI_TEST_RESULT_LIFECYCLE"] {
+            backgroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.lock.withLock { self.defaults.set(true, forKey: "fixture.result-completed." + phase) }
+            }
+        }
+    }
+
+    deinit {
+        if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
     }
 
     var receiptCount: Int {
@@ -95,7 +109,50 @@ final class FixtureReceiptState: @unchecked Sendable {
             defaults.set(next, forKey: Key.harnessSnapshotCount)
             return next >= 3 ? liveUpdateSessionID : nil
         }
-        return FixtureScenarioData.snapshotData(liveUpdateSessionID: updatedSessionID)
+        return unreadLifecycleData(FixtureScenarioData.snapshotData(liveUpdateSessionID: updatedSessionID), snapshot: true)
+    }
+
+    /// A real background transition releases this synthetic completion.
+    /// Polling, loading Chat and launch speed cannot release it.
+    private func unreadLifecycleData(_ data: Data, snapshot: Bool) -> Data {
+        guard let phase = ProcessInfo.processInfo.environment["DROVER_UI_TEST_RESULT_LIFECYCLE"],
+              var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return data }
+        let completed = lock.withLock {
+            defaults.bool(forKey: "fixture.result-completed." + phase)
+        }
+        let completionID = "lifecycle-completed-" + phase
+        if snapshot {
+            var sessions = (body["sessions"] as! [[String: Any]]).filter {
+                $0["session_id"] as? String == FixtureScenarioData.primarySessionID
+            }
+            if let index = sessions.firstIndex(where: { $0["session_id"] as? String == FixtureScenarioData.primarySessionID }) {
+                sessions[index]["status"] = completed ? "running" : "working"
+                sessions[index]["awaiting"] = completed ? "input" : nil
+                sessions[index]["notification_kind"] = completed ? "finished" : nil
+                sessions[index]["attention_id"] = completed ? completionID : nil
+                sessions[index]["preview"] = completed ? "Result generation " + phase : "Working generation " + phase
+                body["sessions"] = sessions
+            }
+        } else {
+            let seq = phase == "second" ? 10 : 1
+            var messages: [[String: Any]] = [[
+                "event_id": "lifecycle-response-" + phase, "seq": seq,
+                "type": "assistant_output", "role": "assistant",
+                "text": completed ? "Final response generation " + phase : "Working response generation " + phase,
+                "payload": [:],
+            ]]
+            if completed {
+                messages.append(["event_id": completionID, "seq": seq + 1,
+                                 "type": "status", "role": "system", "text": "turn.completed",
+                                 "payload": ["turn_complete": true, "awaiting": "input"]])
+            }
+            body["messages"] = messages
+            body["page_min_seq"] = seq
+            body["page_max_seq"] = completed ? seq + 1 : seq
+            body["max_seq"] = completed ? seq + 1 : seq
+        }
+        return try! JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
 
     func acceptTurn(from request: URLRequest) -> FixtureHubResponse {
@@ -140,7 +197,7 @@ final class FixtureReceiptState: @unchecked Sendable {
             // exact original turn id.
             return lookups >= 2 ? clientTurnID : nil
         }
-        return FixtureScenarioData.historyData(sessionID: sessionID, receiptTurnID: receiptID)
+        return unreadLifecycleData(FixtureScenarioData.historyData(sessionID: sessionID, receiptTurnID: receiptID), snapshot: false)
     }
 }
 
