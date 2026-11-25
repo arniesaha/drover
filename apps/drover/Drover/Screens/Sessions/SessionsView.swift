@@ -48,6 +48,7 @@ struct SessionsView: View {
     @State private var notificationRouteNotice: String?
     @State private var filterState: FleetFilterState
     @State private var isOverviewExpanded = false
+    @State private var resultReceiptRevision = 0
 
     init(
         client: DroverClient,
@@ -150,6 +151,24 @@ struct SessionsView: View {
                             .background(DroverTheme.accentSubtle,
                                         in: RoundedRectangle(cornerRadius: DroverRadius.control, style: .continuous))
                             .accessibilityIdentifier("home-open-inbox")
+                        }
+
+                        if !unreadResults.isEmpty {
+                            Text("New responses")
+                                .font(DroverTypeScale.section)
+                                .foregroundStyle(DroverTheme.textPrimary)
+                                .accessibilityIdentifier("home-new-responses")
+                            ForEach(unreadResults) { session in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    row(for: session)
+                                    Button("Mark reviewed") {
+                                        resultReceipts.dismiss(session)
+                                        resultReceiptRevision += 1
+                                    }
+                                    .font(.caption)
+                                    .accessibilityLabel("Mark result reviewed for " + (session.repoName ?? session.harness))
+                                }
+                            }
                         }
 
                         switch sessionContentState {
@@ -308,12 +327,19 @@ struct SessionsView: View {
             openNotificationRoute()
         }
         .onChange(of: store.lastSuccessfulRefresh) { _, _ in
+            updateResultReceipts()
             syncWidgetSnapshot()
         }
         .onChange(of: cockpitStore.providerAccounts) { _, _ in
             syncWidgetSnapshot()
         }
-        .onAppear { openNotificationRoute() }
+        .onAppear {
+            updateResultReceipts()
+            openNotificationRoute()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { updateResultReceipts() }
+        }
         .sheet(isPresented: $showLaunch) {
             NavigationStack {
                 LaunchView(
@@ -571,12 +597,28 @@ struct SessionsView: View {
         return filterState.filter(store.working)
     }
 
+    private var resultReceipts: ResultReadReceipts {
+        ResultReadReceipts(hub: client.config.baseURL.absoluteString, defaults: defaults)
+    }
+
+    private var unreadResults: [SessionSummary] {
+        _ = resultReceiptRevision
+        let sessions = resultReceipts.unread(in: store.snapshot?.sessions ?? [])
+        if let ids = notificationSessionIDs { return sessions.filter { ids.contains($0.id) } }
+        return filterState.filter(sessions)
+    }
+
+    private func updateResultReceipts() {
+        if let sessions = store.snapshot?.sessions { resultReceipts.bootstrap(sessions) }
+        resultReceiptRevision += 1
+    }
+
     private var sessionContentState: HomeSessionContentState {
         HomeSessionContentState.select(
             hasLoadedOnce: store.hasLoadedOnce,
             isReachable: store.isReachable,
             hasRunningSessions: !runningSessions.isEmpty,
-            hasActionRequiredSessions: !store.needsYou.isEmpty,
+            hasActionRequiredSessions: !store.needsYou.isEmpty || !unreadResults.isEmpty,
             hasError: store.lastError != nil,
             isFiltered: filterState.isFiltered
         )

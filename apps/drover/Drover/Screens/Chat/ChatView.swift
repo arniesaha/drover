@@ -51,6 +51,8 @@ struct ChatView: View {
     private let chatModelFactory: ChatModelFactory?
     private let onSessionEnded: ((String, Bool) -> Void)?
     @State private var visibilityOwner = UUID()
+    @State private var visibleResponseRows: Set<String> = []
+    @State private var resultScreenVisible = false
     @State private var model: ChatModel
     @State private var showTerminateConfirm = false
     @State private var showDiscardPendingConfirm = false
@@ -338,14 +340,18 @@ struct ChatView: View {
             coldOpenIsSlow = true
         }
         .onAppear {
+            resultScreenVisible = true
+            recordVisibleResultResponses()
             NotificationVisibility.shared.show(sessionID: sessionID, owner: visibilityOwner)
             Task { await SessionNotificationDelivery.clear(sessionID: sessionID) }
         }
         .onDisappear {
+            resultScreenVisible = false
             NotificationVisibility.shared.hide(owner: visibilityOwner)
             Task { await model.prepareForDeparture() }
         }
         .onChange(of: scenePhase) { _, phase in
+            if phase == .active { recordVisibleResultResponses() }
             guard phase == .background else { return }
             Task { await model.flushRecoveryCheckpoint() }
         }
@@ -433,6 +439,16 @@ struct ChatView: View {
         }
     }
 
+    private func recordVisibleResultResponses() {
+        guard resultScreenVisible, scenePhase == .active, let client else { return }
+        let receipts = ResultReadReceipts(hub: client.config.baseURL.absoluteString)
+        for item in model.items where visibleResponseRows.contains(item.id) {
+            if case .message(let response) = item {
+                receipts.viewed(sessionID: sessionID, response: response, messages: model.messages)
+            }
+        }
+    }
+
     private var transcript: some View {
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
@@ -510,6 +526,11 @@ struct ChatView: View {
                         ForEach(items) { item in
                             row(for: item, isNewest: item.id == items.last?.id)
                                 .id(item.id)
+                                .onScrollVisibilityChange(threshold: 0.1) { visible in
+                                    if visible { visibleResponseRows.insert(item.id) }
+                                    else { visibleResponseRows.remove(item.id) }
+                                    recordVisibleResultResponses()
+                                }
                                 .background {
                                     GeometryReader { geometry in
                                         Color.clear.preference(
@@ -658,6 +679,7 @@ struct ChatView: View {
                 // keeps the transcript following the stream without an animation
                 // storm. Gated on pinning so it never fights the user's finger.
                 .onChange(of: model.messagesVersion) { _, _ in
+                    recordVisibleResultResponses()
                     // Also observes in-place streaming updates, whose last ID may be unchanged.
                     if followState.contentChanged() { scheduleScroll(with: proxy) }
                 }
