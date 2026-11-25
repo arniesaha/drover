@@ -82,4 +82,48 @@ struct ResultReadReceiptsTests {
         let newTurn = HarnessMessage(seq: 681, type: .userInput, text: "Next task")
         #expect(ResultReadReceipts.completedResponse(in: messages + [newTurn]) == nil)
     }
+    @Test func terminalEvidenceDoesNotInventResultsAndRetainsUnreadThroughStop() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        receipts.bootstrap([])
+        var stopped = result(); stopped.status = "terminated"; stopped.attentionID = "stop"
+        let response = HarnessMessage(seq: 82, type: .assistantOutput, text: "Actual result")
+        let completion = HarnessMessage(id: "completed-82", seq: 83, type: .status,
+                                       payload: ["turn_complete": .bool(true)])
+        let stop = HarnessMessage(id: "stop", seq: 84, type: .status,
+                                 payload: ["session_status": .string("terminated"), "turn_complete": .bool(true)])
+        #expect(receipts.unread(in: [stopped]).isEmpty)
+        receipts.recordResponseEvidence(stopped, messages: [stop])
+        #expect(receipts.unread(in: [stopped]).isEmpty)
+        #expect(!receipts.needsResponseEvidence(stopped))
+        receipts.recordResponseEvidence(stopped, messages: [response, completion, stop])
+        #expect(receipts.unread(in: [stopped]).count == 1)
+        receipts.viewed(sessionID: stopped.id, response: response, messages: [response, completion, stop])
+        #expect(ResultReadReceipts(hub: "studio", defaults: defaults).unread(in: [stopped]).isEmpty)
+        stopped.lastActivity = Date(timeIntervalSince1970: 900)
+        #expect(receipts.needsResponseEvidence(stopped))
+        receipts.recordResponseEvidence(stopped, messages: [response, completion, stop])
+        #expect(receipts.unread(in: [stopped]).isEmpty)
+    }
+
+    @Test func firstInstallDoesNotPromoteOldTerminalPerHostExample() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        var old = result("old-nas", host: "nas"); old.status = "terminated"
+        receipts.bootstrap([old])
+        let response = HarnessMessage(seq: 1, type: .assistantOutput, text: "Old result")
+        let completion = HarnessMessage(id: "old-completion", seq: 2, type: .status,
+                                       payload: ["turn_complete": .bool(true)])
+        receipts.recordResponseEvidence(old, messages: [response, completion])
+        #expect(receipts.unread(in: [old]).isEmpty)
+        old.lastActivity = Date(timeIntervalSince1970: 900)
+        receipts.recordResponseEvidence(old, messages: [response, completion])
+        #expect(receipts.unread(in: [old]).isEmpty)
+        let nextResponse = HarnessMessage(seq: 10, type: .assistantOutput, text: "New result")
+        let nextCompletion = HarnessMessage(id: "new-completion", seq: 11, type: .status,
+                                           payload: ["turn_complete": .bool(true)])
+        receipts.recordResponseEvidence(old, messages: [nextResponse, nextCompletion])
+        #expect(receipts.unread(in: [old]).count == 1)
+    }
+
 }

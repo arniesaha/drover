@@ -49,6 +49,7 @@ struct SessionsView: View {
     @State private var filterState: FleetFilterState
     @State private var isOverviewExpanded = false
     @State private var resultReceiptRevision = 0
+    @State private var refreshingResultEvidence = false
 
     init(
         client: DroverClient,
@@ -612,6 +613,39 @@ struct SessionsView: View {
     private func updateResultReceipts() {
         if let sessions = store.snapshot?.sessions { resultReceipts.bootstrap(sessions) }
         resultReceiptRevision += 1
+        guard !refreshingResultEvidence, scenePhase == .active else { return }
+        let candidates = (store.snapshot?.sessions ?? []).filter {
+            $0.hostRetiredAt == nil && resultReceipts.needsResponseEvidence($0)
+        }.prefix(4)
+        guard !candidates.isEmpty else { return }
+        refreshingResultEvidence = true
+        Task { @MainActor in
+            defer { refreshingResultEvidence = false }
+            // Four bounded tail reads per refresh; stable revisions persist.
+            for session in candidates {
+                guard !Task.isCancelled, scenePhase == .active else { return }
+                do {
+                    let page = try await client.messagePage(sessionID: session.id, request: .newest(limit: 100))
+                    guard !page.hasNewer, page.decodeIssues.isEmpty else { continue }
+                    // A long lifecycle tail may put the actual result on an
+                    // older page. Never cache a truncated tail as "no result".
+                    var messages = page.messages
+                    var older = page.hasOlder
+                    var before = page.pageMinSeq
+                    for _ in 0..<2 where older && ResultReadReceipts.completedResponse(in: messages) == nil {
+                        guard let seq = before else { break }
+                        let previous = try await client.messagePage(sessionID: session.id, request: .older(beforeSeq: seq, limit: 100))
+                        guard previous.decodeIssues.isEmpty else { break }
+                        messages = previous.messages + messages
+                        older = previous.hasOlder
+                        before = previous.pageMinSeq
+                    }
+                    guard !older || ResultReadReceipts.completedResponse(in: messages) != nil else { continue }
+                    resultReceipts.recordResponseEvidence(session, messages: messages)
+                    resultReceiptRevision += 1
+                } catch { /* A failed tail read never marks a result read. */ }
+            }
+        }
     }
 
     private var sessionContentState: HomeSessionContentState {

@@ -38,18 +38,62 @@ public struct ResultReadReceipts {
         return "activity:\(date.timeIntervalSince1970)"
     }
 
-    /// First-install migration: preserve one latest result per host for review,
+    /// Terminal summaries prove process state, not an assistant result. Cache
+    /// transcript evidence against the exact summary revision, never a host.
+    public func needsResponseEvidence(_ session: SessionSummary) -> Bool {
+        requiresResponseEvidence(session) && evidence[session.id]?["revision"] != revision(session)
+    }
+
+    private var evidence: [String: [String: String]] {
+        defaults.dictionary(forKey: prefix + "evidence") as? [String: [String: String]] ?? [:]
+    }
+
+    private func requiresResponseEvidence(_ session: SessionSummary) -> Bool {
+        ["completed", "terminated", "errored"].contains(session.status) || session.attention == .errored
+    }
+
+    private func revision(_ session: SessionSummary) -> String {
+        "\(session.status)|\(session.attentionID ?? "")|\(session.activityDate?.timeIntervalSince1970 ?? 0)"
+    }
+
+    public func recordResponseEvidence(_ session: SessionSummary, messages: [HarnessMessage]) {
+        var stored = evidence
+        let result = Self.completedResponse(in: messages)
+        stored[session.id] = ["revision": revision(session),
+                              "generation": result.map { "attention:" + $0.completion.id } ?? ""]
+        defaults.set(stored, forKey: prefix + "evidence")
+        // Resolve a first-install baseline to the actual completion once known.
+        // Later stop/activity revisions must not resurrect that same old result.
+        var dismissed = defaults.dictionary(forKey: prefix + "dismissed") as? [String: String] ?? [:]
+        if dismissed[session.id] == "baseline:" + revision(session), let result {
+            dismissed[session.id] = "attention:" + result.completion.id
+            defaults.set(dismissed, forKey: prefix + "dismissed")
+        }
+    }
+
+    private func resultGeneration(_ session: SessionSummary) -> String? {
+        guard Self.generation(session) != nil else { return nil }
+        if requiresResponseEvidence(session) {
+            guard let value = evidence[session.id], value["revision"] == revision(session),
+                  let generation = value["generation"], !generation.isEmpty else { return nil }
+            return generation
+        }
+        return Self.generation(session)
+    }
+
+    /// First-install migration: preserve one latest non-terminal result per host for review,
     /// rather than flooding Home with every old finished session. All subsequent
     /// results persist without a timeout. Missing/filtered snapshots never prune.
     public func bootstrap(_ sessions: [SessionSummary]) {
         guard !defaults.bool(forKey: prefix + "bootstrapped") else { return }
         let finished = sessions.filter { Self.generation($0) != nil }
         let newest = Dictionary(grouping: finished, by: \.hostID).values.compactMap {
-            $0.max { ($0.activityDate ?? .distantPast) < ($1.activityDate ?? .distantPast) }?.id
+            $0.filter { !requiresResponseEvidence($0) }
+                .max { ($0.activityDate ?? .distantPast) < ($1.activityDate ?? .distantPast) }?.id
         }
         var dismissed = defaults.dictionary(forKey: prefix + "dismissed") as? [String: String] ?? [:]
         for session in finished where !newest.contains(session.id) {
-            dismissed[session.id] = Self.generation(session)
+            dismissed[session.id] = resultGeneration(session) ?? "baseline:" + revision(session)
         }
         defaults.set(dismissed, forKey: prefix + "dismissed")
         defaults.set(true, forKey: prefix + "bootstrapped")
@@ -59,8 +103,9 @@ public struct ResultReadReceipts {
         let dismissed = defaults.dictionary(forKey: prefix + "dismissed") as? [String: String] ?? [:]
         let read = defaults.dictionary(forKey: prefix + "viewed") as? [String: [String]] ?? [:]
         return sessions.filter { session in
-            guard let generation = Self.generation(session),
-                  dismissed[session.id] != generation else { return false }
+            guard let generation = resultGeneration(session),
+                  dismissed[session.id] != generation,
+                  dismissed[session.id] != "baseline:" + revision(session) else { return false }
             if read[session.id]?.contains(generation) == true { return false }
             return true
         }.sorted { ($0.activityDate ?? .distantPast) > ($1.activityDate ?? .distantPast) }
@@ -83,7 +128,7 @@ public struct ResultReadReceipts {
     }
 
     public func dismiss(_ session: SessionSummary) {
-        guard let generation = Self.generation(session) else { return }
+        guard let generation = resultGeneration(session) else { return }
         var dismissed = defaults.dictionary(forKey: prefix + "dismissed") as? [String: String] ?? [:]
         dismissed[session.id] = generation
         defaults.set(dismissed, forKey: prefix + "dismissed")

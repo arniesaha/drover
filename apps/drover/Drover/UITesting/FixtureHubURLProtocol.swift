@@ -114,7 +114,7 @@ final class FixtureReceiptState: @unchecked Sendable {
 
     /// A real background transition releases this synthetic completion.
     /// Polling, loading Chat and launch speed cannot release it.
-    private func unreadLifecycleData(_ data: Data, snapshot: Bool) -> Data {
+    private func unreadLifecycleData(_ data: Data, snapshot: Bool, sessionID: String? = nil) -> Data {
         guard let phase = ProcessInfo.processInfo.environment["DROVER_UI_TEST_RESULT_LIFECYCLE"],
               var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return data }
@@ -127,11 +127,17 @@ final class FixtureReceiptState: @unchecked Sendable {
                 $0["session_id"] as? String == FixtureScenarioData.primarySessionID
             }
             if let index = sessions.firstIndex(where: { $0["session_id"] as? String == FixtureScenarioData.primarySessionID }) {
-                sessions[index]["status"] = completed ? "running" : "working"
+                sessions[index]["status"] = completed ? (phase == "terminated" ? "terminated" : "running") : "working"
                 sessions[index]["awaiting"] = completed ? "input" : nil
                 sessions[index]["notification_kind"] = completed ? "finished" : nil
                 sessions[index]["attention_id"] = completed ? completionID : nil
                 sessions[index]["preview"] = completed ? "Result generation " + phase : "Working generation " + phase
+                if phase == "terminated" {
+                    sessions.append(["session_id": "old-lifecycle-only", "host_id": "old-nas",
+                                     "harness": "codex", "mode": "structured", "status": "terminated",
+                                     "attention_id": "old-stop", "preview": "Old lifecycle only",
+                                     "last_activity": "2026-09-01T00:00:00Z"])
+                }
                 body["sessions"] = sessions
             }
         } else {
@@ -147,10 +153,20 @@ final class FixtureReceiptState: @unchecked Sendable {
                                  "type": "status", "role": "system", "text": "turn.completed",
                                  "payload": ["turn_complete": true, "awaiting": "input"]])
             }
+            if phase == "terminated", completed {
+                messages.append(["event_id": "lifecycle-stop", "seq": seq + 2,
+                                 "type": "status", "role": "system", "text": "Session terminated",
+                                 "payload": ["session_status": "terminated", "turn_complete": true]])
+            }
+            if phase == "terminated", sessionID == "old-lifecycle-only" {
+                messages = [["event_id": "old-stop", "seq": seq,
+                             "type": "status", "role": "system", "text": "Session terminated",
+                             "payload": ["session_status": "terminated", "turn_complete": true]]]
+            }
             body["messages"] = messages
             body["page_min_seq"] = seq
-            body["page_max_seq"] = completed ? seq + 1 : seq
-            body["max_seq"] = completed ? seq + 1 : seq
+            body["page_max_seq"] = messages.last?["seq"] ?? seq
+            body["max_seq"] = messages.last?["seq"] ?? seq
         }
         return try! JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
     }
@@ -197,7 +213,7 @@ final class FixtureReceiptState: @unchecked Sendable {
             // exact original turn id.
             return lookups >= 2 ? clientTurnID : nil
         }
-        return unreadLifecycleData(FixtureScenarioData.historyData(sessionID: sessionID, receiptTurnID: receiptID), snapshot: false)
+        return unreadLifecycleData(FixtureScenarioData.historyData(sessionID: sessionID, receiptTurnID: receiptID), snapshot: false, sessionID: sessionID)
     }
 }
 
