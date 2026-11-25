@@ -222,8 +222,14 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(fleet.waitForExistence(timeout: 8))
         let runningRow = app.buttons["gpu-drover-running"]
         XCTAssertTrue(runningRow.waitForExistence(timeout: 5))
+        // Reachability is a scroll contract: a partially visible row can be
+        // hittable while its bottom is still beneath the floating action dock.
+        let launchButton = app.buttons["launch-button"]
+        for _ in 0..<3 where runningRow.frame.maxY >= launchButton.frame.minY {
+            fleet.swipeUp()
+        }
         XCTAssertTrue(runningRow.isHittable)
-        XCTAssertLessThan(runningRow.frame.maxY, app.buttons["launch-button"].frame.minY)
+        XCTAssertLessThan(runningRow.frame.maxY, launchButton.frame.minY)
         screenshot("home-last-row-above-floating-dock-light", app)
     }
 
