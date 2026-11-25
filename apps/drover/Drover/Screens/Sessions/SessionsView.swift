@@ -846,12 +846,7 @@ private struct HomeEmptyState: View {
 
     var body: some View {
         VStack(spacing: DroverSpace.x3) {
-            Image("DroverHero")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: 300, maxHeight: artworkMaximumHeight)
-                .accessibilityLabel("Drover dog artwork")
-                .accessibilityIdentifier("home-empty-state-artwork")
+            IdleBannerArtwork(maximumHeight: artworkMaximumHeight)
 
             Text("Nothing running.")
                 .droverText(.subtitle)
@@ -867,6 +862,36 @@ private struct HomeEmptyState: View {
             minHeight: dynamicTypeSize.isAccessibilitySize ? nil : availableContentHeight,
             alignment: .center
         )
+    }
+}
+
+/// A conservative native prototype using the existing, unmodified illustration.
+/// This is only a 0.35% breathing scale, not simulated limb motion or a moving
+/// card. No geometry-specific glow is painted over the flattened artwork.
+private struct IdleBannerArtwork: View {
+    let maximumHeight: CGFloat
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var isVisible = false
+
+    private var motionEnabled: Bool {
+        isVisible && scenePhase == .active && !reduceMotion
+    }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !motionEnabled)) { context in
+            let cycle = context.date.timeIntervalSinceReferenceDate / 6.0
+            let breath = motionEnabled ? (1 - cos(cycle * 2 * .pi)) / 2 : 0
+            Image("DroverHero")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 300, maxHeight: maximumHeight)
+                .scaleEffect(1 + 0.0035 * breath)
+                .accessibilityLabel("Drover dog artwork")
+                .accessibilityIdentifier("home-empty-state-artwork")
+        }
+        .onScrollVisibilityChange(threshold: 0.01) { isVisible = $0 }
+        .onDisappear { isVisible = false }
     }
 }
 
