@@ -158,17 +158,19 @@ def test_running_completed_turn_is_finished_in_history_without_hiding_real_input
     registry, path = fleet
     _session(registry, path, "completed-turn", T0, status="running")
     registry.ingest_structured_events(
-        [{
-            "event_id": "seq-60",
-            "session_id": "completed-turn",
-            "event_type": "status",
-            "seq": 60,
-            "payload": {
-                "awaiting": "input",
-                "turn_complete": True,
-                "reason": {"kind": "completed"},
-            },
-        }]
+        [
+            {
+                "event_id": "seq-60",
+                "session_id": "completed-turn",
+                "event_type": "status",
+                "seq": 60,
+                "payload": {
+                    "awaiting": "input",
+                    "turn_complete": True,
+                    "reason": {"kind": "completed"},
+                },
+            }
+        ]
     )
     _session(registry, path, "real-input", T0 - timedelta(minutes=1), status="running")
     registry.update_session_activity("real-input", awaiting="input")

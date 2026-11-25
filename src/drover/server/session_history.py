@@ -490,7 +490,8 @@ def fetch_history_page(
     awaiting_ids = [
         row["session_id"]
         for row in rows
-        if row.get("awaiting") == "input" and row.get("status") not in (*_FINISHED, *_FAILED)
+        if row.get("awaiting") == "input"
+        and row.get("status") not in (*_FINISHED, *_FAILED)
     ]
     if awaiting_ids:
         kinds = HarnessRegistry(control_path).completed_turn_kinds(awaiting_ids)
