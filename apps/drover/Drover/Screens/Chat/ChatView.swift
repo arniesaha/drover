@@ -50,6 +50,7 @@ struct ChatView: View {
     private let recoveryGeneration: Int
     private let chatModelFactory: ChatModelFactory?
     private let onSessionEnded: ((String, Bool) -> Void)?
+    private let resultReceiptDefaults: UserDefaults
     @State private var visibilityOwner = UUID()
     @State private var visibleResponseRows: Set<String> = []
     @State private var resultScreenVisible = false
@@ -87,8 +88,10 @@ struct ChatView: View {
         recoveryGeneration: Int = 0,
         chatModelFactory: ChatModelFactory? = nil,
         onSessionEnded: ((String, Bool) -> Void)? = nil,
-        isDemoMode: Bool = false
+        isDemoMode: Bool = false,
+        resultReceiptDefaults: UserDefaults = .standard
     ) {
+        self.resultReceiptDefaults = resultReceiptDefaults
         self.client = client
         self.sessionID = sessionID
         self.isDemoMode = isDemoMode
@@ -441,7 +444,7 @@ struct ChatView: View {
 
     private func recordVisibleResultResponses() {
         guard resultScreenVisible, scenePhase == .active, let client else { return }
-        let receipts = ResultReadReceipts(hub: client.config.baseURL.absoluteString)
+        let receipts = ResultReadReceipts(hub: client.config.baseURL.absoluteString, defaults: resultReceiptDefaults)
         for item in model.items where visibleResponseRows.contains(item.id) {
             if case .message(let response) = item {
                 receipts.viewed(sessionID: sessionID, response: response, messages: model.messages)

@@ -447,6 +447,43 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testFinishedResultStaysOnActualHomeUntilResponseViewed() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_UNREAD_RESULT"] = "1"
+        app.launch()
+        let newResponses = app.staticTexts["home-new-responses"]
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+        XCTAssertFalse(app.images["home-empty-state-artwork"].exists)
+        XCTAssertTrue(app.buttons["fixture-session"].isHittable)
+        addSafeFixtureCapture("actual-home-23-finished-one-unread", app)
+
+        // Navigation and relaunch must not acknowledge a delivered result.
+        tab(app, "accounts").tap()
+        tab(app, "home").tap()
+        XCTAssertTrue(newResponses.exists)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "Fixture ready: fixture-session"
+        )).firstMatch.waitForExistence(timeout: 8))
+        addSafeFixtureCapture("actual-visible-final-response", app)
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        addSafeFixtureCapture("actual-home-result-reviewed", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+    }
+
+    @MainActor
     func testRealAppRootTabNavigationAndDeepLink() {
         // 1. Launch against real app root (core-journey scenario)
         let app = launchRealApp()

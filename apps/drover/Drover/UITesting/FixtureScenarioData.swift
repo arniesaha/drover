@@ -183,6 +183,21 @@ enum FixtureScenarioData {
                 "host_id": coreJourney.hostID,
             ]],
         ]
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_UNREAD_RESULT"] == "1" {
+            let old: [[String: Any]] = (1...22).map { index in
+                ["session_id": "old-result-\(index)", "host_id": coreJourney.hostID,
+                 "harness": "codex", "mode": "structured", "status": "completed",
+                 "last_activity": "2026-09-03T00:00:00Z"]
+            }
+            snapshot["sessions"] = old + [[
+                "session_id": primarySessionID, "host_id": coreJourney.hostID,
+                "harness": "codex", "mode": "structured", "status": "running",
+                "awaiting": "input", "notification_kind": "finished",
+                "attention_id": "fixture-result-completed",
+                "preview": "GPU fixture finished response", "recap_source_seq": 1,
+                "last_activity": "2026-09-04T00:00:00Z",
+            ]]
+        }
         // The real-root navigation regression needs Analytics to issue a
         // request; the ordinary core journey intentionally has no Cockpit.
         if ProcessInfo.processInfo.environment["DROVER_UI_TEST_DELAYED_ANALYTICS"] == "1" {
@@ -279,6 +294,13 @@ enum FixtureScenarioData {
             "text": "Fixture ready: \(sessionID)",
             "payload": [:],
         ]]
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_UNREAD_RESULT"] == "1" {
+            messages.append([
+                "event_id": "fixture-result-completed", "seq": 2,
+                "type": "status", "role": "system", "text": "turn.completed",
+                "payload": ["turn_complete": true, "awaiting": "input"],
+            ])
+        }
         if ProcessInfo.processInfo.environment["DROVER_UI_TEST_TRANSCRIPT_STREAM"] == "1" {
             messages = (1...40).map { index in
                 [

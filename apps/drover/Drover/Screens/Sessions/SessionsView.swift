@@ -369,7 +369,8 @@ struct SessionsView: View {
                         recoveryGeneration: recoveryGeneration,
                         chatModelFactory: chatModelFactory,
                         onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) },
-                        isDemoMode: isEffectiveDemoMode
+                        isDemoMode: isEffectiveDemoMode,
+                        resultReceiptDefaults: defaults
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: launched.id, harness: launched.harness)
@@ -694,7 +695,8 @@ struct SessionsView: View {
                         recoveryGeneration: recoveryGeneration,
                         chatModelFactory: chatModelFactory,
                         onSessionEnded: { id, ended in store.markSessionEnded(id, ended: ended) },
-                        isDemoMode: isEffectiveDemoMode
+                        isDemoMode: isEffectiveDemoMode,
+                        resultReceiptDefaults: defaults
                     )
                 } else {
                     TerminalScreen(client: client, sessionID: session.id, harness: session.harness)
