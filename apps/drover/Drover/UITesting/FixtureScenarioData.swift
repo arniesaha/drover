@@ -42,7 +42,11 @@ enum FixtureScenarioData {
     }
 
     static func insightDetailData() -> Data {
-        jsonData([
+        let historical = insightFinding()["historical"] as? Bool ?? false
+        let checkAction: [String: Any] = historical
+            ? ["available": false, "reason": "Check Again is unavailable because this is historical evidence from a retired rule."]
+            : ["available": true]
+        return jsonData([
             "finding": insightFinding(),
             "evidence": [
                 [
@@ -62,7 +66,7 @@ enum FixtureScenarioData {
                     "excerpt": NSNull(),
                 ] as [String: Any],
             ],
-            "actions": ["check_again": ["available": true]],
+            "actions": ["check_again": checkAction],
         ])
     }
 

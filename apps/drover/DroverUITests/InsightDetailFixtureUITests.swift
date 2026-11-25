@@ -78,6 +78,8 @@ final class InsightDetailFixtureUITests: XCTestCase {
         for _ in 0..<4 where !obsolete.isHittable { app.scrollViews.firstMatch.swipeUp() }
         XCTAssertTrue(obsolete.isHittable)
         XCTAssertFalse(app.staticTexts["Recommended steps"].exists)
+        XCTAssertFalse(app.buttons["insight-check-again"].exists)
+        XCTAssertTrue(app.staticTexts["Check Again is unavailable because this is historical evidence from a retired rule."].exists)
         addScreenshot(named: "historical-insight-detail-light", app: app)
         obsolete.tap()
         XCTAssertTrue(app.staticTexts["These steps belonged to a retired rule. They are preserved as evidence, not a request to repair current telemetry."].exists)
