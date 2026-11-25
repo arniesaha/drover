@@ -1,6 +1,7 @@
 import Foundation
 
 #if DEBUG
+import UIKit
 /// Mutable state for the deterministic HTTP hub. Only a synthetic client turn
 /// ID, receipt count, and lookup count are persisted; request text and any
 /// credential are deliberately discarded.
@@ -18,6 +19,7 @@ final class FixtureReceiptState: @unchecked Sendable {
     private let defaults: UserDefaults
     let kind: FixtureScenarioKind
     let delaysAnalytics: Bool
+    private var backgroundObserver: NSObjectProtocol?
     private var analyticsReleased = false
     private var pendingAnalytics: [UUID: @Sendable () -> Void] = [:]
 
@@ -33,6 +35,18 @@ final class FixtureReceiptState: @unchecked Sendable {
             preconditionFailure("Could not create isolated fixture defaults")
         }
         self.defaults = defaults
+        if let phase = ProcessInfo.processInfo.environment["DROVER_UI_TEST_RESULT_LIFECYCLE"] {
+            backgroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.lock.withLock { self.defaults.set(true, forKey: "fixture.result-completed." + phase) }
+            }
+        }
+    }
+
+    deinit {
+        if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
     }
 
     var receiptCount: Int {
@@ -98,16 +112,14 @@ final class FixtureReceiptState: @unchecked Sendable {
         return unreadLifecycleData(FixtureScenarioData.snapshotData(liveUpdateSessionID: updatedSessionID), snapshot: true)
     }
 
-    /// Persisted synthetic server clock; completion happens offscreen, not
-    /// because a transcript was loaded or a notification was delivered.
+    /// A real background transition releases this synthetic completion.
+    /// Polling, loading Chat and launch speed cannot release it.
     private func unreadLifecycleData(_ data: Data, snapshot: Bool) -> Data {
         guard let phase = ProcessInfo.processInfo.environment["DROVER_UI_TEST_RESULT_LIFECYCLE"],
               var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return data }
-        let completed = lock.withLock { () -> Bool in
-            let key = "fixture.result-start." + phase
-            if defaults.object(forKey: key) == nil { defaults.set(Date.now, forKey: key) }
-            return Date.now.timeIntervalSince(defaults.object(forKey: key) as! Date) >= 16
+        let completed = lock.withLock {
+            defaults.bool(forKey: "fixture.result-completed." + phase)
         }
         let completionID = "lifecycle-completed-" + phase
         if snapshot {

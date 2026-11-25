@@ -499,9 +499,6 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Working response generation first")).firstMatch.waitForExistence(timeout: 8))
         app.navigationBars.buttons.element(boundBy: 0).tap()
         XCUIDevice.shared.press(.home)
-        let backgroundInterval = expectation(description: "fixture completes offscreen")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 17) { backgroundInterval.fulfill() }
-        wait(for: [backgroundInterval], timeout: 20)
         app.activate()
         XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
         XCTAssertFalse(app.staticTexts["Running now"].exists)
@@ -518,9 +515,6 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
         XCTAssertFalse(newResponses.exists)
         XCUIDevice.shared.press(.home)
-        let secondInterval = expectation(description: "second turn completes offscreen")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 17) { secondInterval.fulfill() }
-        wait(for: [secondInterval], timeout: 20)
         app.activate()
         XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
         addSafeFixtureCapture("actual-second-turn-resurfaces", app)
