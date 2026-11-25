@@ -47,7 +47,20 @@ final class InsightDetailFixtureUITests: XCTestCase {
         let inbox = app.tabBars.buttons["Inbox"]
         XCTAssertTrue(inbox.waitForExistence(timeout: 8))
         inbox.tap()
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Open priority insights")).firstMatch.exists)
+        addScreenshot(named: "historical-insights-no-priority-warning", app: app)
         app.segmentedControls["inbox-segments"].buttons["Insights"].tap()
+        XCTAssertTrue(app.staticTexts["No current insights"].waitForExistence(timeout: 8))
+        let summary = app.buttons["insights-summary"]
+        XCTAssertTrue(summary.waitForExistence(timeout: 8))
+        let zeroCounts = NSPredicate(format: "label CONTAINS %@", "0 current open · 0 high/critical severity")
+        expectation(for: zeroCounts, evaluatedWith: summary)
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(summary.label.contains("temporarily unavailable"))
+        XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch.exists)
+        addScreenshot(named: "historical-insights-current-empty", app: app)
+        app.segmentedControls["insights-collection"].buttons["Historical"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label ==[c] %@", "3 loaded findings")).firstMatch.waitForExistence(timeout: 8))
         let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 8))
         XCTAssertTrue(row.label.contains("Historical evidence"))
@@ -60,7 +73,17 @@ final class InsightDetailFixtureUITests: XCTestCase {
         XCTAssertTrue(header.waitForExistence(timeout: 8))
         XCTAssertTrue(header.label.contains("Historical evidence"))
         XCTAssertTrue(header.label.contains("Status: Open"))
+        XCTAssertTrue(header.label.contains("Evidence: 2 observations"))
+        let obsolete = app.buttons["Obsolete context — not current action"]
+        for _ in 0..<4 where !obsolete.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(obsolete.isHittable)
+        XCTAssertFalse(app.staticTexts["Recommended steps"].exists)
+        XCTAssertFalse(app.buttons["insight-check-again"].exists)
+        XCTAssertTrue(app.staticTexts["Check Again is unavailable because this is historical evidence from a retired rule."].exists)
         addScreenshot(named: "historical-insight-detail-light", app: app)
+        obsolete.tap()
+        XCTAssertTrue(app.staticTexts["These steps belonged to a retired rule. They are preserved as evidence, not a request to repair current telemetry."].exists)
+        addScreenshot(named: "historical-insight-obsolete-context-expanded", app: app)
     }
 
     @MainActor

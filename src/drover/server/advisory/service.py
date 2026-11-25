@@ -27,6 +27,8 @@ from drover.server.advisory.jobs import (
 )
 from drover.server.advisory.model_analyzer import MODEL_ANALYZER_ID
 from drover.server.advisory.repository import AdvisoryRepository
+from drover.server.advisory.retired_rules import is_retired_rule as _is_retired_rule
+from drover.server.advisory.retired_rules import retired_rule_ids as _retired_rule_ids
 from drover.server.advisory.types import (
     AnalyzerClass,
     Confidence,
@@ -1578,18 +1580,6 @@ def _serialize_finding(finding: Finding) -> dict[str, Any]:
         "regressed_at": _wire_datetime(finding.regressed_at),
         "historical": _is_retired_rule(finding),
     }
-
-
-def _is_retired_rule(finding: Finding) -> bool:
-    """Rules no current analyzer emits; open evidence remains historical."""
-    return _retired_rule_ids(finding.analyzer_id, finding.rule_id)
-
-
-def _retired_rule_ids(analyzer_id: str, rule_id: str) -> bool:
-    return (
-        analyzer_id == "deterministic.telemetry_coverage"
-        and rule_id == "telemetry.flow_coverage"
-    )
 
 
 def _encode_cursor(rank: int, last_seen: datetime, finding_id: str) -> str:

@@ -602,12 +602,17 @@ class CockpitService:
         return response["result"]
 
     def _insight_counts(self) -> dict[str, int] | None:
+        from drover.server.advisory.retired_rules import is_retired_rule
+
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         if self.advisory_repository is None:
             return counts
         try:
             for finding in self.advisory_repository.list_findings():
-                if finding.state.value not in {"open", "regressed"}:
+                if is_retired_rule(finding) or finding.state.value not in {
+                    "open",
+                    "regressed",
+                }:
                     continue
                 counts[finding.severity.value] += 1
             return counts

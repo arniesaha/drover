@@ -31,9 +31,22 @@ final class InboxAttentionStore {
             if requestGeneration == generation { isLoading = false }
         }
         do {
-            let page = try await client.insights(filters: InsightFilters(state: .open, limit: 100))
+            var filters = InsightFilters(state: .open, limit: 100, historical: false)
+            var findings: [InsightSummary] = []
+            var seenCursors = Set<String>()
+            repeat {
+                try Task.checkCancellation()
+                let page = try await client.insights(filters: filters)
+                guard requestGeneration == generation else { return }
+                findings.append(contentsOf: page.findings)
+                guard let cursor = page.nextCursor else { break }
+                guard seenCursors.insert(cursor).inserted else {
+                    throw DroverError.conflict("Insight pagination did not advance")
+                }
+                filters.cursor = cursor
+            } while true
             guard requestGeneration == generation else { return }
-            insights = InboxAttentionPresentation.openPriorityInsights(page.findings)
+            insights = InboxAttentionPresentation.openPriorityInsights(findings)
         } catch is CancellationError {
             return
         } catch {

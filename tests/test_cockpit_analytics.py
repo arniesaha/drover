@@ -2332,3 +2332,37 @@ def test_analytics_metric_filter_re_ranks_dimensions_and_projects():
 
     with pytest.raises(ValueError, match="metric must be 'tokens' or 'sessions'"):
         AnalyticsFilters(days=7, metric="invalid")
+
+
+def test_retired_evidence_is_preserved_but_excluded_from_current_counts():
+    from drover.server.advisory.retired_rules import is_retired_rule
+
+    retired = SimpleNamespace(
+        analyzer_id="deterministic.telemetry_coverage",
+        rule_id="telemetry.flow_coverage",
+        state=SimpleNamespace(value="open"),
+        severity=SimpleNamespace(value="high"),
+    )
+    current = SimpleNamespace(
+        analyzer_id="deterministic.connector_freshness",
+        rule_id="connector.freshness",
+        state=SimpleNamespace(value="regressed"),
+        severity=SimpleNamespace(value="high"),
+    )
+    findings = [retired, current]
+    service = CockpitService(
+        duckdb_path=None,
+        provider_usage=None,
+        advisory_repository=SimpleNamespace(list_findings=lambda: findings),
+    )
+    assert service._insight_counts() == {
+        "critical": 0,
+        "high": 1,
+        "medium": 0,
+        "low": 0,
+    }
+    assert is_retired_rule(retired)
+    assert not is_retired_rule(current)
+    assert findings == [retired, current]
+    assert retired.state.value == "open"
+    assert retired.severity.value == "high"

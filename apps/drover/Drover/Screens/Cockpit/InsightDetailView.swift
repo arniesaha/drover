@@ -144,17 +144,30 @@ struct InsightDetailView: View {
         }
     }
 
+    @ViewBuilder
     private func remediationSection(_ finding: InsightFinding) -> some View {
-        detailSection("Recommended steps") {
-            VStack(alignment: .leading, spacing: 9) {
-                ForEach(Array(finding.remediation.enumerated()), id: \.offset) { index, step in
-                    HStack(alignment: .top, spacing: 9) {
-                        Text("\(index + 1)")
-                            .droverText(.marker)
-                            .frame(minWidth: 28, minHeight: 28)
-                            .background(DroverColor.bg, in: Circle())
-                        Text(step).droverText(.body).fixedSize(horizontal: false, vertical: true)
-                    }
+        if finding.historical {
+            detailSection("Historical recommendations") {
+                DisclosureGroup("Obsolete context — not current action") {
+                    Text("These steps belonged to a retired rule. They are preserved as evidence, not a request to repair current telemetry.")
+                        .droverText(.nested)
+                    remediationSteps(finding)
+                }
+            }
+        } else {
+            detailSection("Recommended steps") { remediationSteps(finding) }
+        }
+    }
+
+    private func remediationSteps(_ finding: InsightFinding) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(finding.remediation.enumerated()), id: \.offset) { index, step in
+                HStack(alignment: .top, spacing: 9) {
+                    Text("\(index + 1)")
+                        .droverText(.marker)
+                        .frame(minWidth: 28, minHeight: 28)
+                        .background(DroverColor.bg, in: Circle())
+                    Text(step).droverText(.body).fixedSize(horizontal: false, vertical: true)
                 }
             }
         }

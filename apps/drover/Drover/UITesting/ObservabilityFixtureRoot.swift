@@ -77,7 +77,10 @@ struct ObservabilityFixtureRoot: View {
         // `MainTabView` owns the live app's session lifecycle. This isolated
         // fixture root deliberately bypasses it, so it must retain its own
         // polling owner or Home never receives the scenario snapshot.
-        .task { sessionStore.startPolling() }
+        .task {
+            sessionStore.startPolling()
+            await store.refresh()
+        }
     }
 }
 
@@ -238,7 +241,7 @@ enum ObservabilityFixtureData {
 
     static var overview: Data {
         var value = try! JSONSerialization.jsonObject(with: analytics) as! [String: Any]
-        value["insight_counts"] = ["critical": 0, "high": 1, "medium": 0, "low": 0]
+        value["insight_counts"] = ["critical": 0, "high": ProcessInfo.processInfo.environment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] == "1" ? 0 : 1, "medium": 0, "low": 0]
         return encode(value)
     }
 
@@ -356,8 +359,17 @@ enum ObservabilityFixtureData {
     }
 
     static var insights: Data {
-        let finding = try! JSONSerialization.jsonObject(with: FixtureScenarioData.insightSummaryData())
-        return encode(["findings": [finding], "next_cursor": NSNull()])
+        let finding = try! JSONSerialization.jsonObject(with: FixtureScenarioData.insightSummaryData()) as! [String: Any]
+        var findings = [finding]
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] == "1" {
+            for index in 2...3 {
+                var extra = finding
+                extra["finding_id"] = "fixture-historical-\(index)"
+                extra["title"] = "Retired telemetry evidence \(index)"
+                findings.append(extra)
+            }
+        }
+        return encode(["findings": findings, "next_cursor": NSNull()])
     }
 
     static var history: Data {
