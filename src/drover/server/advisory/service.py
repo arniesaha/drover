@@ -1552,6 +1552,7 @@ def _summary_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
         "state": row[9],
         "first_seen_at": _wire_datetime(row[10]),
         "last_seen_at": _wire_datetime(row[11]),
+        "historical": _retired_rule_ids(row[1], row[2]),
     }
 
 
@@ -1581,9 +1582,13 @@ def _serialize_finding(finding: Finding) -> dict[str, Any]:
 
 def _is_retired_rule(finding: Finding) -> bool:
     """Rules no current analyzer emits; open evidence remains historical."""
+    return _retired_rule_ids(finding.analyzer_id, finding.rule_id)
+
+
+def _retired_rule_ids(analyzer_id: str, rule_id: str) -> bool:
     return (
-        finding.analyzer_id == "deterministic.telemetry_coverage"
-        and finding.rule_id == "telemetry.flow_coverage"
+        analyzer_id == "deterministic.telemetry_coverage"
+        and rule_id == "telemetry.flow_coverage"
     )
 
 

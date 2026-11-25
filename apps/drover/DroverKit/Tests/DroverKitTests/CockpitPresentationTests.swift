@@ -1376,3 +1376,28 @@ private let fourAnthropicWindows = """
     #expect(group.headline.windowTitle == "5-hour")
     #expect(group.headline.usedText == "20% used")
 }
+
+
+@Test func historicalInsightMetadataPreservesStoredFactsAndExplainsRetirement() throws {
+    let wire = Data(#"""
+    {"finding_id":"retired-1","analyzer_id":"deterministic.telemetry_coverage",
+     "rule_id":"telemetry.flow_coverage","target_type":"telemetry_source","target_id":"studio/shell",
+     "analyzer_class":"deterministic","severity":"high","confidence":"confirmed",
+     "title":"Coverage incomplete","impact":"Old observation","remediation":[],
+     "state":"open","historical":true,"first_seen_at":"2026-08-08T18:00:00Z",
+     "last_seen_at":"2026-08-08T18:01:00Z"}
+    """#.utf8)
+    let summary = try JSONDecoder().decode(InsightSummary.self, from: wire)
+    let finding = try JSONDecoder().decode(InsightFinding.self, from: wire)
+    #expect(summary.historical && finding.historical)
+    #expect(summary.state == .open && finding.state == .open)
+    #expect(summary.severity == .high && finding.severity == .high)
+    let list = InsightPresentation(insight: summary)
+    let detail = InsightPresentation(insight: finding)
+    #expect(list.historicalText == detail.historicalText)
+    #expect(list.historicalText?.contains("Not a current health assessment") == true)
+    #expect(list.severityText == "Recorded severity: High")
+    let legacy = try decodeInsightSummary(analyzerClass: "deterministic", confidence: "confirmed")
+    #expect(!legacy.historical)
+    #expect(InsightPresentation(insight: legacy).historicalText == nil)
+}

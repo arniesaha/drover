@@ -3976,6 +3976,11 @@ def test_retired_flow_coverage_detail_is_historical_without_probing_store(db_pat
 
     assert detail["finding"]["state"] == "open"
     assert detail["finding"]["historical"] is True
+    page = InsightsService(db_path).list_insights(InsightFilters(state="open"))
+    summary = next(item for item in page["findings"] if item["finding_id"] == finding.finding_id)
+    assert summary["historical"] is True
+    assert summary["state"] == "open"
+    assert summary["severity"] == "high"
     assert detail["actions"]["check_again"] == {
         "available": False,
         "reason": "Check Again is unavailable because this is historical evidence from a retired rule.",

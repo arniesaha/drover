@@ -626,6 +626,7 @@ public struct InsightSummary: Decodable, Sendable, Equatable {
     public let confidence: InsightConfidence
     public let title: String
     public let state: InsightState
+    public let historical: Bool
     public let firstSeenAt: Date
     public let lastSeenAt: Date
 
@@ -637,6 +638,7 @@ public struct InsightSummary: Decodable, Sendable, Equatable {
         case targetID = "target_id"
         case analyzerClass = "analyzer_class"
         case severity, confidence, title, state
+        case historical
         case firstSeenAt = "first_seen_at"
         case lastSeenAt = "last_seen_at"
     }
@@ -653,6 +655,7 @@ public struct InsightSummary: Decodable, Sendable, Equatable {
         confidence = try container.decode(InsightConfidence.self, forKey: .confidence)
         title = try container.decodeRequiredIdentity(forKey: .title)
         state = try container.decode(InsightState.self, forKey: .state)
+        historical = try container.decodeIfPresent(Bool.self, forKey: .historical) ?? false
         firstSeenAt = try container.decodeRequiredWireDate(forKey: .firstSeenAt)
         lastSeenAt = try container.decodeRequiredWireDate(forKey: .lastSeenAt)
     }
@@ -672,6 +675,7 @@ public struct InsightFinding: Decodable, Sendable, Equatable {
     public let remediation: [String]
     public let state: InsightState
     public let dismissalReason: String?
+    public let historical: Bool
     public let firstSeenAt: Date
     public let lastSeenAt: Date
     public let resolvedAt: Date?
@@ -687,6 +691,7 @@ public struct InsightFinding: Decodable, Sendable, Equatable {
         case analyzerClass = "analyzer_class"
         case severity, confidence, title, impact, remediation, state
         case dismissalReason = "dismissal_reason"
+        case historical
         case firstSeenAt = "first_seen_at"
         case lastSeenAt = "last_seen_at"
         case resolvedAt = "resolved_at"
@@ -709,6 +714,7 @@ public struct InsightFinding: Decodable, Sendable, Equatable {
         remediation = try container.decodeIfPresent([String].self, forKey: .remediation) ?? []
         state = try container.decode(InsightState.self, forKey: .state)
         dismissalReason = try? container.decode(String.self, forKey: .dismissalReason)
+        historical = try container.decodeIfPresent(Bool.self, forKey: .historical) ?? false
         firstSeenAt = try container.decodeRequiredWireDate(forKey: .firstSeenAt)
         lastSeenAt = try container.decodeRequiredWireDate(forKey: .lastSeenAt)
         resolvedAt = try container.decodeOptionalWireDate(forKey: .resolvedAt)
