@@ -31,6 +31,6 @@ struct InsightsSummaryRow: View {
         guard let counts else { return "Counts temporarily unavailable" }
         let severe = counts.critical + counts.high
         let total = severe + counts.medium + counts.low
-        return severe > 0 ? "\(severe) high priority · \(total) open" : "\(total) open"
+        return "\(total) stored open · \(severe) high/critical severity (may include historical findings)"
     }
 }

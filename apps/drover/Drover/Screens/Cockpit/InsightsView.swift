@@ -147,6 +147,8 @@ struct InsightsView: View {
                      ? "Current filters · more findings available"
                      : "Current filters")
                     .droverText(.subtitle)
+                Text("Severity and state describe stored findings, including historical evidence from retired rules.")
+                    .droverText(.subtitle)
             }
         }
         .accessibilityIdentifier("insights-severity-overview")
@@ -217,8 +219,15 @@ struct InsightFeedCard: View {
         CockpitCard {
             VStack(alignment: .leading, spacing: 7) {
                 FlowLayout(spacing: 7, lineSpacing: 4) {
-                    InsightSeverityBadge(severity: insight.severity)
+                    if insight.historical {
+                        Text(value.severityText).droverText(.subtitle)
+                    } else {
+                        InsightSeverityBadge(severity: insight.severity)
+                    }
                     Text((state ?? insight.state).rawValue.capitalized).droverText(.subtitle)
+                }
+                if let historical = value.historicalText {
+                    Text(historical).droverText(.nested)
                 }
                 HStack(alignment: .top, spacing: 8) {
                     Text(insight.title)
@@ -243,7 +252,7 @@ struct InsightFeedCard: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel([
-            value.severityText, value.confidenceText, value.sourceText, insight.title,
+            value.historicalText, value.severityText, value.confidenceText, value.sourceText, insight.title,
             insight.targetType.replacingOccurrences(of: "_", with: " "), insight.targetID,
             (state ?? insight.state).rawValue, value.uncertaintyText,
         ].compactMap { $0 }.joined(separator: ", "))

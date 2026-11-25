@@ -58,11 +58,18 @@ struct InsightDetailView: View {
         return CockpitCard {
             VStack(alignment: .leading, spacing: 8) {
                 FlowLayout(spacing: 7, lineSpacing: 4) {
-                    InsightSeverityBadge(severity: finding.severity)
+                    if finding.historical {
+                        Text(value.severityText).droverText(.subtitle)
+                    } else {
+                        InsightSeverityBadge(severity: finding.severity)
+                    }
                     Text(statusText)
                         .droverText(.subtitle)
                     Text(value.sourceText).droverText(.subtitle)
                     Text(value.confidenceText).droverText(.subtitle)
+                }
+                if let historical = value.historicalText {
+                    Text(historical).droverText(.nested)
                 }
                 Text(finding.title).droverText(.h1).fixedSize(horizontal: false, vertical: true)
                 Text("\(finding.targetType.replacingOccurrences(of: "_", with: " ")) · \(finding.targetID)")
@@ -85,7 +92,7 @@ struct InsightDetailView: View {
             title: finding.title,
             targetID: finding.targetID,
             evidenceSummary: evidenceSummary,
-            uncertainty: value.uncertaintyText
+            uncertainty: [value.historicalText, value.uncertaintyText].compactMap { $0 }.joined(separator: " ")
         ))
     }
 

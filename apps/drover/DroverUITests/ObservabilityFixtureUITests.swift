@@ -373,7 +373,7 @@ final class ObservabilityFixtureUITests: XCTestCase {
         let caption = app.staticTexts["home-empty-state-caption"]
         XCTAssertTrue(artwork.waitForExistence(timeout: 8))
         XCTAssertTrue(caption.exists)
-        XCTAssertEqual(caption.label, "Nothing running")
+        XCTAssertEqual(caption.label, "Nothing running.")
         XCTAssertFalse(app.staticTexts["Running now"].exists)
 
         // Keep the verification image in the result bundle; the worker exports
@@ -415,7 +415,8 @@ final class ObservabilityFixtureUITests: XCTestCase {
         initialTab: String? = nil,
         awaitingSessionID: String? = nil,
         liveUpdateSessionID: String? = nil,
-        delayedAnalytics: Bool = false
+        delayedAnalytics: Bool = false,
+        emptyHome: Bool = false
     ) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -433,6 +434,9 @@ final class ObservabilityFixtureUITests: XCTestCase {
         }
         if delayedAnalytics {
             app.launchEnvironment["DROVER_UI_TEST_DELAYED_ANALYTICS"] = "1"
+        }
+        if emptyHome {
+            app.launchEnvironment["DROVER_UI_TEST_EMPTY_HOME"] = "1"
         }
         if large {
             app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
@@ -488,6 +492,41 @@ final class ObservabilityFixtureUITests: XCTestCase {
         XCTAssertTrue(newSessionButton.isHittable)
 
         screenshot("real-app-home-dock-light", app)
+    }
+
+    @MainActor
+    func testRealAppRootEmptyHomeCompositionAcrossSizes() {
+        // A prior journey may exercise rotation. Home is portrait-only, so
+        // restore the device before measuring its actual root layout.
+        XCUIDevice.shared.orientation = .portrait
+        let app = launchRealApp(emptyHome: true)
+        let artwork = app.images["home-empty-state-artwork"]
+        let caption = app.staticTexts["home-empty-state-caption"]
+        let dock = app.buttons["launch-button"]
+        XCTAssertTrue(artwork.waitForExistence(timeout: 8))
+        XCTAssertEqual(caption.label, "Nothing running.")
+        XCTAssertTrue(dock.isHittable)
+        XCTAssertLessThan(caption.frame.maxY, dock.frame.minY)
+        addSafeFixtureCapture("real-app-empty-home-tall", app)
+        app.terminate()
+
+        let largeApp = launchRealApp(large: true, emptyHome: true)
+        let largeArtwork = largeApp.images["home-empty-state-artwork"]
+        let largeCaption = largeApp.staticTexts["home-empty-state-caption"]
+        XCTAssertTrue(largeArtwork.waitForExistence(timeout: 8))
+        XCTAssertEqual(largeCaption.label, "Nothing running.")
+        let largeDock = largeApp.buttons["launch-button"]
+        XCTAssertTrue(largeDock.isHittable)
+        XCTAssertLessThan(largeCaption.frame.maxY, largeDock.frame.minY)
+        addSafeFixtureCapture("real-app-empty-home-accessibility-xxxl", largeApp)
+
+        // A real attention item remains actionable rather than being replaced
+        // by the decorative idle presentation.
+        largeApp.terminate()
+        let actionableApp = launchRealApp(awaitingSessionID: "fixture-session")
+        XCTAssertTrue(actionableApp.buttons["home-open-inbox"].waitForExistence(timeout: 8))
+        XCTAssertFalse(actionableApp.images["home-empty-state-artwork"].exists)
+        addSafeFixtureCapture("real-app-home-actionable-not-empty", actionableApp)
     }
 
     @MainActor

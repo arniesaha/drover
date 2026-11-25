@@ -749,6 +749,7 @@ public struct ProjectActivityPresentation: Sendable, Equatable {
 }
 
 public struct InsightPresentation: Sendable, Equatable {
+    public let historicalText: String?
     public let severityText: String
     public let confidenceText: String
     public let sourceText: String
@@ -756,6 +757,7 @@ public struct InsightPresentation: Sendable, Equatable {
 
     public init(insight: InsightSummary) {
         self.init(
+            historical: insight.historical,
             analyzerClass: insight.analyzerClass,
             severity: insight.severity,
             confidence: insight.confidence
@@ -764,6 +766,7 @@ public struct InsightPresentation: Sendable, Equatable {
 
     public init(insight: InsightFinding) {
         self.init(
+            historical: insight.historical,
             analyzerClass: insight.analyzerClass,
             severity: insight.severity,
             confidence: insight.confidence
@@ -771,11 +774,13 @@ public struct InsightPresentation: Sendable, Equatable {
     }
 
     private init(
+        historical: Bool,
         analyzerClass: InsightAnalyzerClass,
         severity: InsightSeverity,
         confidence: InsightConfidence
     ) {
-        severityText = Self.title(severity.rawValue)
+        historicalText = historical ? "Historical evidence · retired rule. Not a current health assessment." : nil
+        severityText = (historical ? "Recorded severity: " : "") + Self.title(severity.rawValue)
         confidenceText = Self.title(confidence.rawValue)
         switch analyzerClass {
         case .deterministic:

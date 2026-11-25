@@ -350,12 +350,21 @@ def page_sql(query: HistoryQuery) -> tuple[str, list[Any]]:
 # --------------------------------------------------------------------------- #
 
 
-def session_state(status: str | None, awaiting: str | None) -> str:
+def session_state(
+    status: str | None,
+    awaiting: str | None,
+    notification_kind: str | None = None,
+) -> str:
     status = status or ""
     if status in _FINISHED:
         return "finished"
     if status in _FAILED:
         return "failed"
+    # Structured adapters explicitly mark a completed turn as resumable input.
+    # That is not an asserted human question: Home and notification projection
+    # already render this wire contract as finished, so History must agree.
+    if awaiting == "input" and notification_kind == "finished":
+        return "finished"
     if status == "awaiting" or awaiting:
         return "awaiting"
     return "running"
@@ -439,7 +448,9 @@ def history_item(row: dict[str, Any]) -> dict[str, Any]:
         },
         "repo": bound_text(repo, 160),
         "branch": bound_text(row.get("branch"), 120),
-        "state": session_state(row.get("status"), row.get("awaiting")),
+        "state": session_state(
+            row.get("status"), row.get("awaiting"), row.get("notification_kind")
+        ),
         "status": row.get("status"),
         "started_at": _wire(row.get("started_at")),
         "ended_at": _wire(row.get("ended_at")),
@@ -472,6 +483,21 @@ def fetch_history_page(
         rows = _rows(con.execute(sql, params))
     more = len(rows) > query.limit
     rows = rows[: query.limit]
+    # Mirror the bounded fleet projection: a running structured session may be
+    # resumable (`awaiting=input`) after an explicitly completed turn. That
+    # completed-turn signal lives in the latest status payload, not in prose.
+    # Enrich only the visible page and only candidates that can use it.
+    awaiting_ids = [
+        row["session_id"]
+        for row in rows
+        if row.get("awaiting") == "input"
+        and row.get("status") not in (*_FINISHED, *_FAILED)
+    ]
+    if awaiting_ids:
+        kinds = HarnessRegistry(control_path).completed_turn_kinds(awaiting_ids)
+        for row in rows:
+            if row["session_id"] in kinds:
+                row["notification_kind"] = kinds[row["session_id"]]
     items = [history_item(row) for row in rows]
     fingerprint = query.fingerprint()
     as_of = _wire(now or datetime.now(timezone.utc))

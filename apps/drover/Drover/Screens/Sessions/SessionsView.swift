@@ -117,9 +117,10 @@ struct SessionsView: View {
                     .accessibilityIdentifier("exporterFreshnessWarning")
             }
 
-            ScrollViewReader { _ in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+            GeometryReader { contentRegion in
+                ScrollViewReader { _ in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
                         if dynamicTypeSize.isAccessibilitySize { statusHeader }
                         // Action errors (e.g. a failed continueSession) land here.
                         // They are distinct from an unreachable hub: connected, but
@@ -161,7 +162,16 @@ struct SessionsView: View {
                                 action: { filterState.clear(); filterState.save(to: defaults) }
                             )
                         case .empty:
-                            HomeEmptyState()
+                            // `contentRegion` starts below Home's fixed fleet
+                            // filters. Keep the empty state within the portion
+                            // that also clears the floating New Session dock;
+                            // it must not be centered against the full screen.
+                            HomeEmptyState(
+                                availableContentHeight: max(
+                                    0,
+                                    contentRegion.size.height - DroverRootPageLayout.dockClearance
+                                )
+                            )
                         case .running:
                             Text("Running now")
                                 .font(DroverTypeScale.section)
@@ -176,71 +186,71 @@ struct SessionsView: View {
                             EmptyView()
                         }
 
+                        }
+                        .padding(.horizontal, DroverRootPageLayout.horizontalInset)
+                        .padding(.top, DroverRootPageLayout.topInset)
+                        .padding(.bottom, DroverRootPageLayout.dockClearance)
                     }
-                    .padding(.horizontal, DroverRootPageLayout.horizontalInset)
-                    .padding(.top, DroverRootPageLayout.topInset)
-                    .padding(.bottom, DroverRootPageLayout.dockClearance)
-                }
-                .accessibilityIdentifier("fleet-list")
-                .refreshable {
-                    await store.refresh()
-                    if let snapshot = store.snapshot {
-                        await cockpitStore.refresh(for: snapshot)
+                    .accessibilityIdentifier("fleet-list")
+                    .refreshable {
+                        await store.refresh()
+                        if let snapshot = store.snapshot {
+                            await cockpitStore.refresh(for: snapshot)
+                        }
+                        syncWidgetSnapshot()
                     }
-                    syncWidgetSnapshot()
-                }
-                .overlay {
-                    if !store.hasLoadedOnce {
-                        if let deadline = store.busyUntil {
-                            Label(RetryPolicy.busyMessage(until: deadline), systemImage: "clock")
-                                .droverText(.subtitle)
-                        } else if let error = store.lastError {
-                            if store.isTailscaleTransportFailure {
-                                ContentUnavailableView {
-                                    Label("Can't reach the hub over Tailscale", systemImage: "network.badge.shield.half.filled")
-                                } description: {
-                                    let host = client.config.tailscaleHost ?? client.config.baseURL.host ?? "Tailscale"
-                                    Text("Your Drover hub is configured at a Tailscale address (\(host)). Check that Tailscale is connected on this device and that the hub is running.")
-                                } actions: {
-                                    Button("Retry") {
-                                        Task { await store.refresh() }
+                    .overlay {
+                        if !store.hasLoadedOnce {
+                            if let deadline = store.busyUntil {
+                                Label(RetryPolicy.busyMessage(until: deadline), systemImage: "clock")
+                                    .droverText(.subtitle)
+                            } else if let error = store.lastError {
+                                if store.isTailscaleTransportFailure {
+                                    ContentUnavailableView {
+                                        Label("Can't reach the hub over Tailscale", systemImage: "network.badge.shield.half.filled")
+                                    } description: {
+                                        let host = client.config.tailscaleHost ?? client.config.baseURL.host ?? "Tailscale"
+                                        Text("Your Drover hub is configured at a Tailscale address (\(host)). Check that Tailscale is connected on this device and that the hub is running.")
+                                    } actions: {
+                                        Button("Retry") {
+                                            Task { await store.refresh() }
+                                        }
+                                        .buttonStyle(.bordered)
                                     }
-                                    .buttonStyle(.bordered)
+                                } else {
+                                    ContentUnavailableView {
+                                        Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
+                                    } description: {
+                                        Text(error)
+                                    } actions: {
+                                        Button("Retry") {
+                                            Task { await store.refresh() }
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
                                 }
                             } else {
-                                ContentUnavailableView {
-                                    Label("Can't reach the Drover server", systemImage: "wifi.exclamationmark")
-                                } description: {
-                                    Text(error)
-                                } actions: {
-                                    Button("Retry") {
-                                        Task { await store.refresh() }
+                                // The spinner alone cannot distinguish a hub that is
+                                // unreachable from a first load repeatedly torn down
+                                // before it lands, which is exactly why a recurring
+                                // stuck "Connecting…" could not be diagnosed from the
+                                // phone (#85). After the second failure it says which.
+                                VStack(spacing: 8) {
+                                    ProgressView("Connecting…")
+                                    if let detail = store.connectingDetail {
+                                        Text(detail)
+                                            .droverText(.subtitle)
+                                            .multilineTextAlignment(.center)
+                                            .accessibilityIdentifier("connecting-detail")
                                     }
-                                    .buttonStyle(.bordered)
-                                }
-                            }
-                        } else {
-                            // The spinner alone cannot distinguish a hub that is
-                            // unreachable from a first load repeatedly torn down
-                            // before it lands, which is exactly why a recurring
-                            // stuck "Connecting…" could not be diagnosed from the
-                            // phone (#85). After the second failure it says which.
-                            VStack(spacing: 8) {
-                                ProgressView("Connecting…")
-                                if let detail = store.connectingDetail {
-                                    Text(detail)
-                                        .droverText(.subtitle)
-                                        .multilineTextAlignment(.center)
-                                        .accessibilityIdentifier("connecting-detail")
                                 }
                             }
                         }
                     }
                 }
-
             }
-
         }
+
         .background(DroverColor.bg)
         // This is deliberately an overlay on Home's navigation source rather
         // than a safe-area inset. During the native interactive pop, UIKit
@@ -777,22 +787,42 @@ struct SessionsView: View {
 }
 
 private struct HomeEmptyState: View {
+    let availableContentHeight: CGFloat
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var artworkMaximumHeight: CGFloat {
+        if dynamicTypeSize.isAccessibilitySize {
+            // The fixed dock grows at Accessibility sizes. Keep the artwork
+            // compact enough that the caption arrives above that control;
+            // the surrounding ScrollView still handles any further growth.
+            return 110
+        }
+        return min(260, max(116, availableContentHeight * 0.56))
+    }
+
     var body: some View {
         VStack(spacing: DroverSpace.x3) {
             Image("DroverHero")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: 220, maxHeight: 155)
+                .frame(maxWidth: 300, maxHeight: artworkMaximumHeight)
                 .accessibilityLabel("Drover dog artwork")
                 .accessibilityIdentifier("home-empty-state-artwork")
 
-            Text("Nothing running")
+            Text("Nothing running.")
                 .droverText(.subtitle)
                 .foregroundStyle(DroverTheme.textSecondary)
                 .accessibilityIdentifier("home-empty-state-caption")
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, DroverSpace.x8)
+        // At accessibility sizes, allow the complete group to take its
+        // intrinsic height and scroll with the fleet header. On a compact or
+        // regular layout this frame centers the group in the true Home content
+        // region, not beneath the floating dock or against the whole screen.
+        .frame(
+            minHeight: dynamicTypeSize.isAccessibilitySize ? nil : availableContentHeight,
+            alignment: .center
+        )
     }
 }
 

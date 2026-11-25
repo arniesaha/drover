@@ -3953,6 +3953,50 @@ def test_provider_insight_detail_advertises_scoped_check_again(db_path: Path) ->
     assert detail["actions"]["check_again"] == {"available": True, "reason": None}
 
 
+def test_retired_flow_coverage_detail_is_historical_without_probing_store(
+    db_path: Path,
+) -> None:
+    repository = AdvisoryRepository(db_path)
+    finding = repository.observe(
+        FindingCandidate(
+            analyzer_id="deterministic.telemetry_coverage",
+            rule_id="telemetry.flow_coverage",
+            target_type="telemetry_source",
+            target_id="mac-mini/shell",
+            analyzer_class=AnalyzerClass.DETERMINISTIC,
+            severity=Severity.HIGH,
+            confidence=Confidence.CONFIRMED,
+            title="Telemetry flow is incomplete",
+            impact="Historical telemetry coverage was incomplete.",
+            remediation=("Review the retained evidence.",),
+            evidence=(
+                FindingEvidence(
+                    source_ref="normalized-telemetry:mac-mini/shell",
+                    observed_at=NOW,
+                    fields={"span_coverage_percent": 0},
+                ),
+            ),
+        ),
+        run_id="historic-run",
+    )
+
+    detail = InsightsService(db_path).get_insight(finding.finding_id)
+
+    assert detail["finding"]["state"] == "open"
+    assert detail["finding"]["historical"] is True
+    page = InsightsService(db_path).list_insights(InsightFilters(state="open"))
+    summary = next(
+        item for item in page["findings"] if item["finding_id"] == finding.finding_id
+    )
+    assert summary["historical"] is True
+    assert summary["state"] == "open"
+    assert summary["severity"] == "high"
+    assert detail["actions"]["check_again"] == {
+        "available": False,
+        "reason": "Check Again is unavailable because this is historical evidence from a retired rule.",
+    }
+
+
 def test_model_check_again_replays_latest_material_version_behind_consent(
     db_path: Path, tmp_path: Path
 ) -> None:
