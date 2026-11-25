@@ -6,6 +6,7 @@ struct InsightsView: View {
     let store: CockpitStore
     var showsConfigurationSummary = false
     var showsNavigationTitle = true
+    @State private var historical = false
     @State private var filtersExpanded = false
     @State private var state: InsightState? = .open
     @State private var severity: InsightSeverity?
@@ -21,6 +22,13 @@ struct InsightsView: View {
                 if showsConfigurationSummary {
                     InsightsSummaryRow(counts: store.insightCounts, onOpenInsights: {})
                 }
+                Picker("Insight collection", selection: $historical) {
+                    Text("Current").tag(false)
+                    Text("Historical").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("insights-collection")
+                .onChange(of: historical) { _, _ in Task { await reload() } }
                 filterStrip
                 if let error = store.insightsError {
                     Label(error, systemImage: error.hasPrefix("Hub busy,") ? "clock" : "exclamationmark.circle")
@@ -34,8 +42,10 @@ struct InsightsView: View {
                         .accessibilityIdentifier("insights-loading")
                 } else if store.insights.isEmpty, store.insightsError == nil {
                     ContentUnavailableView(
-                        "No matching insights", systemImage: "checkmark.circle",
-                        description: Text("Try another filter or check again later.")
+                        historical ? "No historical insights" : "No current insights", systemImage: "checkmark.circle",
+                        description: Text(historical
+                            ? "Historical evidence remains available here when it matches your filters."
+                            : "No actionable findings match these filters. Retired findings are in Historical.")
                     )
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
@@ -147,7 +157,9 @@ struct InsightsView: View {
                      ? "Current filters · more findings available"
                      : "Current filters")
                     .droverText(.subtitle)
-                Text("Severity and state describe stored findings, including historical evidence from retired rules.")
+                Text(historical
+                     ? "Stored severity and state are historical evidence, not current warnings."
+                     : "Current findings only. Retired evidence is available in Historical.")
                     .droverText(.subtitle)
             }
         }
@@ -188,7 +200,7 @@ struct InsightsView: View {
         await store.loadInsights(filters: InsightFilters(
             state: state, severity: severity, confidence: confidence,
             analyzerClass: analyzerClass, host: host, harness: harness,
-            targetType: targetType
+            targetType: targetType, historical: historical
         ))
     }
 

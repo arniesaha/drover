@@ -585,6 +585,8 @@ public enum InsightState: String, Decodable, Sendable, Equatable {
 }
 
 public struct InsightFilters: Sendable, Equatable {
+    /// nil preserves the server collection; true/false select historical/current evidence.
+    public var historical: Bool?
     public var state: InsightState?
     public var severity: InsightSeverity?
     public var confidence: InsightConfidence?
@@ -601,7 +603,8 @@ public struct InsightFilters: Sendable, Equatable {
                 analyzerClass: InsightAnalyzerClass? = nil,
                 host: String? = nil, harness: String? = nil,
                 targetType: String? = nil, targetID: String? = nil,
-                cursor: String? = nil, limit: Int = 50) {
+                cursor: String? = nil, limit: Int = 50, historical: Bool? = nil) {
+        self.historical = historical
         self.state = state
         self.severity = severity
         self.confidence = confidence
@@ -787,6 +790,11 @@ public struct InsightDetail: Decodable, Sendable, Equatable {
 }
 
 public struct InsightPage: Decodable, Sendable, Equatable {
+    public init(findings: [InsightSummary], nextCursor: String?) {
+        self.findings = findings
+        self.nextCursor = nextCursor
+    }
+
     public let findings: [InsightSummary]
     public let nextCursor: String?
 

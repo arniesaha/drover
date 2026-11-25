@@ -273,6 +273,24 @@ public actor DroverClient {
 
     public func insights(filters: InsightFilters = InsightFilters()) async throws
         -> InsightPage {
+        var pageFilters = filters
+        var seenCursors = Set<String>()
+        while true {
+            try Task.checkCancellation()
+            let page = try await insightWirePage(filters: pageFilters)
+            guard let historical = filters.historical else { return page }
+            let findings = page.findings.filter { $0.historical == historical }
+            if !findings.isEmpty || page.nextCursor == nil {
+                return InsightPage(findings: findings, nextCursor: page.nextCursor)
+            }
+            guard let cursor = page.nextCursor, seenCursors.insert(cursor).inserted else {
+                throw DroverError.conflict("Insight pagination did not advance")
+            }
+            pageFilters.cursor = cursor
+        }
+    }
+
+    private func insightWirePage(filters: InsightFilters) async throws -> InsightPage {
         let url = try queryURL(path: "/insights", items: [
             ("state", filters.state?.rawValue),
             ("severity", filters.severity?.rawValue),

@@ -14,7 +14,7 @@ public enum InboxAttentionPresentation {
 
     public static func openPriorityInsights(_ insights: [InsightSummary]) -> [InsightSummary] {
         insights
-            .filter { $0.state == .open && ($0.severity == .critical || $0.severity == .high) }
+            .filter { !$0.historical && $0.state == .open && ($0.severity == .critical || $0.severity == .high) }
             .sorted { $0.lastSeenAt > $1.lastSeenAt }
     }
 

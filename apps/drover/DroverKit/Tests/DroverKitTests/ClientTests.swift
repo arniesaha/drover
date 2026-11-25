@@ -556,6 +556,38 @@ struct ClientTests {
     ))
 }
 
+@Test func currentInsightsScanPastRetiredOnlyPageWithoutChangingWireContract() async throws {
+    mock.handler = { request in
+        let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.queryItems!
+        #expect(!items.contains { $0.name == "historical" })
+        let secondPage = request.url!.query!.contains("cursor=")
+        let finding: [String: Any] = [
+            "finding_id": secondPage ? "current" : "retired",
+            "analyzer_id": "analyzer", "rule_id": "rule", "target_type": "host",
+            "target_id": "gpu", "analyzer_class": "deterministic", "severity": "high",
+            "confidence": "confirmed", "title": "Evidence", "state": "open",
+            "historical": !secondPage,
+            "first_seen_at": "2026-11-25T20:00:00Z", "last_seen_at": "2026-11-25T20:00:00Z"
+        ]
+        return (200, try! JSONSerialization.data(withJSONObject: [
+            "findings": [finding], "next_cursor": secondPage ? NSNull() : "next-page"
+        ]))
+    }
+    let page = try await client().insights(filters: InsightFilters(historical: false))
+    #expect(page.findings.map(\.findingID) == ["current"])
+    #expect(page.nextCursor == nil)
+}
+
+@Test func historicalInsightsRetainOpenStateAndSeverity() async throws {
+    mock.handler = { _ in
+        (200, Data(#"{"findings":[{"finding_id":"retired","analyzer_id":"analyzer","rule_id":"rule","target_type":"host","target_id":"gpu","analyzer_class":"deterministic","severity":"high","confidence":"confirmed","title":"Evidence","state":"open","historical":true,"first_seen_at":"2026-11-25T20:00:00Z","last_seen_at":"2026-11-25T20:00:00Z"}],"next_cursor":null}"#.utf8))
+    }
+    let page = try await client().insights(filters: InsightFilters(historical: true))
+    #expect(page.findings.count == 1)
+    #expect(page.findings[0].state == .open)
+    #expect(page.findings[0].severity == .high)
+}
+
 @Test func insightsCursorAndFiltersAreEncodedExactlyOnce() async throws {
     mock.handler = { request in
         #expect(request.url?.path == "/insights")
