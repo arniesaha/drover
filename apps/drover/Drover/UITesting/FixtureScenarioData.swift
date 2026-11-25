@@ -67,7 +67,7 @@ enum FixtureScenarioData {
     }
 
     private static func insightFinding() -> [String: Any] {
-        [
+        var finding: [String: Any] = [
             "finding_id": insightFindingID,
             "analyzer_id": "fixture-analyzer",
             "rule_id": "fixture-rule",
@@ -90,6 +90,13 @@ enum FixtureScenarioData {
             "dismissed_at": NSNull(),
             "regressed_at": NSNull(),
         ]
+#if DEBUG
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] == "1" {
+            finding["historical"] = true
+            finding["rule_id"] = "telemetry.flow_coverage"
+        }
+#endif
+        return finding
     }
 
     // MARK: Capability envelopes (#420)

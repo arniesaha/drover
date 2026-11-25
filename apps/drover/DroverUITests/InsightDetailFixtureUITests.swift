@@ -37,6 +37,33 @@ final class InsightDetailFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testHistoricalInsightListAndDetailPreserveFactsWithoutCurrentAlarm() {
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "observability"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] = "1"
+        app.launchArguments += ["-drover.appearance", "light"]
+        app.launch()
+        let inbox = app.tabBars.buttons["Inbox"]
+        XCTAssertTrue(inbox.waitForExistence(timeout: 8))
+        inbox.tap()
+        app.segmentedControls["inbox-segments"].buttons["Insights"].tap()
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 8))
+        XCTAssertTrue(row.label.contains("Historical evidence"))
+        XCTAssertTrue(row.label.contains("Not a current health assessment"))
+        XCTAssertTrue(row.label.contains("Recorded severity: High"))
+        XCTAssertTrue(row.label.lowercased().contains("open"))
+        addScreenshot(named: "historical-insight-list-light", app: app)
+        row.tap()
+        let header = app.descendants(matching: .any)["insight-detail-header"].firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 8))
+        XCTAssertTrue(header.label.contains("Historical evidence"))
+        XCTAssertTrue(header.label.contains("Status: Open"))
+        addScreenshot(named: "historical-insight-detail-light", app: app)
+    }
+
+    @MainActor
     private func addScreenshot(named name: String, app: XCUIApplication) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
