@@ -484,6 +484,52 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testBackgroundCompletionAndViewedWorkingTurnDoNotLoseResults() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_UNREAD_RESULT"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_RESULT_LIFECYCLE"] = "first"
+        app.launch()
+        let newResponses = app.staticTexts["home-new-responses"]
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Working response generation first")).firstMatch.waitForExistence(timeout: 8))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCUIDevice.shared.press(.home)
+        let backgroundInterval = expectation(description: "fixture completes offscreen")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 17) { backgroundInterval.fulfill() }
+        wait(for: [backgroundInterval], timeout: 20)
+        app.activate()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+        addSafeFixtureCapture("actual-background-result-unread", app)
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Final response generation first")).firstMatch.waitForExistence(timeout: 8))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        // Same session and persisted receipt, distinct second turn.
+        app.terminate()
+        app.launchEnvironment["DROVER_UI_TEST_RESULT_LIFECYCLE"] = "second"
+        app.launch()
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        XCUIDevice.shared.press(.home)
+        let secondInterval = expectation(description: "second turn completes offscreen")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 17) { secondInterval.fulfill() }
+        wait(for: [secondInterval], timeout: 20)
+        app.activate()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 12))
+        addSafeFixtureCapture("actual-second-turn-resurfaces", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+    }
+
+    @MainActor
     func testRealAppRootTabNavigationAndDeepLink() {
         // 1. Launch against real app root (core-journey scenario)
         let app = launchRealApp()
