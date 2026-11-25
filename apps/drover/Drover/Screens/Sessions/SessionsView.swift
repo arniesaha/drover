@@ -50,6 +50,7 @@ struct SessionsView: View {
     @State private var isOverviewExpanded = false
     @State private var resultReceiptRevision = 0
     @State private var refreshingResultEvidence = false
+    @State private var lastResultEvidenceCandidateID: String?
 
     init(
         client: DroverClient,
@@ -614,9 +615,8 @@ struct SessionsView: View {
         if let sessions = store.snapshot?.sessions { resultReceipts.bootstrap(sessions) }
         resultReceiptRevision += 1
         guard !refreshingResultEvidence, scenePhase == .active else { return }
-        let candidates = (store.snapshot?.sessions ?? []).filter {
-            $0.hostRetiredAt == nil && resultReceipts.needsResponseEvidence($0)
-        }.prefix(4)
+        let candidates = resultReceipts.evidenceCandidates(
+            in: store.snapshot?.sessions ?? [], after: lastResultEvidenceCandidateID)
         guard !candidates.isEmpty else { return }
         refreshingResultEvidence = true
         Task { @MainActor in
@@ -624,6 +624,7 @@ struct SessionsView: View {
             // Four bounded tail reads per refresh; stable revisions persist.
             for session in candidates {
                 guard !Task.isCancelled, scenePhase == .active else { return }
+                lastResultEvidenceCandidateID = session.id
                 do {
                     let page = try await client.messagePage(sessionID: session.id, request: .newest(limit: 100))
                     guard !page.hasNewer, page.decodeIssues.isEmpty else { continue }

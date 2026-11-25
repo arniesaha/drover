@@ -44,6 +44,16 @@ public struct ResultReadReceipts {
         requiresResponseEvidence(session) && evidence[session.id]?["revision"] != revision(session)
     }
 
+    /// Rotate bounded attempts so failed or truncated tails cannot starve
+    /// another host's newly completed response on subsequent refreshes.
+    public func evidenceCandidates(in sessions: [SessionSummary], after sessionID: String?, limit: Int = 4) -> [SessionSummary] {
+        let pending = sessions.filter { $0.hostRetiredAt == nil && needsResponseEvidence($0) }
+            .sorted { $0.id < $1.id }
+        guard limit > 0, !pending.isEmpty else { return [] }
+        let start = sessionID.flatMap { id in pending.firstIndex(where: { $0.id > id }) } ?? 0
+        return Array((pending[start...] + pending[..<start]).prefix(limit))
+    }
+
     private var evidence: [String: [String: String]] {
         defaults.dictionary(forKey: prefix + "evidence") as? [String: [String: String]] ?? [:]
     }

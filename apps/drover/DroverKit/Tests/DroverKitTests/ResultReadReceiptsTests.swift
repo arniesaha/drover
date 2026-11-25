@@ -126,4 +126,22 @@ struct ResultReadReceiptsTests {
         #expect(receipts.unread(in: [old]).count == 1)
     }
 
+    @Test func failedTerminalEvidenceCandidatesCannotStarveOtherHosts() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let receipts = ResultReadReceipts(hub: "studio", defaults: defaults)
+        let pending = (1...6).map { index in
+            var session = result("session-\(index)", host: "host-\(index)")
+            session.status = "terminated"
+            return session
+        }
+        let first = receipts.evidenceCandidates(in: pending.reversed(), after: nil)
+        #expect(first.map(\.id) == ["session-1", "session-2", "session-3", "session-4"])
+        // All first-page attempts fail: no evidence recorded. Next poll still
+        // visits the remaining candidates, rather than repeating the first four.
+        let next = receipts.evidenceCandidates(in: pending, after: first.last?.id)
+        #expect(next.map(\.id) == ["session-5", "session-6", "session-1", "session-2"])
+        #expect(receipts.evidenceCandidates(in: [], after: "missing").isEmpty)
+        #expect(receipts.evidenceCandidates(in: pending, after: nil, limit: 0).isEmpty)
+    }
+
 }
