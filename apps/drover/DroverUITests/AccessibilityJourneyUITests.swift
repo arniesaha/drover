@@ -609,6 +609,40 @@ final class AccessibilityJourneyUITests: XCTestCase {
     }
 
     @MainActor
+    func testIdleBannerReturnsAfterTabAndBackgroundTransitions() {
+        let app = coreJourneyApp()
+        app.launchEnvironment["DROVER_UI_TEST_EMPTY_HOME"] = "1"
+        app.launch()
+        let artwork = app.images["home-empty-state-artwork"]
+        XCTAssertTrue(artwork.waitForExistence(timeout: timeout))
+        XCTAssertEqual(artwork.label, "Drover dog artwork")
+        let before = XCTAttachment(screenshot: app.screenshot())
+        before.name = "Idle banner actual Home before leaving"
+        before.lifetime = .keepAlways
+        add(before)
+
+        let accounts = app.tabBars.buttons["Accounts"]
+        XCTAssertTrue(accounts.waitForExistence(timeout: timeout))
+        accounts.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["screen-header-accounts"].waitForExistence(timeout: timeout))
+        XCTAssertFalse(artwork.isHittable, "Offscreen idle art must not remain an interactive overlay")
+        app.tabBars.buttons["Home"].tap()
+        XCTAssertTrue(artwork.waitForExistence(timeout: timeout))
+        XCTAssertTrue(artwork.isHittable)
+
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        // The core fixture retries one hub-busy response on foreground refresh.
+        XCTAssertTrue(artwork.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.tabBars.buttons["Home"].isSelected)
+        XCTAssertTrue(app.buttons["New Session"].isHittable)
+        let returned = XCTAttachment(screenshot: app.screenshot())
+        returned.name = "Idle banner actual Home returned from tab and background"
+        returned.lifetime = .keepAlways
+        add(returned)
+    }
+
+    @MainActor
     private func coreJourneyApp(assertReduceMotion: Bool = false) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
