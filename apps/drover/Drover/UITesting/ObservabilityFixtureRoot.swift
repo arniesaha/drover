@@ -77,7 +77,10 @@ struct ObservabilityFixtureRoot: View {
         // `MainTabView` owns the live app's session lifecycle. This isolated
         // fixture root deliberately bypasses it, so it must retain its own
         // polling owner or Home never receives the scenario snapshot.
-        .task { sessionStore.startPolling() }
+        .task {
+            sessionStore.startPolling()
+            await store.refresh()
+        }
     }
 }
 

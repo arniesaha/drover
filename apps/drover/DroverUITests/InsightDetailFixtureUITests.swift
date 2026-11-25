@@ -51,6 +51,12 @@ final class InsightDetailFixtureUITests: XCTestCase {
         addScreenshot(named: "historical-insights-no-priority-warning", app: app)
         app.segmentedControls["inbox-segments"].buttons["Insights"].tap()
         XCTAssertTrue(app.staticTexts["No current insights"].waitForExistence(timeout: 8))
+        let summary = app.buttons["insights-summary"]
+        XCTAssertTrue(summary.waitForExistence(timeout: 8))
+        let zeroCounts = NSPredicate(format: "label CONTAINS %@", "0 current open · 0 high/critical severity")
+        expectation(for: zeroCounts, evaluatedWith: summary)
+        waitForExpectations(timeout: 8)
+        XCTAssertFalse(summary.label.contains("temporarily unavailable"))
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Fixture hook needs attention")).firstMatch.exists)
         addScreenshot(named: "historical-insights-current-empty", app: app)
         app.segmentedControls["insights-collection"].buttons["Historical"].tap()
