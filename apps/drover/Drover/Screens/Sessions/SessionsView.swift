@@ -915,18 +915,67 @@ private struct IdleBannerArtwork: View {
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 24.0, paused: !motionEnabled)) { context in
-            let cycle = context.date.timeIntervalSinceReferenceDate / 6.0
-            let breath = motionEnabled ? (1 - cos(cycle * 2 * .pi)) / 2 : 0
+            let time = context.date.timeIntervalSinceReferenceDate
             Image("DroverHero")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
+                .overlay {
+                    if motionEnabled {
+                        IdleTerminalLight(time: time)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
                 .frame(maxWidth: 300, maxHeight: maximumHeight)
-                .scaleEffect(1 + 0.0035 * breath)
                 .accessibilityLabel("Drover dog artwork")
                 .accessibilityIdentifier("home-empty-state-artwork")
         }
         .onScrollVisibilityChange(threshold: 0.01) { isVisible = $0 }
         .onDisappear { isVisible = false }
+    }
+}
+
+/// Light belongs to the three painted terminal screens, not the whole image.
+/// Normalized asset coordinates preserve the original dog and landscape exactly.
+private struct IdleTerminalLight: View {
+    let time: TimeInterval
+
+    var body: some View {
+        Canvas { context, size in
+            let screens: [[CGPoint]] = [
+                [.init(x: 0.538, y: 0.668), .init(x: 0.630, y: 0.658),
+                 .init(x: 0.634, y: 0.721), .init(x: 0.538, y: 0.735)],
+                [.init(x: 0.574, y: 0.794), .init(x: 0.668, y: 0.780),
+                 .init(x: 0.672, y: 0.852), .init(x: 0.577, y: 0.868)],
+                [.init(x: 0.763, y: 0.707), .init(x: 0.856, y: 0.698),
+                 .init(x: 0.859, y: 0.775), .init(x: 0.763, y: 0.789)]
+            ]
+            for (index, corners) in screens.enumerated() {
+                let phase = time / 3.2 + Double(index) / 3
+                let pulse = (1 - cos(phase * 2 * .pi)) / 2
+                let points = corners.map { CGPoint(x: $0.x * size.width, y: $0.y * size.height) }
+                let screen = Path { path in
+                    path.move(to: points[0])
+                    for point in points.dropFirst() { path.addLine(to: point) }
+                    path.closeSubpath()
+                }
+                var light = context
+                light.clip(to: screen)
+                light.blendMode = .screen
+                light.fill(screen, with: .color(.cyan.opacity(0.10 + 0.25 * pulse)))
+                // A soft, downward phosphor sweep makes motion perceptible at
+                // phone size without moving the artwork or flashing the screen.
+                let bounds = screen.boundingRect
+                let progress = phase - floor(phase)
+                let beam = CGRect(x: bounds.minX, y: bounds.minY + progress * bounds.height,
+                                  width: bounds.width, height: size.height * 0.012)
+                light.fill(Path(beam), with: .linearGradient(
+                    Gradient(colors: [.clear, .mint.opacity(0.60), .clear]),
+                    startPoint: CGPoint(x: beam.midX, y: beam.minY),
+                    endPoint: CGPoint(x: beam.midX, y: beam.maxY)
+                ))
+            }
+        }
     }
 }
 

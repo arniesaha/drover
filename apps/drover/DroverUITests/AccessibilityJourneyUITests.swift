@@ -621,6 +621,18 @@ final class AccessibilityJourneyUITests: XCTestCase {
         before.lifetime = .keepAlways
         add(before)
 
+        // Keep actual-root motion phases for independent pixel review. The
+        // static image geometry must remain unchanged while terminal light moves.
+        let artworkFrame = artwork.frame
+        for phase in 0..<3 {
+            Thread.sleep(forTimeInterval: 1.1)
+            XCTAssertEqual(artwork.frame, artworkFrame)
+            let frame = XCTAttachment(screenshot: app.screenshot())
+            frame.name = "Idle terminal light phase \(phase)"
+            frame.lifetime = .keepAlways
+            add(frame)
+        }
+
         let accounts = app.tabBars.buttons["Accounts"]
         XCTAssertTrue(accounts.waitForExistence(timeout: timeout))
         accounts.tap()
