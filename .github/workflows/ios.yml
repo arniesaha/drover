@@ -111,12 +111,66 @@ jobs:
         xcodebuild -project Drover.xcodeproj \
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
+          -parallel-testing-enabled NO \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/InsightDetailFixtureUITests \
           -only-testing:DroverUITests/ObservabilityFixtureUITests \
           -only-testing:DroverUITests/AccessibilityJourneyUITests \
+          -skip-testing:DroverUITests/AccessibilityJourneyUITests/testIdleTerminalIsExactStaticWithSystemReduceMotion \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
+
+    - name: Run exact-static artwork journey with system Reduce Motion
+      if: steps.scope.outputs.ios == 'true'
+      run: |
+        set -euo pipefail
+        simulator_id="${SIMULATOR_DESTINATION#id=}"
+        preference="$HOME/Library/Developer/CoreSimulator/Devices/$simulator_id/data/Library/Preferences/com.apple.Accessibility.plist"
+        backup="$RUNNER_TEMP/ReduceMotion-preference.plist"
+        # XCTest may already have shut down its destination after the suite.
+        # Ignore only the confirmed Shutdown state, never a genuine simctl failure.
+        if ! xcrun simctl shutdown "$simulator_id"; then
+          simulator_state="$(xcrun simctl list devices --json | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["state"] for group in devices.values() for d in group if d["udid"] == sys.argv[1]))' "$simulator_id")"
+          test "$simulator_state" = "Shutdown"
+        fi
+        cp "$preference" "$backup"
+        restore_preference() {
+          xcrun simctl shutdown "$simulator_id" || true
+          cp "$backup" "$preference"
+        }
+        trap restore_preference EXIT
+        # iOS 18.5 stores this as an integer. PlistBuddy Set ... true logs
+        # Unrecognized Integer Format but returns zero and leaves it disabled.
+        python3 - "$preference" <<'PYTHON'
+        import pathlib, plistlib, sys
+        path = pathlib.Path(sys.argv[1])
+        data = plistlib.loads(path.read_bytes())
+        prior = data.get("ReduceMotionEnabled")
+        print(f"ReduceMotionEnabled before: {prior!r} ({type(prior).__name__})")
+        data["ReduceMotionEnabled"] = 1
+        path.write_bytes(plistlib.dumps(data))
+        actual = plistlib.loads(path.read_bytes())["ReduceMotionEnabled"]
+        assert type(actual) is int and actual == 1, "Reduce Motion preference write failed"
+        print("ReduceMotionEnabled verified integer 1; app-observed assertion follows")
+        PYTHON
+        xcrun simctl boot "$simulator_id"
+        xcrun simctl bootstatus "$simulator_id" -b
+        xcodebuild -project Drover.xcodeproj \
+          -scheme DroverUITests \
+          -destination "$SIMULATOR_DESTINATION" \
+          -parallel-testing-enabled NO \
+          -only-testing:DroverUITests/AccessibilityJourneyUITests/testIdleTerminalIsExactStaticWithSystemReduceMotion \
+          -resultBundlePath "$RUNNER_TEMP/DroverReduceMotionUITests.xcresult" \
+          test-without-building
+
+    - name: Upload Reduce Motion test result bundle
+      if: always() && steps.scope.outputs.ios == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: DroverReduceMotionUITests.xcresult
+        path: ${{ runner.temp }}/DroverReduceMotionUITests.xcresult
+        if-no-files-found: ignore
+        retention-days: 3
 
     - name: Upload unit test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'

@@ -621,6 +621,18 @@ final class AccessibilityJourneyUITests: XCTestCase {
         before.lifetime = .keepAlways
         add(before)
 
+        // Keep actual-root motion phases for independent pixel review. The
+        // static image geometry must remain unchanged while terminal light moves.
+        let artworkFrame = artwork.frame
+        for phase in 0..<3 {
+            Thread.sleep(forTimeInterval: 1.1)
+            XCTAssertEqual(artwork.frame, artworkFrame)
+            let frame = XCTAttachment(screenshot: app.screenshot())
+            frame.name = "Idle terminal light phase \(phase)"
+            frame.lifetime = .keepAlways
+            add(frame)
+        }
+
         let accounts = app.tabBars.buttons["Accounts"]
         XCTAssertTrue(accounts.waitForExistence(timeout: timeout))
         accounts.tap()
@@ -640,6 +652,50 @@ final class AccessibilityJourneyUITests: XCTestCase {
         returned.name = "Idle banner actual Home returned from tab and background"
         returned.lifetime = .keepAlways
         add(returned)
+    }
+
+    @MainActor
+    func testIdleTerminalMotionAtDefaultTextSize() {
+        captureIdleTerminalMotion(reduceMotion: false)
+    }
+
+    @MainActor
+    func testIdleTerminalIsExactStaticWithSystemReduceMotion() {
+        captureIdleTerminalMotion(reduceMotion: true)
+    }
+
+    @MainActor
+    private func captureIdleTerminalMotion(reduceMotion: Bool) {
+        let app = coreJourneyApp(assertReduceMotion: true)
+        app.launchArguments = [
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryL",
+        ]
+        app.launchEnvironment["DROVER_UI_TEST_EMPTY_HOME"] = "1"
+        app.launch()
+        let probe = app.staticTexts["fixture-reduce-motion-state"]
+        XCTAssertTrue(probe.waitForExistence(timeout: timeout))
+        XCTAssertEqual(
+            probe.label,
+            reduceMotion ? "Reduce Motion fixture enabled" : "Reduce Motion fixture disabled",
+            "Run on the attributable simulator with the requested system accessibility state."
+        )
+        let artwork = app.images["home-empty-state-artwork"]
+        XCTAssertTrue(artwork.waitForExistence(timeout: timeout))
+        let frame = artwork.frame
+        let first = artwork.screenshot().pngRepresentation
+        let prefix = reduceMotion ? "Reduced static terminal" : "Default size terminal motion"
+        for phase in 0..<3 {
+            Thread.sleep(forTimeInterval: 1.1)
+            XCTAssertEqual(artwork.frame, frame)
+            let current = artwork.screenshot()
+            if reduceMotion {
+                XCTAssertEqual(current.pngRepresentation, first, "Reduce Motion must render exact static artwork.")
+            }
+            let attachment = XCTAttachment(screenshot: app.screenshot())
+            attachment.name = "\(prefix) phase \(phase)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
     }
 
     @MainActor
