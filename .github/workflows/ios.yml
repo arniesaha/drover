@@ -111,12 +111,49 @@ jobs:
         xcodebuild -project Drover.xcodeproj \
           -scheme DroverUITests \
           -destination "$SIMULATOR_DESTINATION" \
+          -parallel-testing-enabled NO \
           -only-testing:DroverUITests/DeterministicJourneyUITests \
           -only-testing:DroverUITests/InsightDetailFixtureUITests \
           -only-testing:DroverUITests/ObservabilityFixtureUITests \
           -only-testing:DroverUITests/AccessibilityJourneyUITests \
+          -skip-testing:DroverUITests/AccessibilityJourneyUITests/testIdleTerminalIsExactStaticWithSystemReduceMotion \
           -resultBundlePath "$RUNNER_TEMP/DroverUITests.xcresult" \
           test
+
+    - name: Run exact-static artwork journey with system Reduce Motion
+      if: steps.scope.outputs.ios == 'true'
+      run: |
+        set -euo pipefail
+        simulator_id="${SIMULATOR_DESTINATION#id=}"
+        preference="$HOME/Library/Developer/CoreSimulator/Devices/$simulator_id/data/Library/Preferences/com.apple.Accessibility.plist"
+        backup="$RUNNER_TEMP/ReduceMotion-preference.plist"
+        xcrun simctl shutdown "$simulator_id"
+        cp "$preference" "$backup"
+        restore_preference() {
+          xcrun simctl shutdown "$simulator_id" || true
+          cp "$backup" "$preference"
+        }
+        trap restore_preference EXIT
+        /usr/libexec/PlistBuddy -c "Set :ReduceMotionEnabled true" "$preference" || \
+          /usr/libexec/PlistBuddy -c "Add :ReduceMotionEnabled bool true" "$preference"
+        xcrun simctl boot "$simulator_id"
+        xcrun simctl bootstatus "$simulator_id" -b
+        xcodebuild -project Drover.xcodeproj \
+          -scheme DroverUITests \
+          -destination "$SIMULATOR_DESTINATION" \
+          -parallel-testing-enabled NO \
+          -only-testing:DroverUITests/AccessibilityJourneyUITests/testIdleTerminalIsExactStaticWithSystemReduceMotion \
+          -resultBundlePath "$RUNNER_TEMP/DroverReduceMotionUITests.xcresult" \
+          test-without-building
+
+    - name: Upload Reduce Motion test result bundle
+      if: always() && steps.scope.outputs.ios == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: DroverReduceMotionUITests.xcresult
+        path: ${{ runner.temp }}/DroverReduceMotionUITests.xcresult
+        if-no-files-found: ignore
+        retention-days: 3
 
     - name: Upload unit test result bundle
       if: failure() && steps.scope.outputs.ios == 'true'
