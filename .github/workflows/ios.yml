@@ -139,8 +139,20 @@ jobs:
           cp "$backup" "$preference"
         }
         trap restore_preference EXIT
-        /usr/libexec/PlistBuddy -c "Set :ReduceMotionEnabled true" "$preference" || \
-          /usr/libexec/PlistBuddy -c "Add :ReduceMotionEnabled bool true" "$preference"
+        # iOS 18.5 stores this as an integer. PlistBuddy Set ... true logs
+        # Unrecognized Integer Format but returns zero and leaves it disabled.
+        python3 - "$preference" <<'PYTHON'
+        import pathlib, plistlib, sys
+        path = pathlib.Path(sys.argv[1])
+        data = plistlib.loads(path.read_bytes())
+        prior = data.get("ReduceMotionEnabled")
+        print(f"ReduceMotionEnabled before: {prior!r} ({type(prior).__name__})")
+        data["ReduceMotionEnabled"] = 1
+        path.write_bytes(plistlib.dumps(data))
+        actual = plistlib.loads(path.read_bytes())["ReduceMotionEnabled"]
+        assert type(actual) is int and actual == 1, "Reduce Motion preference write failed"
+        print("ReduceMotionEnabled verified integer 1; app-observed assertion follows")
+        PYTHON
         xcrun simctl boot "$simulator_id"
         xcrun simctl bootstatus "$simulator_id" -b
         xcodebuild -project Drover.xcodeproj \
