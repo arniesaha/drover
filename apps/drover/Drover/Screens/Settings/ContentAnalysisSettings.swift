@@ -13,18 +13,21 @@ struct ContentAnalysisSettings: View {
     }
 
     var body: some View {
-        Section("Content analysis") {
+        Section("Permission and privacy") {
             // A server without the cockpit API (older harnessd) has no
             // content-analysis endpoint. The inbox hides its cockpit sections
             // outright in that case; Settings says so once, quietly, rather
             // than leaving a bare transport error sitting next to a
             // destructive control that cannot do anything.
             if store.contentAnalysisStatus == nil, store.contentStatusError != nil {
-                Text("Content analysis is unavailable on this server.")
+                Text("Configuration review status is unavailable. Check your connection and try again.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("content-analysis-unavailable")
+                Button("Retry status") {
+                    Task { await store.loadContentAnalysisStatus() }
+                }
             } else {
                 loadedControls
             }
@@ -102,7 +105,7 @@ struct ContentAnalysisSettings: View {
                     .accessibilityIdentifier("content-cloud-disclosure-acceptance")
             }
 
-            if selectionState.displayedMode != .disabled {
+            if selectionState.displayedMode != .disabled, !selectedPermissionIsActive {
                 Button(enableButtonTitle) {
                     Task {
                         _ = await store.enableContentAnalysis(
@@ -163,11 +166,11 @@ struct ContentAnalysisSettings: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         case .local:
-            Label("Recommended · analyzed on the connected server", systemImage: "checkmark.shield")
+            Label("Uses the configured Ollama service. Its location and availability depend on server setup.", systemImage: "server.rack")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         case .cloud:
-            Label("External model provider", systemImage: "network")
+            Label("Requires Anthropic API credentials on the server and explicit consent. Availability is not verified.", systemImage: "network")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -179,12 +182,17 @@ struct ContentAnalysisSettings: View {
             : "Enable \(selectionState.displayedMode.title.lowercased()) analysis"
     }
 
+    private var selectedPermissionIsActive: Bool {
+        guard let status = store.contentAnalysisStatus, status.enabled else { return false }
+        return (selectionState.displayedMode == .local && status.backend == .local)
+            || (selectionState.displayedMode == .cloud && status.backend == .cloud)
+    }
+
     private func statusDescription(_ status: ContentAnalysisStatus) -> String {
         if status.enabled {
-            return "Enabled · \(status.backend.rawValue.capitalized) · "
-                + "\(status.pendingModelJobs) pending model job\(status.pendingModelJobs == 1 ? "" : "s")"
+            return "Permission granted · \(status.backend.rawValue.capitalized). This does not confirm that files are configured or the model is available."
         }
-        return "Disabled · existing findings remain available"
+        return "Permission off · existing findings remain available"
     }
 
     private func operationMessage(_ message: String, isError: Bool) -> some View {

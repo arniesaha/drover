@@ -95,6 +95,16 @@ enum FixtureScenarioData {
             "regressed_at": NSNull(),
         ]
 #if DEBUG
+        if ProcessInfo.processInfo.environment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] == "model" {
+            finding["analyzer_id"] = "model.configuration"
+            finding["analyzer_class"] = "model"
+            finding["confidence"] = "likely"
+            finding["target_type"] = "configuration"
+            finding["target_id"] = "fixture-host/AGENTS.md"
+            finding["title"] = "Fixture instructions may conflict"
+            finding["impact"] = "The synthetic instructions describe different approval boundaries."
+            finding["remediation"] = ["Compare the recorded instructions and clarify the intended boundary."]
+        }
         if ProcessInfo.processInfo.environment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] == "1" {
             finding["historical"] = true
             finding["rule_id"] = "telemetry.flow_coverage"

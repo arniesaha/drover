@@ -134,14 +134,17 @@ final class ObservabilityFixtureUITests: XCTestCase {
     func testLocalContentAnalysisNamesTheConnectedServer() {
         let app = launch()
         tab(app, "settings").tap()
-
-        let local = app.staticTexts["Recommended · analyzed on the connected server"]
+        let advanced = app.buttons["settings-advanced"]
+        for _ in 0..<8 where !advanced.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        XCTAssertTrue(advanced.isHittable)
+        advanced.tap()
+        app.buttons["advanced-configuration-review"].tap()
+        app.segmentedControls["configuration-review-tabs"].buttons["Setup & privacy"].tap()
+        let local = app.staticTexts["Uses the configured Ollama service. Its location and availability depend on server setup."]
+        for _ in 0..<6 where !local.isHittable { app.swipeUp() }
         XCTAssertTrue(local.waitForExistence(timeout: 8))
-        let settings = app.scrollViews.firstMatch
-        for _ in 0..<8 where !local.isHittable { settings.swipeUp() }
-        XCTAssertTrue(local.isHittable)
-        XCTAssertTrue(app.descendants(matching: .any)["content-analysis-propagation-warning"].exists)
-        addSafeFixtureCapture("content-analysis-connected-server", app)
+        XCTAssertFalse(app.buttons["content-analysis-enable"].exists)
+        addSafeFixtureCapture("configuration-review-local-permission-not-readiness", app)
     }
 
     @MainActor

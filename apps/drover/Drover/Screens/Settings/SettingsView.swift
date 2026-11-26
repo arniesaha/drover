@@ -118,7 +118,12 @@ struct SettingsView: View {
 
                     if let client = environment.client {
                         NotificationPreferences(client: client)
-                        ContentAnalysisSettings(client: client)
+                        NavigationLink {
+                            AdvancedSettingsView(client: client)
+                        } label: {
+                            Label("Advanced", systemImage: "slider.horizontal.3")
+                        }
+                        .accessibilityIdentifier("settings-advanced")
                     }
 
                     if let statusMessage {

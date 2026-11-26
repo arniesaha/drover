@@ -24,6 +24,7 @@ struct InsightDetailView: View {
                 if let detail {
                     let state = currentState ?? detail.finding.state
                     findingHeader(detail.finding, state: state, evidence: detail.evidence)
+                    observationSection(detail)
                     impactSection(detail.finding)
                     remediationSection(detail.finding)
                     actionSection(detail, state: state)
@@ -42,7 +43,7 @@ struct InsightDetailView: View {
             .padding(14)
         }
         .background(DroverColor.bg)
-        .navigationTitle("Insight")
+        .navigationTitle(summary.analyzerClass == .model ? "Review finding" : "Insight")
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
         .refreshable { await load() }
@@ -94,6 +95,21 @@ struct InsightDetailView: View {
             evidenceSummary: evidenceSummary,
             uncertainty: [value.historicalText, value.uncertaintyText].compactMap { $0 }.joined(separator: " ")
         ))
+    }
+
+    private func observationSection(_ detail: InsightDetail) -> some View {
+        detailSection("What was observed") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(detail.finding.title).droverText(.body)
+                if detail.finding.analyzerClass == .model {
+                    Text("This is an AI interpretation, not a confirmed fault. Compare it with the recorded evidence before changing configuration.")
+                        .droverText(.nested)
+                }
+                Text("Affected configuration: \(detail.finding.targetID)").droverText(.nested)
+                Text("Last seen: \(detail.finding.lastSeenAt.formatted(date: .abbreviated, time: .shortened))")
+                    .droverText(.subtitle)
+            }
+        }
     }
 
     private func impactSection(_ finding: InsightFinding) -> some View {
@@ -155,7 +171,7 @@ struct InsightDetailView: View {
                 }
             }
         } else {
-            detailSection("Recommended steps") { remediationSteps(finding) }
+            detailSection("What to do next") { remediationSteps(finding) }
         }
     }
 

@@ -311,6 +311,11 @@ final class FixtureHubURLProtocol: URLProtocol, @unchecked Sendable {
         case ("GET", "/insights/content-analysis"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.contentAnalysisStatus)
         case ("GET", "/insights"):
+            if ProcessInfo.processInfo.environment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] == "model" {
+                let finding = try! JSONSerialization.jsonObject(with: FixtureScenarioData.insightSummaryData())
+                let body = try! JSONSerialization.data(withJSONObject: ["findings": [finding], "next_cursor": NSNull()])
+                return FixtureHubResponse(status: 200, body: body)
+            }
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.insights)
         case ("GET", "/sessions/history"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.history)
