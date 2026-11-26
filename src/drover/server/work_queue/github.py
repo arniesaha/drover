@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
+from urllib.parse import quote
 
 import requests
 
@@ -183,11 +185,15 @@ class GitHubProvider:
             if "pull_request" not in r
         ]
 
-    def exact_head_check_state(self, sha, branch):
+    def exact_head_check_state(self, sha, branch, *, facts=False, behavioral_run=None):
         """Return green/failed/pending for this branch's required checks at SHA."""
         self._require("checks_read")
+        if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+            raise ValueError("invalid commit SHA")
         required = self._request(
-            "GET", self.base + f"/branches/{branch}/protection/required_status_checks"
+            "GET",
+            self.base
+            + f"/branches/{quote(branch, safe='')}/protection/required_status_checks",
         )
         contexts = (
             set(required.get("contexts", [])) if isinstance(required, dict) else set()
@@ -201,25 +207,151 @@ class GitHubProvider:
         )
         if not contexts:
             return "pending"
-        data = self._request(
-            "GET", self.base + f"/commits/{sha}/check-runs", params={"filter": "latest"}
+        if facts and (
+            len(contexts) > 100
+            or any(
+                not isinstance(context, str) or not context or len(context) > 255
+                for context in contexts
+            )
+        ):
+            raise ValueError("required check profile exceeds pilot bounds")
+        runs = self._pages(
+            self.base + f"/commits/{sha}/check-runs",
+            params={"filter": "latest"},
+            collection="check_runs",
         )
-        runs = data.get("check_runs") if isinstance(data, dict) else None
         if not isinstance(runs, list) or not runs:
             return "pending"
+        if behavioral_run is not None:
+            latest = [
+                run
+                for run in runs
+                if isinstance(run, dict)
+                and run.get("name") == behavioral_run["name"]
+                and run.get("app", {}).get("id") == behavioral_run["app"]["id"]
+            ]
+            if len(latest) != 1 or any(
+                latest[0].get(key) != behavioral_run.get(key)
+                for key in ("id", "head_sha", "status", "conclusion", "external_id")
+            ):
+                raise ValueError("stale behavioral evidence; latest run required")
         by_name = {run.get("name"): run for run in runs if isinstance(run, dict)}
         conclusions = []
+        resolved = []
         for context in contexts:
             run = by_name.get(context)
             if not isinstance(run, dict) or run.get("status") != "completed":
                 return "pending"
+            if facts:
+                pins = [
+                    c.get("app_id")
+                    for c in required.get("checks", [])
+                    if c.get("context") == context and c.get("app_id") is not None
+                ]
+                matches = [r for r in runs if r.get("name") == context]
+                if (
+                    len(matches) != 1
+                    or run.get("head_sha") != sha
+                    or type(run.get("id")) is not int
+                    or any(run.get("app", {}).get("id") != pin for pin in pins)
+                ):
+                    return "pending"
+                resolved.append(
+                    (
+                        context,
+                        run["id"],
+                        run.get("conclusion"),
+                        run.get("app", {}).get("id"),
+                    )
+                )
             conclusions.append(run.get("conclusion"))
         # Be conservative if an incomplete non-required run is present: this
         # avoids announcing green while the suite itself still runs.
         for run in runs:
             if not isinstance(run, dict) or run.get("status") != "completed":
                 return "pending"
-        return "green" if all(value == "success" for value in conclusions) else "failed"
+        if not all(value == "success" for value in conclusions):
+            return "failed"
+        return sorted(resolved) if facts else "green"
+
+    def acceptance_source(self, ref):
+        """Resolve a configured source, never a report URL/SHA or shell command."""
+        self._ref(ref)
+        profile = self.scope.github_acceptance_profiles[str(ref.number)]
+        item = self.get_item(ref)
+        if item.get("state") != "open":
+            raise ValueError("acceptance requires an open issue")
+        start, end = "<!-- drover:acceptance -->", "<!-- /drover:acceptance -->"
+        body = item.get("body") or ""
+        if body.count(start) != 1 or body.count(end) != 1:
+            raise ValueError("approved acceptance criteria section required")
+        _, section = body.split(start)
+        criteria, _ = section.split(end) if end in section else (None, None)
+        if criteria is None or criteria.strip() != profile.criteria:
+            raise ValueError("acceptance criteria changed without approved amendment")
+        self._require("pulls_read")
+        pull = self._request("GET", self.base + f"/pulls/{profile.pull_number}")
+        sha = pull.get("head", {}).get("sha", "")
+        branch = pull.get("base", {}).get("ref")
+        if (
+            not re.fullmatch(r"[0-9a-f]{40,64}", sha)
+            or not isinstance(branch, str)
+            or not branch
+            or pull.get("base", {}).get("repo", {}).get("full_name") != ref.repo
+        ):
+            raise ValueError("acceptance source mismatch")
+        return {
+            "profile": profile.revision,
+            "head": sha,
+            "branch": branch,
+            "pull": profile.pull_number,
+            "repo": ref.repo,
+        }
+
+    def acceptance_facts(self, ref, evidence_key):
+        source = self.acceptance_source(ref)
+        profile = self.scope.github_acceptance_profiles[str(ref.number)]
+        match = re.fullmatch(
+            r"check-run:([1-9][0-9]{0,18}):review:([1-9][0-9]{0,18})",
+            evidence_key or "",
+        )
+        if not match:
+            raise ValueError("resolvable provider evidence required")
+        check_id, review_id = map(int, match.groups())
+        check = self._request("GET", self.base + f"/check-runs/{check_id}")
+        if (
+            not isinstance(check, dict)
+            or check.get("id") != check_id
+            or check.get("head_sha") != source["head"]
+            or check.get("name") != profile.behavioral_check
+            or check.get("app", {}).get("id") != profile.app_id
+            or check.get("external_id") != profile.revision
+            or check.get("status") != "completed"
+            or check.get("conclusion") != "success"
+        ):
+            raise ValueError("behavioral evidence mismatch or unsuccessful result")
+        review = self._request(
+            "GET", self.base + f"/pulls/{profile.pull_number}/reviews/{review_id}"
+        )
+        if (
+            not isinstance(review, dict)
+            or review.get("id") != review_id
+            or review.get("state") != "APPROVED"
+            or review.get("commit_id") != source["head"]
+            or review.get("user", {}).get("id") != profile.owner_id
+            or review.get("user", {}).get("type") != "User"
+            or "drover-acceptance:" + profile.revision
+            not in (review.get("body") or "").split()
+        ):
+            raise ValueError("independent owner behavioral review required")
+        checks = self.exact_head_check_state(
+            source["head"], source["branch"], facts=True, behavioral_run=check
+        )
+        if not isinstance(checks, list) or not checks:
+            raise ValueError("required checks must succeed at current head")
+        if self.acceptance_source(ref) != source:
+            raise ValueError("acceptance source changed during evidence resolution")
+        return {**source, "required_checks": checks, "evidence": evidence_key}
 
     def get_item(self, ref):
         self._require("issues_read")

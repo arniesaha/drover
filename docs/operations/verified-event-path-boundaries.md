@@ -5,6 +5,11 @@ work coordinator, hub-native continuity owner, and external agent integrations,
 reflecting the accepted implementation delivered through #924, #979, and
 subsequent accepted commits (`fddcc986`).
 
+The opt-in [GitHub acceptance pilot](github-acceptance-pilot.md) adds a
+provider-resolved coordinator gate for explicitly configured issues. It does
+not extend the local-file native chain or upgrade historical acceptance proof;
+its installed/live acceptance remains a separate owner verification gate.
+
 ## 1. Automatic Work -> Separate Verification -> Owner Acknowledgement Boundaries
 
 The multi-stage progression from automatic worker execution to separate
