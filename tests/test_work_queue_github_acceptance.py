@@ -141,6 +141,10 @@ def ready(service, monkeypatch):
         external_id=profile.revision,
         status="completed",
         conclusion="success",
+        output={
+            "summary": "Journey and negative-control observations recorded.",
+            "text": "The reviewed journey succeeded; the negative control failed.",
+        },
     )
     return client, verify
 
@@ -165,6 +169,8 @@ def test_provider_evidence_and_owner_review_close_once_despite_routine_notes(
     assert proof["head"] == SHA
     assert proof["required_checks"] == [["required", 3, "success", 42]]
     assert proof["evidence"] == "check-run:7:review:8"
+    assert proof["behavioral_result"]["bytes"] > 0
+    assert len(proof["behavioral_result"]["sha256"]) == 64
 
 
 @pytest.mark.parametrize(
@@ -194,6 +200,23 @@ def test_nonexistent_evidence_cannot_close(service, monkeypatch):
     client, verify = ready(service, monkeypatch)
     client.evidence = None
     with pytest.raises(RuntimeError, match="github_http_404"):
+        verdict(service, verify)
+    assert client.closed == 0
+
+
+@pytest.mark.parametrize(
+    "output",
+    [None, {}, {"summary": ""}, {"summary": "recorded", "text": "x" * 65537}],
+)
+def test_missing_or_unbounded_behavioral_result_cannot_close(
+    service, monkeypatch, output
+):
+    client, verify = ready(service, monkeypatch)
+    if output is None:
+        client.evidence.pop("output")
+    else:
+        client.evidence["output"] = output
+    with pytest.raises(ValueError, match="behavioral result"):
         verdict(service, verify)
     assert client.closed == 0
 
@@ -331,6 +354,25 @@ def test_replaced_required_run_at_final_boundary_cannot_close(service, monkeypat
             reads.append(url)
             if len(reads) == 2:
                 response.data["check_runs"][0]["id"] = 4
+        return response
+
+    client.request = request
+    with pytest.raises(ValueError, match="evidence changed"):
+        verdict(service, verify)
+    assert client.closed == 0
+
+
+def test_changed_behavioral_result_at_final_boundary_cannot_close(service, monkeypatch):
+    client, verify = ready(service, monkeypatch)
+    original = client.request
+    reads = []
+
+    def request(method, url, **kwargs):
+        response = original(method, url, **kwargs)
+        if url.endswith("/check-runs/7"):
+            reads.append(url)
+            if len(reads) == 2:
+                response.data["output"]["summary"] = "changed observation"
         return response
 
     client.request = request

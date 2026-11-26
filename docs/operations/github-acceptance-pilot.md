@@ -115,27 +115,50 @@ output.
 
 The behavioral check must have the configured name and App ID, exact current
 head, completed/success status, and `external_id` equal to the profile revision.
-It must still be the latest run for that name/App at that head. The required
+It must still be the latest run for that name/App at that head. Its GitHub-hosted
+`output.summary` must be nonempty; `output.text`, when present, must be text.
+The coordinator hashes the canonical summary/text pair, rejects it above 64 KiB,
+and retains only its byte count and SHA-256 in the decision audit. The required
 branch-protection checks must be present exactly once with their configured App
 IDs, completed/success conclusions, and the same head. Missing, duplicate,
-pending, skipped, failed, wrong-App, and wrong-head runs fail closed. The pilot
-supports up to 100 branch-protection check-run contexts; status-only and
-ruleset-only requirements are outside this increment.
+pending, skipped, failed, wrong-App, wrong-head, missing output, and oversized
+output fail closed. The pilot supports up to 100 branch-protection check-run
+contexts; status-only and ruleset-only requirements are outside this increment.
 
 The configured human owner must submit an `APPROVED` review for that same head
 with the exact whitespace-delimited token `drover-acceptance:<profile-revision>`.
 Source identity is reread during evidence resolution and all provider facts are
 resolved again immediately before the durable close intent. The retained
 `provider_operation_id` is bounded JSON of the resolved source, required-check
-facts, and evidence reference. GitHub has no atomic compare-head-and-close API;
-movement after the final read remains an owner reconciliation gate.
+facts, evidence reference, and behavioral-result byte count/digest. GitHub has
+no atomic compare-head-and-close API; movement after the final read remains an
+owner reconciliation gate.
+
+## Inspecting the retained behavioral result
+
+The evidence key identifies the sole result location: authenticated GitHub
+`GET /repos/<configured-repo>/check-runs/<check-id>`. Before submitting or
+approving a verdict, the independent owner retrieves that fixed route, inspects
+`output.summary` and `output.text`, and confirms that they record the reviewed
+journey and its negative control. The owner then matches the returned run ID,
+head SHA, App ID, and `external_id` to the configured profile revision, and
+matches the review ID to the same head and revision token. After a close intent,
+the recorded result digest and byte count bind the inspected output to that
+decision without copying potentially private output into the control-store
+audit.
+
+An output summary can prove that GitHub retained a bounded result, but it cannot
+interpret whether the observations establish the claim. A producer can still
+write a vague or dishonest summary. The independent owner must judge the
+contents and the producer's isolation; this increment deliberately does not
+turn check text into a general evidence DSL or automate producer trust.
 
 ## What is enforced, what remains manual, and retry handling
 
 | Boundary | Enforced here | Manual owner/producer responsibility |
 | --- | --- | --- |
 | Profile and criteria | exact issue profile, marked criteria match, revision pin, fresh verification | independently review/install profile and amendments; keep candidate access from weakening it |
-| Behavioral result | provider-resolved check identity/status/head/revision and latest-run check | isolate the App/producer, execute the reviewed journey and negative control, retain/inspect actual observations |
+| Behavioral result | provider-resolved check identity/status/head/revision, latest-run check, nonempty bounded GitHub output, and output digest | isolate the App/producer, execute the reviewed journey and negative control, retrieve and judge the retained observations |
 | Owner verdict | configured human ID, approval state, exact head, revision token | decide whether observations establish the substantive claim; dismiss/revise obsolete reviews |
 | Required CI and close | required check IDs/App IDs/current conclusions, final reread, one intent/outcome path | reconcile a GitHub head change after the final read and inspect uncertain provider operations |
 
@@ -150,7 +173,8 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | --- | --- |
 | Caller flags or an evidence label alone cannot close | [`test_forged_flags_and_evidence_label_cannot_close_pilot`](../../tests/test_work_queue_github_acceptance.py) |
 | Current head, criteria/profile revision, terminal sessions, and final reread are required | [`test_stale_verdict_and_unfinished_verifier`](../../tests/test_work_queue_github_acceptance.py), [`test_final_boundary_rechecks_head_movement`](../../tests/test_work_queue_github_acceptance.py) |
-| Behavioral evidence and required CI fail closed | [`test_mismatched_behavioral_evidence_cannot_close`](../../tests/test_work_queue_github_acceptance.py), [`test_required_ci_negative_controls`](../../tests/test_work_queue_github_acceptance.py), [`test_older_success_cannot_replace_latest_behavioral_failure`](../../tests/test_work_queue_github_acceptance.py) |
+| Behavioral evidence and required CI fail closed | [`test_mismatched_behavioral_evidence_cannot_close`](../../tests/test_work_queue_github_acceptance.py), [`test_missing_or_unbounded_behavioral_result_cannot_close`](../../tests/test_work_queue_github_acceptance.py), [`test_required_ci_negative_controls`](../../tests/test_work_queue_github_acceptance.py), [`test_older_success_cannot_replace_latest_behavioral_failure`](../../tests/test_work_queue_github_acceptance.py) |
+| A changed retained result cannot replace the reviewed observation | [`test_changed_behavioral_result_at_final_boundary_cannot_close`](../../tests/test_work_queue_github_acceptance.py) |
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |

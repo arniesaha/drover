@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -23,6 +24,7 @@ from .provider import ItemRef
 API = "https://api.github.com"
 # Independent attention reads run concurrently; GitHub tolerates this few.
 READ_CONCURRENCY = 8
+MAX_BEHAVIORAL_RESULT_BYTES = 64 * 1024
 
 
 class ProviderUnavailable(RuntimeError):
@@ -330,6 +332,7 @@ class GitHubProvider:
             or check.get("conclusion") != "success"
         ):
             raise ValueError("behavioral evidence mismatch or unsuccessful result")
+        result = self.behavioral_result(check)
         review = self._request(
             "GET", self.base + f"/pulls/{profile.pull_number}/reviews/{review_id}"
         )
@@ -351,7 +354,39 @@ class GitHubProvider:
             raise ValueError("required checks must succeed at current head")
         if self.acceptance_source(ref) != source:
             raise ValueError("acceptance source changed during evidence resolution")
-        return {**source, "required_checks": checks, "evidence": evidence_key}
+        return {
+            **source,
+            "required_checks": checks,
+            "evidence": evidence_key,
+            "behavioral_result": result,
+        }
+
+    @staticmethod
+    def behavioral_result(check):
+        """Return a bounded digest of the GitHub-hosted behavioral output."""
+        output = check.get("output")
+        if not isinstance(output, dict):
+            raise ValueError("behavioral result output required")
+        summary = output.get("summary")
+        text = output.get("text", "")
+        if (
+            not isinstance(summary, str)
+            or not summary.strip()
+            or not isinstance(text, str)
+        ):
+            raise ValueError("behavioral result output required")
+        serialized = json.dumps(
+            {"summary": summary, "text": text},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        if len(serialized) > MAX_BEHAVIORAL_RESULT_BYTES:
+            raise ValueError("behavioral result output exceeds size limit")
+        return {
+            "bytes": len(serialized),
+            "sha256": hashlib.sha256(serialized).hexdigest(),
+        }
 
     def get_item(self, ref):
         self._require("issues_read")

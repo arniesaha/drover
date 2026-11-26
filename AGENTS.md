@@ -41,19 +41,35 @@ acknowledged.
 
 Use this only for focused work-queue checks. It provisions a disposable,
 socket-only Postgres cluster owned by this shell. Prerequisites are Python 3.11+
-with `uv`, and PostgreSQL `initdb`/`pg_ctl` on `PATH` (or set
-`DROVER_TEST_PG_BINDIR` to their directory). The test dependencies are resolved
-by `uv` into the scratch root. Choose a new directory under `$HOME/scratch`; do
-not use a production DSN, service, or database.
+available as `python3`, `uv`, and PostgreSQL `initdb`/`pg_ctl` on `PATH` (or set
+`DROVER_TEST_PG_BINDIR` to their directory). `DROVER_TEST_PYTHON` and
+`DROVER_TEST_UV` may name executables outside `PATH`; the recipe also finds the
+standard `$HOME/.local/bin/uv` location. The test dependencies are resolved by
+`uv` into the scratch root. Choose a new directory under `$HOME/scratch`; do not
+use a production DSN, service, or database.
 
 ```sh
 repo_root=$(git rev-parse --show-toplevel)
 scratch_root=$(mktemp -d "${HOME}/scratch/drover-work-queue.XXXXXX")
+printf 'scratch root: %s\n' "$scratch_root"
 export UV_PROJECT_ENVIRONMENT="$scratch_root/venv"
 export UV_CACHE_DIR="$scratch_root/uv-cache"
 export PYTHONDONTWRITEBYTECODE=1
 export TMPDIR="$scratch_root/tmp"
 mkdir -p "$TMPDIR" "$scratch_root/socket"
+
+python_bin=${DROVER_TEST_PYTHON:-$(command -v python3 || true)}
+test -n "$python_bin" && test -x "$python_bin"
+"$python_bin" -c 'import sys; sys.exit("Python 3.11+ required" if sys.version_info < (3, 11) else 0)'
+
+uv_bin=${DROVER_TEST_UV:-}
+if [ -z "$uv_bin" ]; then
+  uv_bin=$(command -v uv 2>/dev/null || true)
+fi
+if [ -z "$uv_bin" ] && [ -x "$HOME/.local/bin/uv" ]; then
+  uv_bin="$HOME/.local/bin/uv"
+fi
+test -n "$uv_bin" && test -x "$uv_bin"
 
 if [ -n "${DROVER_TEST_PG_BINDIR:-}" ]; then
   pg_bin=$DROVER_TEST_PG_BINDIR
@@ -62,7 +78,7 @@ else
 fi
 test -x "$pg_bin/initdb" && test -x "$pg_bin/pg_ctl"
 
-fixture_port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+fixture_port=$("$python_bin" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 LC_ALL=C LANG=C "$pg_bin/initdb" -D "$scratch_root/pg" -A trust -U "$(id -un)" --no-sync -E UTF8
 "$pg_bin/pg_ctl" -D "$scratch_root/pg" -l "$scratch_root/postgres.log" -w start -o "-k $scratch_root/socket -p $fixture_port -c listen_addresses='' -c fsync=off"
 fixture_started=1
@@ -70,7 +86,7 @@ trap 'if [ "${fixture_started:-0}" = 1 ]; then "$pg_bin/pg_ctl" -D "$scratch_roo
 
 cd "$repo_root"
 export DROVER_TEST_POSTGRES_DSN="host=$scratch_root/socket port=$fixture_port dbname=postgres user=$(id -un)"
-uv run --extra dev --extra postgres python -m pytest -p no:cacheprovider -q \
+"$uv_bin" run --extra dev --extra postgres python -m pytest -p no:cacheprovider -q \
   tests/test_work_queue_github_acceptance.py \
   tests/test_work_queue_execution.py \
   tests/test_work_queue_github.py \
@@ -78,7 +94,7 @@ uv run --extra dev --extra postgres python -m pytest -p no:cacheprovider -q \
   tests/test_work_queue_local_candidates.py \
   tests/test_github_work_item_events.py \
   --basetemp="$scratch_root/pytest"
-uv run --extra dev --extra postgres python -m black --check \
+"$uv_bin" run --extra dev --extra postgres python -m black --check \
   src/drover/server/work_queue/config.py \
   src/drover/server/work_queue/github.py \
   src/drover/server/work_queue/service.py \
