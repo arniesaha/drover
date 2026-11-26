@@ -530,6 +530,38 @@ final class ObservabilityFixtureUITests: XCTestCase {
     }
 
     @MainActor
+    func testTerminatedLifecycleIsNotANewResponseButActualResultSurvivesStop() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "core-journey"
+        app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
+        app.launchEnvironment["DROVER_UI_TEST_UNREAD_RESULT"] = "1"
+        app.launchEnvironment["DROVER_UI_TEST_RESULT_LIFECYCLE"] = "terminated"
+        app.launch()
+        let newResponses = app.staticTexts["home-new-responses"]
+        XCTAssertTrue(app.buttons["fixture-session"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        XCTAssertFalse(app.buttons["old-lifecycle-only"].exists)
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 15))
+        XCTAssertFalse(app.staticTexts["Running now"].exists)
+        XCTAssertFalse(app.buttons["old-lifecycle-only"].exists)
+        addSafeFixtureCapture("actual-home-result-survives-termination-no-old-stop", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(newResponses.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.buttons["old-lifecycle-only"].exists)
+        app.buttons["fixture-session"].tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Final response generation terminated")).firstMatch.waitForExistence(timeout: 8))
+        addSafeFixtureCapture("actual-terminated-final-response-visible", app)
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.images["home-empty-state-artwork"].waitForExistence(timeout: 8))
+        XCTAssertFalse(newResponses.exists)
+        addSafeFixtureCapture("actual-home-terminated-result-reviewed", app)
+    }
+
+    @MainActor
     func testRealAppRootTabNavigationAndDeepLink() {
         // 1. Launch against real app root (core-journey scenario)
         let app = launchRealApp()
