@@ -900,9 +900,8 @@ private struct HomeEmptyState: View {
     }
 }
 
-/// A conservative native prototype using the existing, unmodified illustration.
-/// This is only a 0.35% breathing scale, not simulated limb motion or a moving
-/// card. No geometry-specific glow is painted over the flattened artwork.
+/// Keep the original illustration stationary while its painted terminals glow.
+/// Reduce Motion, offscreen and background states render the exact static asset.
 private struct IdleBannerArtwork: View {
     let maximumHeight: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
