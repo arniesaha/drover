@@ -4,11 +4,12 @@ final class ConfigurationReviewUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
     @MainActor
-    private func openReview(model: Bool, historical: Bool = false, large: Bool = false) -> XCUIApplication {
+    private func openReview(model: Bool, historical: Bool = false, large: Bool = false, failure: String? = nil) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["DROVER_UI_TEST_SCENARIO"] = "observability"
         app.launchEnvironment["DROVER_UI_TEST_RUN_ID"] = UUID().uuidString
         if model { app.launchEnvironment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] = "model" }
+        if let failure { app.launchEnvironment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] = failure }
         if historical { app.launchEnvironment["DROVER_UI_TEST_HISTORICAL_INSIGHT"] = "1" }
         app.launchArguments += ["-drover.appearance", large ? "dark" : "light"]
         if large { app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"] }
@@ -67,11 +68,40 @@ final class ConfigurationReviewUITests: XCTestCase {
         let row = app.buttons["insight-0123456789abcdef0123456789abcdef"]
         XCTAssertTrue(row.waitForExistence(timeout: 8))
         XCTAssertTrue(row.label.contains("Historical evidence"))
+        for _ in 0..<10 where !row.isHittable { app.swipeUp() }
+        XCTAssertTrue(row.isHittable)
         capture("configuration-historical-large-dark", app)
         row.tap()
         XCTAssertTrue(app.descendants(matching: .any)["insight-detail-header"].waitForExistence(timeout: 8))
         XCTAssertFalse(app.buttons["insight-check-again"].exists)
         capture("configuration-historical-detail-large-dark", app)
+    }
+
+    @MainActor
+    func testOfflineFindingsKeepSetupAndBackUsable() {
+        let app = openReview(model: false, failure: "offline")
+        let error = app.staticTexts["Could not load review findings. Your retained evidence has not been removed. Check the connection and retry."]
+        XCTAssertTrue(error.waitForExistence(timeout: 8))
+        XCTAssertFalse(app.staticTexts["No AI findings yet"].exists)
+        app.buttons["Retry findings"].tap()
+        XCTAssertTrue(error.waitForExistence(timeout: 8))
+        capture("configuration-offline-light", app)
+        app.segmentedControls["configuration-review-tabs"].buttons["Setup & privacy"].tap()
+        XCTAssertTrue(app.staticTexts["Not reported"].waitForExistence(timeout: 5))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.buttons["advanced-configuration-review"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor
+    func testBusyFindingsKeepNavigationUsable() {
+        let app = openReview(model: false, failure: "busy")
+        XCTAssertTrue(app.staticTexts["The server is busy. Retained findings are unchanged. Try again shortly, or open Setup & privacy."].waitForExistence(timeout: 8))
+        XCTAssertFalse(app.staticTexts["No AI findings yet"].exists)
+        capture("configuration-busy-light", app)
+        app.segmentedControls["configuration-review-tabs"].buttons["Setup & privacy"].tap()
+        XCTAssertTrue(app.staticTexts["Not reported"].waitForExistence(timeout: 5))
+        app.segmentedControls["configuration-review-tabs"].buttons["Findings"].tap()
+        XCTAssertTrue(app.buttons["Retry findings"].waitForExistence(timeout: 8))
     }
 
     @MainActor

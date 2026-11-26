@@ -157,6 +157,9 @@ struct ConfigurationReviewView: View {
             let existing = Set(findings.map(\.findingID))
             findings.append(contentsOf: matches.filter { !existing.contains($0.findingID) })
             cursor = page.nextCursor
+        } catch DroverError.busy {
+            guard requestGeneration == generation else { return }
+            self.error = "The server is busy. Retained findings are unchanged. Try again shortly, or open Setup & privacy."
         } catch is CancellationError {
             return
         } catch {

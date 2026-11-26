@@ -259,6 +259,11 @@ final class FixtureHubURLProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
             return
         }
+        if url.path == "/insights",
+           ProcessInfo.processInfo.environment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] == "offline" {
+            client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+            return
+        }
         let response = route(request, url: url, state: state)
         if url.path == "/analytics", state.delaysAnalytics {
             state.holdAnalytics(id: analyticsID) { [weak self] in
@@ -311,6 +316,9 @@ final class FixtureHubURLProtocol: URLProtocol, @unchecked Sendable {
         case ("GET", "/insights/content-analysis"):
             return FixtureHubResponse(status: 200, body: ObservabilityFixtureData.contentAnalysisStatus)
         case ("GET", "/insights"):
+            if ProcessInfo.processInfo.environment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] == "busy" {
+                return .json(status: 503, ["error": "synthetic busy server"])
+            }
             if ProcessInfo.processInfo.environment["DROVER_UI_TEST_CONFIGURATION_REVIEW"] == "model" {
                 let finding = try! JSONSerialization.jsonObject(with: FixtureScenarioData.insightSummaryData())
                 let body = try! JSONSerialization.data(withJSONObject: ["findings": [finding], "next_cursor": NSNull()])

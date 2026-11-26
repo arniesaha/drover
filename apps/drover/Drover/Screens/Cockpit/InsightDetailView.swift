@@ -41,6 +41,7 @@ struct InsightDetailView: View {
                 }
             }
             .padding(14)
+            .padding(.bottom, DroverRootPageLayout.dockClearance)
         }
         .background(DroverColor.bg)
         .navigationTitle(summary.analyzerClass == .model ? "Review finding" : "Insight")
