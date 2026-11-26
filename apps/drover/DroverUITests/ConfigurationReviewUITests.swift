@@ -52,6 +52,8 @@ final class ConfigurationReviewUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["What was observed"].waitForExistence(timeout: 8))
         XCTAssertTrue(app.staticTexts["Why it matters"].exists)
         capture("configuration-model-detail-light", app)
+        for _ in 0..<4 { app.swipeUp() }
+        capture("configuration-model-detail-bottom-light", app)
         app.navigationBars.buttons.element(boundBy: 0).tap()
         XCTAssertTrue(row.waitForExistence(timeout: 8))
         app.tabBars.buttons["Home"].tap()
@@ -87,7 +89,8 @@ final class ConfigurationReviewUITests: XCTestCase {
         XCTAssertTrue(error.waitForExistence(timeout: 8))
         capture("configuration-offline-light", app)
         app.segmentedControls["configuration-review-tabs"].buttons["Setup & privacy"].tap()
-        XCTAssertTrue(app.staticTexts["Not reported"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Last successful review, Not reported"].waitForExistence(timeout: 5))
+        capture("configuration-error-setup-light", app)
         app.navigationBars.buttons.element(boundBy: 0).tap()
         XCTAssertTrue(app.buttons["advanced-configuration-review"].waitForExistence(timeout: 5))
     }
@@ -99,7 +102,8 @@ final class ConfigurationReviewUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts["No AI findings yet"].exists)
         capture("configuration-busy-light", app)
         app.segmentedControls["configuration-review-tabs"].buttons["Setup & privacy"].tap()
-        XCTAssertTrue(app.staticTexts["Not reported"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Last successful review, Not reported"].waitForExistence(timeout: 5))
+        capture("configuration-error-setup-light", app)
         app.segmentedControls["configuration-review-tabs"].buttons["Findings"].tap()
         XCTAssertTrue(app.buttons["Retry findings"].waitForExistence(timeout: 8))
     }
