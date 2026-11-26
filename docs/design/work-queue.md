@@ -83,7 +83,13 @@ GitHub identities are never inferred or impersonated.
 All defaults live in versioned per-goal config, referenced by the goal brief. Log policy changes as metadata events and sanitized issue comments where appropriate.
 
 - **Authority:** Nix, Jenny, Max and workers may merge, deploy, spend and delegate within agreed goal/quota. Critical or destructive actions require a human decision: production cutovers, data migrations, deleting data and outward-facing posts. Ambiguous classification blocks for a decision. Tool authorization enforces the policy at the action boundary.
-- **Acceptance:** Nix defines and may amend criteria, recording the amendment. A separate review/verify run is sufficient; no mandatory human acceptance or separate verifier credential. Require evidence for the intended behavior, not merely process exit or a health response. The verifier reruns relevant checks against the resulting commit/artifact.
+- **Acceptance:** Outside an opt-in pilot, Nix defines and may amend criteria,
+  recording the amendment. A separate review/verify run is sufficient; no
+  mandatory human acceptance or separate verifier credential. Require evidence
+  for the intended behavior, not merely process exit or a health response. The
+  verifier reruns relevant checks against the resulting commit/artifact. The
+  exact-issue GitHub pilot adds an independently reviewed profile, provider
+  facts, and an owner behavioral verdict; see the [pilot contract](../operations/github-acceptance-pilot.md).
 - **Priority/retries:** default normal priority; urgent incidents first, then goal priority and oldest queued work. Start with one attempt plus two retries. After the third failure, stop and write a short systemic review identifying the repeated assumption/process gap. Nix may authorize a bounded new attempt after that review and a changed approach, within policy/quota. Human rejection returns for revision and does not consume a failure attempt by itself.
 - **Capacity/quota:** maximum five active workers per goal, including verification runs; five across the workspace initially. Reserve 20% of each provider's available goal quota for verification/recovery. A launch needs estimated cost plus reserve; unknown quota pauses new launches. Route to an eligible provider with headroom without relaxing acceptance or authority.
 - **Progress:** flag thirty minutes without substantive progress. An active long tool call gets up to sixty minutes before inspection, extended explicitly for known slow work. Neither stale signal alone kills/restarts a worker. Session liveness is distinct from progress.

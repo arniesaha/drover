@@ -136,6 +136,14 @@ GitHub-backed coordinator workloads:
 | **Implementation Scope** | Hub-native owner continuity loop (`drover:owner/<goal>`) | Webhook ingestion, timeline facts, CI rollups, guarded draft PRs |
 | **Observed Live Evidence** | M1 unattended jobs, M2 restart recovery, M3 committed provenance & overlap | Automatic queue admission and tool/session links proven for #980 and #783; end-to-end owner completion **unproven** |
 
+For an exact configured GitHub issue, the pilot's separate verifier binds to
+the current PR head and reviewed profile revision, then the coordinator
+resolves required CI, behavioral check, and owner-review facts before it can
+close the issue. It is a close gate only: it creates no local-file deferred
+verifier/owner sequence and does not establish merge, deployment, publication,
+or acknowledgement. The portable API/configuration and remaining owner gates
+are in the [GitHub pilot contract](github-acceptance-pilot.md).
+
 ### Live Verification Evidence and Limitations on Real GitHub Runs
 
 Observation of real GitHub workloads (#980 and #783) demonstrates the following
