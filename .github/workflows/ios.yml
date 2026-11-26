@@ -127,7 +127,12 @@ jobs:
         simulator_id="${SIMULATOR_DESTINATION#id=}"
         preference="$HOME/Library/Developer/CoreSimulator/Devices/$simulator_id/data/Library/Preferences/com.apple.Accessibility.plist"
         backup="$RUNNER_TEMP/ReduceMotion-preference.plist"
-        xcrun simctl shutdown "$simulator_id"
+        # XCTest may already have shut down its destination after the suite.
+        # Ignore only the confirmed Shutdown state, never a genuine simctl failure.
+        if ! xcrun simctl shutdown "$simulator_id"; then
+          simulator_state="$(xcrun simctl list devices --json | python3 -c 'import json,sys; devices=json.load(sys.stdin)["devices"]; print(next(d["state"] for group in devices.values() for d in group if d["udid"] == sys.argv[1]))' "$simulator_id")"
+          test "$simulator_state" = "Shutdown"
+        fi
         cp "$preference" "$backup"
         restore_preference() {
           xcrun simctl shutdown "$simulator_id" || true
