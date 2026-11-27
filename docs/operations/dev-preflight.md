@@ -129,5 +129,7 @@ sh scripts/quality/preflight.sh --out ~/scratch/<run> --expect-base <base-sha> \
 
 For PG-backed focused tests, add `--profile focused-tests-pg --pg-dsn-env
 DROVER_TEST_POSTGRES_DSN --pg-expect-role <role> --pg-forbid-endpoint <prod-port>`.
-Wiring it into CI is optional and should be a separate one-line step before the
-pytest step in `.github/workflows/`.
+The focused preflight suite runs in the existing CI pytest tier. The PG-backed
+cold-start recipe in root `AGENTS.md` invokes this helper before its test command.
+This environment increment is not the architectural/type/schema portion of
+Slice B; those structural checks remain a separate delivery gate.

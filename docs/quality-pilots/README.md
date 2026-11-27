@@ -2,10 +2,12 @@
 
 **Status: preparation only. No pilot has been executed and none has passed.**
 
-This branch is based on `7133442d`. Lane A is merged as `b36305f6`; its
-contract was read from that object and the Lane A facts below come from it.
-Lane B (preflight CLI) and the integrated runtime were not available, so their
-slots stay `UNBOUND` and are filled only at the [binding gate](#binding-gate).
+Preparation originated at `7133442d` and is integrated with Lane A
+(`b36305f6`) and the reviewed Lane B preflight increment. The canonical
+cold-start recipe is in root `AGENTS.md`; the preflight contract is in
+[`dev-preflight.md`](../operations/dev-preflight.md). Runtime profile and
+execution slots stay `UNBOUND` until the [binding gate](#binding-gate).
+Source integration and baseline pins are not executed pilot outcomes.
 
 Case definitions:
 [`tests/fixtures/quality-pilots/scenarios.json`](../../tests/fixtures/quality-pilots/scenarios.json).
@@ -30,8 +32,8 @@ Lane A hardens **only exact opted-in GitHub issues**. `local_file` goals and
 GitHub issues without a profile are deliberately unchanged. P1 therefore has
 two parts with opposite expectations, and they must not be mixed.
 
-Contract of record: `docs/operations/github-acceptance-pilot.md` at `b36305f6`
-(not linked because this branch predates it).
+Contract of record: [GitHub acceptance pilot](../operations/github-acceptance-pilot.md),
+introduced at `b36305f6`.
 
 ### P1a · GitHub gate (the fix)
 

@@ -12,6 +12,8 @@ scoped verification recipe, not a second policy definition.
 | GitHub pilot profile, provider facts, and owner handoff | `docs/operations/github-acceptance-pilot.md` |
 | Work/verify/owner and GitHub/local-file stage boundaries | `docs/operations/verified-event-path-boundaries.md` |
 | Queue product rules and planned/default policy | `docs/design/work-queue.md` |
+| Environment profiles and fail-fast diagnostics | `docs/operations/dev-preflight.md` and `scripts/quality/preflight.sh` |
+| Task-class pilot map (preparation, not acceptance) | `docs/quality-pilots/README.md` |
 | Protecting tests | `tests/test_work_queue_github_acceptance.py`, `tests/test_work_queue_execution.py`, `tests/test_work_queue_github.py`, and `tests/test_work_queue_local_candidates.py` |
 
 ## Ownership, stages, and non-goals
@@ -86,7 +88,16 @@ trap 'if [ "${fixture_started:-0}" = 1 ]; then "$pg_bin/pg_ctl" -D "$scratch_roo
 
 cd "$repo_root"
 export DROVER_TEST_POSTGRES_DSN="host=$scratch_root/socket port=$fixture_port dbname=postgres user=$(id -un)"
-"$uv_bin" run --extra dev --extra postgres python -m pytest -p no:cacheprovider -q \
+"$uv_bin" sync --locked --extra dev --extra postgres --python "$python_bin"
+export PATH="$pg_bin:$PATH"
+sh scripts/quality/preflight.sh --out "$scratch_root" \
+  --python "$UV_PROJECT_ENVIRONMENT/bin/python" --expect-worktree "$repo_root" \
+  --expect-base "$(git rev-parse HEAD)" --require-clean \
+  --profile focused-tests-pg --pg-dsn-env DROVER_TEST_POSTGRES_DSN \
+  --pg-expect-role "$(id -un)" --pg-expect-data-prefix "$scratch_root/pg" \
+  --pg-forbid-endpoint 5432 \
+  --then '{python}' -m pytest -p no:cacheprovider -q \
+  tests/test_quality_preflight.py \
   tests/test_work_queue_github_acceptance.py \
   tests/test_work_queue_execution.py \
   tests/test_work_queue_github.py \
@@ -94,11 +105,14 @@ export DROVER_TEST_POSTGRES_DSN="host=$scratch_root/socket port=$fixture_port db
   tests/test_work_queue_local_candidates.py \
   tests/test_github_work_item_events.py \
   --basetemp="$scratch_root/pytest"
-"$uv_bin" run --extra dev --extra postgres python -m black --check \
+"$uv_bin" run --locked --extra dev --extra postgres python -m black --check \
   src/drover/server/work_queue/config.py \
   src/drover/server/work_queue/github.py \
   src/drover/server/work_queue/service.py \
-  tests/test_work_queue_github_acceptance.py
+  tests/test_work_queue_github_acceptance.py \
+  scripts/quality/preflight.py tests/test_quality_preflight.py \
+  tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+"$uv_bin" run --locked --extra dev --extra postgres python tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
 git diff --check
 ```
 
