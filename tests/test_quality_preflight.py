@@ -161,7 +161,12 @@ def test_bootstrap_classifies_absent_supported_interpreter(tmp_path):
         text=True,
     )
     assert result.returncode == 3
-    assert json.loads(result.stdout)["classification"] == "environment_unavailable"
+    diagnostic = json.loads(result.stdout)
+    assert diagnostic["classification"] == "environment_unavailable"
+    assert diagnostic["check"] == "bootstrap_interpreter"
+    assert "Python >= 3.11" in diagnostic["action"]
+    assert "DROVER_PREFLIGHT_PYTHON" in diagnostic["action"]
+    assert "uv sync --locked --extra dev" in diagnostic["action"]
     assert "no Python >= 3.11" in result.stderr
 
 
