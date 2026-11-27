@@ -1,4 +1,4 @@
-# Native iOS screenshots — 2026-11-26 (UTC)
+# Native iOS screenshots: 2026-11-26 (UTC)
 
 Actual simulator screenshots exported from retained Xcode UI-test attachments.
 All three use **synthetic fixtures**. No images were generated, composited or
