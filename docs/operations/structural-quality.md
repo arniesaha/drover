@@ -74,6 +74,10 @@ analytics precheck. No global quota policy, reserve or deadline is changed.
 The strict guard has no exemptions. Fresh-process regression tests reject
 analytics imports while exercising the real route entrypoint and shared reader;
 existing MCP tests separately cover the public facade and refresh transport.
+A separate fresh-process test uses the real usage service with an inaccessible
+catalog, not an injected service: both cached and refresh reads return no
+accounts and routing denies admission. This proves bounded failed-store behavior,
+not whole-server startup or universal runtime isolation.
 
 ### Negative controls (all must fail for the stated reason)
 

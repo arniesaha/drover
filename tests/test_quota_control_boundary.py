@@ -52,3 +52,51 @@ else:
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_control_quota_real_store_unavailable(tmp_path):
+    """No injected usage service: failed analytical storage denies admission."""
+    source = r"""
+import importlib.abc
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+class NoAnalytics(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'drover.server.mcp.tools' or fullname.startswith((
+            'drover.server.lake', 'drover.server.summarizer',
+            'drover.server.cockpit', 'drover.server.embeddings',
+        )):
+            raise AssertionError('forbidden analytics import: ' + fullname)
+sys.meta_path.insert(0, NoAnalytics())
+from drover.server.providers.quota_read import read_provider_quota
+from drover.server.work_queue.service import route, WorkDenied
+
+# A directory cannot be a DuckDB catalog. The real service must handle this
+# failed open; a hand-written Usage double cannot establish this boundary.
+path = Path(sys.argv[1]) / 'unavailable.duckdb'
+path.mkdir()
+for fresh in (False, True):
+    result = read_provider_quota(duckdb_path=path, fresh=fresh)
+    assert result['accounts'] == [], result
+    assert result['updated_at'] is None, result
+    if fresh:
+        assert result['refresh_errors'] == [dict(host_id='', error_category='unavailable')]
+    policy = SimpleNamespace(quota=SimpleNamespace(reserve_fraction=0.1))
+    try:
+        route(result['accounts'], policy, 5, {('host', 'codex')})
+    except WorkDenied:
+        pass
+    else:
+        raise AssertionError('failed analytical storage admitted work')
+"""
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    result = subprocess.run(
+        [sys.executable, "-c", source, str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
