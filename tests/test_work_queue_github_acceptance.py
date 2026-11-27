@@ -7,20 +7,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_work_queue_execution import (
+from test_work_queue_execution import (  # noqa: F401
     ACTOR,
     complete,
     launch,
     service,
     update,
-)  # noqa: F401
+)
 from test_work_queue_github import Response
 
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
 from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import identity
-from drover.server.harness.registry import HarnessRegistry
 
 SHA = "a" * 40
 CRITERIA = "The selected journey succeeds and its negative control fails."
