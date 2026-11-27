@@ -11,8 +11,10 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -398,6 +400,140 @@ def test_failure_without_action_cannot_be_constructed():
         preflight.Failure(preflight.ENV, "x", "message")
     with pytest.raises(ValueError):
         preflight.Failure(preflight.ENV, "x", "message", "  ")
+
+
+# --- SIGINT interruption through the real preflight.sh process ---------------
+
+# An idempotent, invocation-owned marker: announces start, waits, then writes
+# its one effect only if absent. A clean SIGINT exit mirrors well-behaved tools.
+MARKER_HELPER = """\
+import pathlib, sys, time
+started, effect, delay = sys.argv[1], pathlib.Path(sys.argv[2]), float(sys.argv[3])
+pathlib.Path(started).write_text("started")
+try:
+    time.sleep(delay)
+except KeyboardInterrupt:
+    sys.exit(130)
+if not effect.exists():
+    effect.write_text("effect\\n")
+"""
+
+
+def _wait_for(path: Path, proc: subprocess.Popen, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+def _start(argv: list, tmp_path: Path) -> subprocess.Popen:
+    env = {
+        "PATH": os.pathsep.join([GIT_DIR, str(Path(sys.executable).parent)]),
+        "HOME": str(tmp_path),
+        "LC_ALL": "C",
+    }
+    # Own session => own process group: the SIGINT below reaches only this
+    # invocation and its children, never the test runner or the host.
+    return subprocess.Popen(
+        ["/bin/sh", str(QUALITY / "preflight.sh"), *map(str, argv)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _interrupt(proc: subprocess.Popen) -> tuple[dict, str]:
+    os.killpg(proc.pid, signal.SIGINT)
+    out, err = proc.communicate(timeout=30)
+    return json.loads(out.strip().splitlines()[-1]), err
+
+
+def test_sigint_during_then_is_classified_and_retry_has_one_effect(repo, out, tmp_path):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    helper = tmp_path / "marker_helper.py"
+    helper.write_text(MARKER_HELPER)
+    started, effect = tmp_path / "started", tmp_path / "effect"
+
+    def argv(delay):
+        return [
+            *base_args(repo, out, py),
+            "--then",
+            sys.executable,
+            "-I",
+            helper,
+            started,
+            effect,
+            delay,
+        ]
+
+    proc = _start(argv("60"), tmp_path)
+    _wait_for(started, proc)  # --then is observably running
+    result, err = _interrupt(proc)
+    assert proc.returncode == 130
+    assert (result["classification"], result["check"]) == (
+        "harness_failure",
+        "interrupted",
+    )
+    assert "Traceback" not in err and result["action"] in err
+    receipt = Path(result["receipt"])
+    assert receipt.is_file() and str(receipt) in result["action"]
+    assert json.loads(receipt.read_text())["head"] == _git(repo, "rev-parse", "HEAD")
+    assert result["then"] == {
+        "argv0": Path(sys.executable).name,
+        "returncode": 130,
+        "stopped_by": "exited",
+    }
+    assert not effect.exists()  # no premature effect
+
+    started.unlink()
+    retry = _start(argv("0"), tmp_path)
+    out_text, err_text = retry.communicate(timeout=60)
+    second = json.loads(out_text.strip().splitlines()[-1])
+    assert (retry.returncode, second["classification"]) == (0, "pass"), err_text
+    assert effect.read_text() == "effect\n"  # exactly one effect
+    assert receipt.is_file() and second["receipt"] != str(receipt)
+
+
+def test_sigint_before_receipt_is_classified_and_leaves_nothing(repo, out, tmp_path):
+    started = tmp_path / "probe-started"
+    slow = tmp_path / "slow-python"
+    slow.write_text(f"#!/bin/sh\necho > '{started}'\n/bin/sleep 60\n")
+    slow.chmod(0o755)
+    proc = _start(["--root", repo, "--out", out, "--python", slow], tmp_path)
+    _wait_for(started, proc)  # the interpreter probe is running: pre-receipt
+    result, err = _interrupt(proc)
+    assert proc.returncode == 130
+    assert (result["classification"], result["check"]) == (
+        "harness_failure",
+        "interrupted",
+    )
+    assert "no receipt exists" in result["message"] and "receipt" not in result
+    assert "Traceback" not in err
+    assert list(out.iterdir()) == []  # own write probe removed, no receipt
+
+
+def test_reap_terminates_an_own_child_that_ignores_sigint(monkeypatch, tmp_path):
+    monkeypatch.setattr(preflight, "CHILD_GRACE_SECONDS", 0.5)
+    ready = tmp_path / "ready"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, signal, sys, time\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "time.sleep(60)\n",
+            str(ready),
+        ]
+    )
+    _wait_for(ready, child)
+    child.send_signal(signal.SIGINT)
+    state = preflight._reap(child)
+    assert state["stopped_by"] == "was terminated"
+    assert state["returncode"] == -signal.SIGTERM and child.poll() is not None
 
 
 @pytest.mark.parametrize(

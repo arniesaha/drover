@@ -3,7 +3,8 @@
 Run through ``scripts/quality/preflight.sh`` so an absent interpreter is
 classified too. Contract: docs/operations/dev-preflight.md. Exit codes:
 0 pass, 1 product_test_failure (only from ``--then``), 3 environment_unavailable,
-4 harness_failure. The ``--then`` argv runs only after every check passed.
+4 harness_failure, 130 harness_failure/interrupted (SIGINT). The ``--then`` argv
+runs only after every check passed.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -56,6 +58,8 @@ RECEIPT_KEYS = (
     "pg",
 )
 SYNC_ACTION = "Run `uv sync --locked --extra dev` in this worktree, or pass --python."
+INTERRUPTED_EXIT = 130  # shell convention for SIGINT; classification stays harness
+CHILD_GRACE_SECONDS = 5.0
 _remove = os.unlink  # indirection so tests can induce a cleanup failure
 
 # Executed by the resolved interpreter in isolated mode. Module names come from
@@ -118,6 +122,56 @@ class Failure(Exception):
             message,
             action,
         )
+
+
+class Interrupted(Failure):
+    """SIGINT during this invocation: never pass, never product_test_failure."""
+
+    exit_code = INTERRUPTED_EXIT
+
+    def __init__(self, message: str, action: str, then: dict | None = None):
+        super().__init__(HARNESS, "interrupted", message, action)
+        self.then = then
+
+
+def _interrupted(receipt_path: str | None, then: dict | None = None) -> Interrupted:
+    if receipt_path is None or then is None:
+        return Interrupted(
+            "interrupted (SIGINT) before the receipt was written; checks did not "
+            "complete, --then did not start, and no receipt exists",
+            "Rerun scripts/quality/preflight.sh with the same arguments; nothing "
+            "from this invocation needs reconciling.",
+        )
+    return Interrupted(
+        "interrupted (SIGINT) while --then ran; its effects are unknown. The "
+        f"direct child {then['stopped_by']} with returncode {then['returncode']}",
+        f"The retained receipt {receipt_path} certifies only the environment, "
+        "not the command. Reconcile any partial effects of the --then command, "
+        "then rerun scripts/quality/preflight.sh with the same arguments; it "
+        "writes a new receipt.",
+        then,
+    )
+
+
+def _reap(proc: subprocess.Popen) -> dict:
+    """Stop only the child this invocation started, observed to its exit."""
+    stopped_by = "exited"
+    try:
+        proc.wait(timeout=CHILD_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        stopped_by = "was terminated"
+        proc.terminate()
+        try:
+            proc.wait(timeout=CHILD_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            stopped_by = "was killed"
+            proc.kill()
+            proc.wait()
+    return {
+        "argv0": Path(proc.args[0]).name,
+        "returncode": proc.returncode,
+        "stopped_by": stopped_by,
+    }
 
 
 def _run(argv, *, cwd=None, timeout=30):
@@ -494,7 +548,12 @@ def _mismatch_hint(stale: list[str]) -> str:
     return ""
 
 
-def run_then(argv: list[str], receipt: dict) -> dict:
+def _ignore_sigint() -> None:
+    with contextlib.suppress(ValueError):  # only possible on the main thread
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def run_then(argv: list[str], receipt: dict, receipt_path: str | None = None) -> dict:
     if argv[0] in ("python", "python3"):
         raise Failure(
             HARNESS,
@@ -503,7 +562,20 @@ def run_then(argv: list[str], receipt: dict) -> dict:
             "Pass '{python}' as the --then interpreter so the verified one runs.",
         )
     argv = [receipt["interpreter"] if a == "{python}" else a for a in argv]
-    rc = subprocess.run(argv, cwd=receipt["worktree"], check=False).returncode
+    proc = subprocess.Popen(argv, cwd=receipt["worktree"])
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        _ignore_sigint()  # a second Ctrl-C must not lose the result line
+        raise _interrupted(receipt_path, _reap(proc)) from None
+    if rc < 0:
+        raise Failure(
+            HARNESS,
+            "then",
+            f"command was killed by signal {-rc}",
+            "Find what signalled the --then command, reconcile its partial "
+            "effects, then rerun scripts/quality/preflight.sh.",
+        )
     if rc == 1:
         raise Failure(
             PRODUCT,
@@ -556,6 +628,8 @@ def main(argv=None, *, path: str | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
     path = os.environ.get("PATH", "") if path is None else path
     result: dict = {"profile": args.profile}
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    code = None
     try:
         try:
             with contextlib.ExitStack() as stack:
@@ -577,22 +651,46 @@ def main(argv=None, *, path: str | None = None) -> int:
         target.write_text(json.dumps(receipt, indent=2, sort_keys=True))
         result.update(classification=PASS, receipt=str(target))
         if args.then:
-            result["then"] = run_then(args.then, receipt)
+            result["then"] = run_then(args.then, receipt, str(target))
+    except KeyboardInterrupt:
+        # Before --then: the ExitStack has already removed our own probe.
+        _ignore_sigint()
+        if "receipt" in result:  # receipt written, --then not yet started
+            failure = Interrupted(
+                "interrupted (SIGINT) after the receipt was written and before "
+                "--then started",
+                f"Rerun scripts/quality/preflight.sh; the retained receipt "
+                f"{result['receipt']} certifies only the environment.",
+            )
+        else:
+            failure = _interrupted(None)
+        code = _record(result, failure)
     except Failure as exc:
-        result.update(
-            classification=exc.classification,
-            check=exc.check,
-            message=exc.message,
-            action=exc.action,
-        )
-    print(json.dumps(result, sort_keys=True))
+        code = _record(result, exc)
+    print(json.dumps(result, sort_keys=True), flush=True)
     if result["classification"] != PASS:
         print(
             f"preflight {result['classification']}: [{result['check']}] "
             f"{result['message']} {result['action']}".rstrip(),
             file=sys.stderr,
         )
-    return EXIT[result["classification"]]
+    # Restored only after the result is reported, so a second SIGINT while
+    # reporting cannot replace it with a traceback.
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGINT, previous_sigint)
+    return EXIT[result["classification"]] if code is None else code
+
+
+def _record(result: dict, exc: Failure) -> int | None:
+    result.update(
+        classification=exc.classification,
+        check=exc.check,
+        message=exc.message,
+        action=exc.action,
+    )
+    if getattr(exc, "then", None):
+        result["then"] = exc.then
+    return getattr(exc, "exit_code", None)
 
 
 if __name__ == "__main__":

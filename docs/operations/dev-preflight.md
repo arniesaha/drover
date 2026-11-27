@@ -54,7 +54,34 @@ on stderr only.
 | 0 | `pass` | every check passed; receipt written; `--then` (if any) exited 0 |
 | 1 | `product_test_failure` | checks passed, `--then` exited 1 (pytest: tests failed) |
 | 3 | `environment_unavailable` | a check failed; `--then` did **not** run |
-| 4 | `harness_failure` | own-probe cleanup failed, unexpected I/O, or `--then` exited other than 0/1 |
+| 4 | `harness_failure` | own-probe cleanup failed, unexpected I/O, or `--then` exited other than 0/1 (including killed by a signal) |
+| 130 | `harness_failure` (`check: interrupted`) | the invocation received SIGINT; never reported as `pass` or `product_test_failure` |
+
+### Interruption (SIGINT)
+
+A SIGINT to the invocation's process group, such as Ctrl-C or `kill -INT
+-<pgid>`, still produces the result line, with no traceback, and exits 130:
+
+- **Before the receipt:** the helper removes its own write probe and writes no
+  receipt. The action is a plain rerun.
+- **After the receipt, before `--then` starts:** the receipt is retained, and
+  the action names it.
+- **While `--then` runs:** the receipt is retained, and `then` reports the
+  direct child's final status (`exited`, `was terminated` or `was killed`)
+  and return code.
+  - Reaping covers only the child process this invocation started. The helper
+    waits 5 s for it to exit (it shares the group, so it saw the same SIGINT),
+    then terminates it, waits another 5 s, then kills it.
+  - Descendants of that child are not tracked separately. They received the
+    group's SIGINT, and the helper never kills by name or by process group.
+  - The action says the command's effects are unknown. Reconcile any partial
+    effects, then rerun to write a new receipt. The retained receipt certifies
+    the environment only, never the command.
+
+A second SIGINT while the result is being reported is ignored. The helper makes
+no exactly-once claim for arbitrary `--then` commands. SIGTERM, SIGKILL and
+SIGHUP are not handled: they end the invocation with no result line, so treat a
+missing result line as an interrupted, unverified run.
 
 ## Profiles and what is enforced
 
