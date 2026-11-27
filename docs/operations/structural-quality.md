@@ -14,7 +14,7 @@ coordinator, plus the exact limits of what each one proves.
 From the worktree root, after [preflight](dev-preflight.md):
 
 ```sh
-uv run --locked --extra dev python -I scripts/quality/boundaries.py --ratchet
+uv run --locked --extra dev python -I scripts/quality/boundaries.py
 sh scripts/quality/preflight.sh --out ~/scratch/<run> --expect-base <base-sha> \
   --then '{python}' -m pytest -q --basetemp ~/scratch/<run>/pytest \
   tests/test_quality_boundaries.py
@@ -23,8 +23,8 @@ sh scripts/quality/preflight.sh --out ~/scratch/<run> --expect-base <base-sha> \
 The guard prints one JSON report. It exits 0 on pass, 1 on a violation, and 4
 on a harness failure: a root that matches no module, or a source that doesn't
 parse. `--eager-only` checks the import-time graph alone. Running with no flag
-applies the full policy without exemptions, and today it fails on the known
-violation below. `--closure` prints the reachable set for diagnosis.
+applies the full policy without exemptions. This exact command is enforced
+in CI; the selected boundary has no characterized exclusions. `--closure` prints the reachable set for diagnosis.
 
 ## Boundary 1: work coordinator must not acquire analytics or enrichment
 
@@ -63,26 +63,17 @@ the control outbox itself, not optional enrichment.
   acquires a dependency when its own deferred import runs.
 - The report gives the shortest path, with line numbers and `(lazy)` markers.
 
-### Known violation (characterized, not redesigned)
+### Shared quota projection, separate public transport
 
-The default policy fails on exactly one forbidden target:
-
-```text
-drover.server.work_queue.runtime:454 (lazy) -> drover.server.mcp.tools
-```
-
-`WorkQueueRuntime.quota()` imports `drover_provider_quota` from the MCP tool
-module, and `work_queue.service.route()` imports `_build_routing_hint` from it.
-Importing `drover.server.mcp.tools` then executes `drover.server.summarizer`,
-and `drover.server.cockpit` via `project_activity`, at import time. So queue
-admission in the control process loads analytics and enrichment code.
-
-Fixing it means moving the quota/routing helpers out of `mcp.tools`, which
-touches Slice A runtime sources and is outside this slice. The two exact
-`(importer, imported)` edges are listed in `Boundary.known`. `--ratchet`
-removes only those two edges, and it fails in two cases:
-- any other path to a forbidden module appears;
-- a known edge stops existing, so the entry must be deleted once the code is fixed.
+Queue admission and routing use `providers.quota_read`, not the analytics-heavy
+`mcp.tools` facade. The projection, account masking, freshness/reset semantics,
+relay-aware refresh transport and independent-subscription routing are shared.
+The public MCP wrapper still applies its existing selected-store check, read
+caps and freshness envelope; the internal control path does not acquire that
+analytics precheck. No global quota policy, reserve or deadline is changed.
+The strict guard has no exemptions. Fresh-process regression tests reject
+analytics imports while exercising the real route entrypoint and shared reader;
+existing MCP tests separately cover the public facade and refresh transport.
 
 ### Negative controls (all must fail for the stated reason)
 
@@ -95,7 +86,7 @@ seeded forbidden prefix with a path starting at the seeded root module:
 - a lazy third-party SDK import.
 
 A copy of the real `src/drover` with `import drover.server.lake.serving`
-appended to `work_queue/provider.py` must fail `--ratchet`. A similarly named
+appended to `work_queue/provider.py` must fail the strict command. A similarly named
 module (`drover.server.lakehouse`) and a `TYPE_CHECKING`-only import must pass.
 
 ### Limitations
@@ -178,7 +169,7 @@ Two edits to `.github/workflows/ci.yml`.
    ```yaml
        - name: Architectural boundary ratchet
          if: steps.scope.outputs.python == 'true'
-         run: python -I scripts/quality/boundaries.py --ratchet
+         run: python -I scripts/quality/boundaries.py
    ```
 
    The existing `pytest tests/ -n 2 -m 'not slow_integration'` step already

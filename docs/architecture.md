@@ -186,3 +186,12 @@ by default for upgrades. Drover enforces host-bound credentials for host
 registration, heartbeats, relay attachment, and event ingest; it does not
 provide RBAC, SSO, multi-tenant isolation, or cryptographic machine identity.
 See [Security](security.md).
+
+### Work coordinator quota dependency
+
+The control work coordinator reads quota and computes routing through
+`drover.server.providers.quota_read`. MCP keeps its bounded, selected-store-aware
+public facade; internal queue admission does not import the analytics tool
+module. The strict dependency CI command and response-contract tests are in
+[Structural quality gates](operations/structural-quality.md). Static shared-lazy
+call-graph limits there remain explicit; this is not universal analytics isolation.

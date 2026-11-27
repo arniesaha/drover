@@ -14,6 +14,7 @@ scoped verification recipe, not a second policy definition.
 | Queue product rules and planned/default policy | `docs/design/work-queue.md` |
 | Environment profiles and fail-fast diagnostics | `docs/operations/dev-preflight.md` and `scripts/quality/preflight.sh` |
 | Task-class pilot map (preparation, not acceptance) | `docs/quality-pilots/README.md` |
+| Strict dependency and response contracts | `docs/operations/structural-quality.md`, `python3 -I scripts/quality/boundaries.py`, `tests/test_quality_boundaries.py` |
 | Protecting tests | `tests/test_work_queue_github_acceptance.py`, `tests/test_work_queue_execution.py`, `tests/test_work_queue_github.py`, and `tests/test_work_queue_local_candidates.py` |
 
 ## Ownership, stages, and non-goals
