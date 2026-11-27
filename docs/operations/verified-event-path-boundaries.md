@@ -5,6 +5,11 @@ work coordinator, hub-native continuity owner, and external agent integrations,
 reflecting the accepted implementation delivered through #924, #979, and
 subsequent accepted commits (`fddcc986`).
 
+The opt-in [GitHub acceptance pilot](github-acceptance-pilot.md) adds a
+provider-resolved coordinator gate for explicitly configured issues. It does
+not extend the local-file native chain or upgrade historical acceptance proof;
+its installed/live acceptance remains a separate owner verification gate.
+
 ## 1. Automatic Work -> Separate Verification -> Owner Acknowledgement Boundaries
 
 The multi-stage progression from automatic worker execution to separate
@@ -130,6 +135,14 @@ GitHub-backed coordinator workloads:
 | **Effect Attestation** | Session-relative `local-file:` artifacts verified by `drover-harnessd` | Remote branch commits and PR head SHAs |
 | **Implementation Scope** | Hub-native owner continuity loop (`drover:owner/<goal>`) | Webhook ingestion, timeline facts, CI rollups, guarded draft PRs |
 | **Observed Live Evidence** | M1 unattended jobs, M2 restart recovery, M3 committed provenance & overlap | Automatic queue admission and tool/session links proven for #980 and #783; end-to-end owner completion **unproven** |
+
+For an exact configured GitHub issue, the pilot's separate verifier binds to
+the current PR head and reviewed profile revision, then the coordinator
+resolves required CI, behavioral check, and owner-review facts before it can
+close the issue. It is a close gate only: it creates no local-file deferred
+verifier/owner sequence and does not establish merge, deployment, publication,
+or acknowledgement. The portable API/configuration and remaining owner gates
+are in the [GitHub pilot contract](github-acceptance-pilot.md).
 
 ### Live Verification Evidence and Limitations on Real GitHub Runs
 

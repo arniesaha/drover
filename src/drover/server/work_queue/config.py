@@ -174,6 +174,26 @@ class GitHubCredential(Model):
         return self
 
 
+class GitHubAcceptanceProfile(Model):
+    """Reviewed server-side pilot contract; never sourced from candidate text."""
+
+    pull_number: int = Field(gt=0)
+    criteria: str = Field(min_length=1, max_length=16000)
+    instructions: str = Field(min_length=1, max_length=16000)
+    behavioral_check: str = Field(min_length=1, max_length=100)
+    app_id: int = Field(gt=0)
+    owner_id: int = Field(gt=0)
+    amendment_record: str = Field(min_length=1, max_length=2000)
+
+    @property
+    def revision(self):
+        import hashlib
+
+        return hashlib.sha256(
+            json.dumps(self.model_dump(), sort_keys=True).encode()
+        ).hexdigest()
+
+
 class GoalScope(Model):
     goal_id: str = Field(min_length=1)
     repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -209,6 +229,10 @@ class GoalScope(Model):
     # GitHub is the normal ingress.  ``local_file`` is an explicit isolated
     # canary source and never inherits a remote provider credential.
     candidate_source: Literal["github", "local_file"] = "github"
+    # Exact item opt-in, installed by an independent owner after review.
+    github_acceptance_profiles: dict[str, GitHubAcceptanceProfile] = Field(
+        default_factory=dict
+    )
     local_candidates_path: str | None = None
     # Per-item worktrees are local-file-only and must be declared in the
     # server configuration; manifest content cannot choose an arbitrary path.
@@ -233,6 +257,19 @@ class GoalScope(Model):
 
     @model_validator(mode="after")
     def valid(self):
+        if self.github_acceptance_profiles:
+            if self.candidate_source != "github" or any(
+                not key.isascii()
+                or not key.isdigit()
+                or str(int(key)) != key
+                or int(key) <= 0
+                for key in self.github_acceptance_profiles
+            ):
+                raise ValueError("GitHub acceptance profiles require exact issue keys")
+            if not {"issues_read", "pulls_read", "checks_read"}.issubset(
+                self.credential.capabilities
+            ):
+                raise ValueError("GitHub acceptance profiles require provider reads")
         if any(part in {".", ".."} for part in self.repo.split("/")):
             raise ValueError("repository traversal is forbidden")
         if bool(self.goal_label) == bool(self.milestone):

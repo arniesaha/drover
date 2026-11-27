@@ -520,7 +520,9 @@ class WorkService:
                 None,
             )
             if not parent or request_key != identity(
-                parent["run_key"], "verify", item.get("body")
+                parent["run_key"],
+                "verify",
+                self._verification_criteria(provider, ref, item),
             ):
                 raise ValueError(
                     "verification must reference work and current criteria"
@@ -678,8 +680,27 @@ class WorkService:
         )
         return parent is not None and self._signed_committed_provenance(parent) is True
 
+    def _verification_criteria(self, provider, ref, item):
+        scope = next(
+            g for g in self.config.goals if self.providers[g.goal_id] is provider
+        )
+        if str(ref.number) in scope.github_acceptance_profiles:
+            if provider.scope.github_acceptance_profiles.get(str(ref.number)) != (
+                scope.github_acceptance_profiles[str(ref.number)]
+            ):
+                raise PermissionError("acceptance provider profile is stale")
+            return provider.acceptance_source(ref)
+        return item.get("body")
+
     def _verification_request(self, goal_id, number, row, item):
-        request = identity(row["run_key"], "verify", item.get("body"))
+        scope = next(g for g in self.config.goals if g.goal_id == goal_id)
+        request = identity(
+            row["run_key"],
+            "verify",
+            self._verification_criteria(
+                self.providers[goal_id], self.ref(scope, number), item
+            ),
+        )
         return request, identity(
             self.config.workspace_id, goal_id, number, request, "verify"
         )
@@ -952,6 +973,7 @@ class WorkService:
             )
         if action not in {"verified", "failed", "progress"}:
             raise ValueError("unsupported update action")
+        operation_id = evidence_key if action == "verified" else None
         if action == "verified":
             if row["run_role"] != "verify" or not row["session_id"]:
                 raise ValueError("separate verification session required")
@@ -964,7 +986,8 @@ class WorkService:
                 raise PermissionError(
                     "unsupported acceptance policy; inspection required"
                 )
-            if (
+            pilot = str(number) in scope.github_acceptance_profiles
+            if not pilot and (
                 behavioral_passed is not True
                 or checks_rerun is not True
                 or not evidence_key
@@ -973,6 +996,7 @@ class WorkService:
                     "successful behavioral evidence and rerun checks required"
                 )
             code(evidence_key)
+            criteria = self._verification_criteria(provider, ref, item)
             # Criteria changes invalidate this verification's stable identity.
             expected = identity(
                 self.config.workspace_id,
@@ -983,7 +1007,7 @@ class WorkService:
                         links=self.store.links(goal_id=goal_id, number=number), row=row
                     ),
                     "verify",
-                    item.get("body"),
+                    criteria,
                 ),
                 "verify",
             )
@@ -1008,13 +1032,36 @@ class WorkService:
                 return {"outcome": "deferred"}
             if session is None or session.status != "completed":
                 raise ValueError("verification session must complete before acceptance")
+            if pilot:
+                parent = self.harness.resolve(
+                    self._work_parent(
+                        links=self.store.links(goal_id=goal_id, number=number), row=row
+                    )
+                )
+                if parent is None or parent.status != "completed":
+                    raise ValueError("work session must complete before acceptance")
+                facts = provider.acceptance_facts(ref, evidence_key)
+                if any(facts.get(k) != v for k, v in criteria.items()):
+                    raise ValueError(
+                        "acceptance source changed; new verification required"
+                    )
+                # Repeat trusted reads at the final boundary, before the durable
+                # intent. A rejected stale verdict is safe to retry; an uncertain
+                # close after intent retains the existing no-second-effect rule.
+                if provider.acceptance_facts(ref, evidence_key) != facts:
+                    raise ValueError(
+                        "acceptance evidence changed; new verification required"
+                    )
+                # Bounded provider facts, not caller success flags, remain in
+                # the existing append-only decision audit alongside evidence ID.
+                operation_id = json.dumps(facts, sort_keys=True)
         self.store.event(
             actor.principal,
             ref,
             key,
             "intent",
             action,
-            operation_id=evidence_key if action == "verified" else None,
+            operation_id=operation_id,
             link_id=row["id"],
         )
         if action == "verified":
@@ -1041,7 +1088,7 @@ class WorkService:
             "outcome",
             action,
             outcome=action,
-            operation_id=evidence_key if action == "verified" else None,
+            operation_id=operation_id,
             link_id=row["id"],
         )
         return {"outcome": action}

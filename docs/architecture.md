@@ -25,6 +25,13 @@ The command plane carries live fleet operations:
 The central server does not execute remote commands itself. The host daemon is
 the authority for processes and filesystem access on its machine.
 
+The work coordinator is a separate control-plane boundary: it holds durable
+work intents and provider references, while GitHub remains authoritative for
+issues, PR heads, checks, and reviews. Its opt-in GitHub acceptance pilot closes
+only a configured issue after provider-resolved facts and an independent owner
+verdict; it is not a merge, deployment, or host-process authority. See the
+[work-queue guidance](../AGENTS.md) and [pilot contract](operations/github-acceptance-pilot.md).
+
 Drive-capable harnesses resolve through a registered adapter contract. Hosts
 and the central hub publish a bounded, versioned capability envelope (schema v1,
 #418) in `/capabilities`, `/harness` and `/harness/hosts`; web and iOS controls
@@ -122,6 +129,7 @@ explicitly renewed after a change.
 | --- | --- | --- |
 | iOS, web, and CLI clients | Operator devices | Presentation and authenticated requests |
 | `drover-server` API role | Central machine | Fleet API, pairing, relay, push, PostgreSQL control readiness |
+| Work coordinator | Control API process | Serialized work intents, bounded provider reads, and configured issue-close decisions; no remote process, merge, or deployment ownership |
 | `drover-server` analytics role | Central machine | Ingest, lake exporter lifecycle, analytical routes, MCP, optional OTLP |
 | `drover-server` all role | Central machine | Combined API and analytics startup |
 | `drover-harnessd` | Every harness host | Agent processes, adapters, PTY, terminal stream, local DuckDB spool |

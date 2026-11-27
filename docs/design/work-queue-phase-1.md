@@ -23,6 +23,14 @@ token_env = "DROVER_WORK_QUEUE_GITHUB_TOKEN"
 capabilities = ["issues_read", "pulls_read", "checks_read", "actions_read"]
 ```
 
+The optional GitHub acceptance pilot is a **non-shadow**, exact-issue opt-in.
+Its profile is reviewed server configuration, not an issue-body field. It needs
+`issues_read`, `pulls_read`, and `checks_read` in addition to the existing
+write capability used to close an accepted issue. See the canonical
+[pilot contract](../operations/github-acceptance-pilot.md) for the profile
+shape, provider facts, and owner gates. Do not configure a pilot profile while
+using this phase's read-only shadow-mode example.
+
 Credentials follow the existing runtime environment-reference pattern. Config holds the reference, never the secret. Use a repository-scoped token, or set `mode = "app"`, `installation_id` and `repository_id` with an externally refreshed GitHub App installation token in the referenced variable. Installation repository membership is checked before reading the scope. Managed installation provisioning and token minting are outside this phase. Each goal has its own credential reference and repository boundary. Item refs from another workspace or repository are rejected. Token actors are resolved from GitHub authentication; App actors use the configured installation credential identity after the repository check. Request bodies cannot choose an actor or workspace.
 
 The strict `GoalPolicy` schema in `src/drover/server/work_queue/config.py` covers authority, acceptance, priority, retries, capacity, quota, progress, window, polling and retention. Its JSON schema is available through `GoalPolicy.model_json_schema()`. All v1 default values live in the packaged `policy-v1.json`. A goal can reference a complete versioned policy file; the worker reloads it each pass. Unknown versions, unsupported fields and invalid thresholds fail validation. Policy changes have no provider or audit side effects in shadow mode; phase 2 owns consequential action auditing.

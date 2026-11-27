@@ -69,13 +69,17 @@ unreachable outcomes remain inspectable and block relaunch. The daemon lookup
 never sends another launch request.
 
 `update(action="complete")` schedules a separate verify run and leaves the issue
-open in review. Acceptance requires that run to finish, affirmative behavioral
-and rerun-check results, an opaque evidence identity, and unchanged acceptance
-criteria. Work runs and failed behavioral checks cannot close issues. A failure
-queues revision until the configured attempt budget is exhausted, then blocks
-and writes the generated systemic-review comment. Further launches remain
-blocked for coordinator inspection. A bounded changed-approach override after
-review is outside this implementation; there is no automatic fourth attempt.
+open in review. For the default path, acceptance requires that run to finish,
+affirmative behavioral and rerun-check results, an opaque evidence identity,
+and unchanged acceptance criteria. An exact-issue GitHub pilot profile replaces
+caller assertions with provider-resolved PR/head, check-run/output, and
+owner-review facts; its request/response, unavailable, amendment, and
+idempotency behavior are specified in the [pilot contract](../operations/github-acceptance-pilot.md).
+Work runs and failed behavioral checks cannot close issues. A failure queues
+revision until the configured attempt budget is exhausted, then blocks and
+writes the generated systemic-review comment. Further launches remain blocked
+for coordinator inspection. A bounded changed-approach override after review
+is outside this implementation; there is no automatic fourth attempt.
 
 Provider update/decision intents precede consequential external actions. Outcomes
 append afterward; a timeout keeps the intent uncertain and prevents automatic
