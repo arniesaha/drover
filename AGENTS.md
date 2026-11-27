@@ -57,6 +57,8 @@ printf 'scratch root: %s\n' "$scratch_root"
 export UV_PROJECT_ENVIRONMENT="$scratch_root/venv"
 export UV_CACHE_DIR="$scratch_root/uv-cache"
 export PYTHONDONTWRITEBYTECODE=1
+# Keep the fixture server and initdb in the same valid locale, including env -i.
+export LC_ALL=C LANG=C
 export TMPDIR="$scratch_root/tmp"
 mkdir -p "$TMPDIR" "$scratch_root/socket"
 
