@@ -41,6 +41,16 @@ def identity(*parts):
     return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
 
 
+def verification_identity(workspace_id, goal_id, number, parent_run_key, criteria):
+    """Return ``(request_key, run_key)`` for one separate verification.
+
+    The single derivation shared by launch, deferred completion/verification
+    and acceptance. Callers resolve ``criteria`` themselves; this is pure.
+    """
+    request = identity(parent_run_key, "verify", criteria)
+    return request, identity(workspace_id, goal_id, number, request, "verify")
+
+
 def code(value):
     if not isinstance(value, str) or not re.fullmatch(
         r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}", value
@@ -519,10 +529,16 @@ class WorkService:
                 ),
                 None,
             )
-            if not parent or request_key != identity(
-                parent["run_key"],
-                "verify",
-                self._verification_criteria(provider, ref, item),
+            if (
+                not parent
+                or request_key
+                != verification_identity(
+                    self.config.workspace_id,
+                    goal_id,
+                    number,
+                    parent["run_key"],
+                    self._verification_criteria(provider, ref, item),
+                )[0]
             ):
                 raise ValueError(
                     "verification must reference work and current criteria"
@@ -694,15 +710,12 @@ class WorkService:
 
     def _verification_request(self, goal_id, number, row, item):
         scope = next(g for g in self.config.goals if g.goal_id == goal_id)
-        request = identity(
-            row["run_key"],
-            "verify",
-            self._verification_criteria(
-                self.providers[goal_id], self.ref(scope, number), item
-            ),
+        parent_run_key = row["run_key"]
+        criteria = self._verification_criteria(
+            self.providers[goal_id], self.ref(scope, number), item
         )
-        return request, identity(
-            self.config.workspace_id, goal_id, number, request, "verify"
+        return verification_identity(
+            self.config.workspace_id, goal_id, number, parent_run_key, criteria
         )
 
     def _launch_verification(
@@ -840,12 +853,8 @@ class WorkService:
             terminal_done = getattr(self.harness, "terminal_work_done", None)
             if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
                 return None
-            expected = identity(
-                self.config.workspace_id,
-                goal_id,
-                number,
-                identity(parent, "verify", item.get("body")),
-                "verify",
+            _, expected = verification_identity(
+                self.config.workspace_id, goal_id, number, parent, item.get("body")
             )
             if row["run_key"] != expected:
                 return None
@@ -998,18 +1007,14 @@ class WorkService:
             code(evidence_key)
             criteria = self._verification_criteria(provider, ref, item)
             # Criteria changes invalidate this verification's stable identity.
-            expected = identity(
+            _, expected = verification_identity(
                 self.config.workspace_id,
                 goal_id,
                 number,
-                identity(
-                    self._work_parent(
-                        links=self.store.links(goal_id=goal_id, number=number), row=row
-                    ),
-                    "verify",
-                    criteria,
+                self._work_parent(
+                    links=self.store.links(goal_id=goal_id, number=number), row=row
                 ),
-                "verify",
+                criteria,
             )
             if run_key != expected:
                 raise ValueError(
