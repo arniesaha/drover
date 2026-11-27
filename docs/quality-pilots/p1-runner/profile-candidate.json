@@ -1,0 +1,9 @@
+{
+  "pull_number": 1029,
+  "criteria": "At PR1029 head 5202c2359483a58b2916c58acac5f11ee2df20b8, command-plane quota reading and routing work without importing the analytical MCP facade or optional enrichment. Expired and unknown quota deny admission. A real failed isolated analytical-store open returns unavailable/empty observations and denies routing, never false readiness. The strict boundary passes; owner-held seeded forbidden imports fail for their intended dependency violation. Existing required exact-head checks must pass. No production faults, quota refresh or account-policy changes are permitted.",
+  "instructions": "Use the owner-held run-proof.py, outside the pinned candidate checkout, on an ephemeral GitHub-hosted runner. Checkout exact PR1029 head 5202c2359483a58b2916c58acac5f11ee2df20b8; resolve supported Python 3.11 and uv 0.13.6 with the candidate uv.lock using --locked --extra dev. Run the fixed strict-boundary command and selected fresh-process quota/routing and seeded forbidden-import tests; require zero skips/errors/failures and retain interpreter, source, lock digest, JUnit counts, commands and log hashes. Publish actual proof.json and logs in a bounded GitHub check summary/text at that exact head, name cohort1024-independent-quota-outcome, external_id equal to the complete installed profile revision. Separate credential-free execution from a fresh publication job. Independent human review must inspect output and required checks; an agent must not approve as that human.",
+  "behavioral_check": "cohort1024-independent-quota-outcome",
+  "app_id": 15368,
+  "owner_id": 3646287,
+  "amendment_record": "Initial prepared cohort1024 quota/control isolation contract. NOT APPROVED OR INSTALLED. Proposed owner is ineligible as PR author; a distinct independently authorized human must be selected and this complete model rehashed before installation."
+}
