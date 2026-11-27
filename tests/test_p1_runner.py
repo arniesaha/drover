@@ -5,6 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from drover.server.work_queue.config import GitHubAcceptanceProfile
+
 ROOT = Path(__file__).parents[1]
 RUNNER = ROOT / "docs/quality-pilots/p1-runner"
 
@@ -48,10 +52,28 @@ def publish(tmp_path, payload):
     )
 
 
-def test_publisher_requires_direct_unknown_quota_admission_observation(tmp_path):
-    missing = publish(tmp_path, proof(observation=False))
-    assert missing.returncode != 0
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        lambda payload: payload["commands"].pop(),
+        lambda payload: payload.pop("unknown_quota_admission"),
+        lambda payload: payload["unknown_quota_admission"].update(denied=False),
+        lambda payload: payload["unknown_quota_admission"].update(reason="other"),
+        lambda payload: payload["commands"][3].update(returncode=1),
+    ],
+)
+def test_publisher_rejects_incomplete_unknown_quota_admission_proof(tmp_path, invalid):
+    rejected = proof()
+    invalid(rejected)
+    assert publish(tmp_path, rejected).returncode != 0
 
+
+def test_publisher_uses_the_complete_schema_profile_revision(tmp_path):
     accepted = publish(tmp_path, proof())
     assert accepted.returncode == 0, accepted.stderr
-    assert json.loads(accepted.stdout)["payload"]["head_sha"] == proof()["source"]
+    publication = json.loads(accepted.stdout)
+    profile = GitHubAcceptanceProfile.model_validate(
+        json.loads((RUNNER / "profile-candidate.json").read_text())
+    )
+    assert publication["profile_revision"] == profile.revision
+    assert publication["payload"]["head_sha"] == proof()["source"]
