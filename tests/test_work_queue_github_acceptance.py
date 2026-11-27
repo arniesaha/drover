@@ -217,6 +217,107 @@ def existing_pilot(service, monkeypatch, binding):
     return client
 
 
+def resumable_existing_pilot(service, monkeypatch, pg_control_path):
+    """Install real retained-turn reads below the WorkService boundary."""
+    profile = independent_profile()
+    binding = existing_binding(
+        profile,
+        work_session_id="resumable-work",
+        work_turn_id="retained-work-turn",
+        verifier_session_id="resumable-verify",
+        verifier_turn_id="retained-verify-turn",
+    )
+    client = existing_pilot(service, monkeypatch, binding)
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
+    live = {}
+
+    def settled(session_id, harness, turn_id):
+        registry.create_session(
+            session_id=session_id,
+            host_id="fixture",
+            harness=harness,
+            command=harness,
+            status="running",
+            mode="structured",
+            repo_owner="example",
+            repo_name="project",
+        )
+        registry.append_event(
+            session_id=session_id,
+            event_type="user_input",
+            seq=10,
+            payload={"turn_id": turn_id},
+        )
+        if harness == "codex":
+            terminal = {
+                "turn_id": turn_id,
+                "payload": {"exited": 0},
+            }
+        else:
+            terminal = {
+                "type": "status",
+                "role": "system",
+                "turn_id": None,
+                "payload": {
+                    "turn_complete": True,
+                    "awaiting": "input",
+                    "result": {
+                        "type": "result",
+                        "is_error": False,
+                        "subtype": "success",
+                        "terminal_reason": "completed",
+                        "queued_turn_count": 0,
+                    },
+                },
+            }
+        registry.append_event(
+            session_id=session_id, event_type="status", seq=11, payload=terminal
+        )
+        registry.update_session_activity(session_id, awaiting="input")
+        live[session_id] = {
+            "session_id": session_id,
+            "harness": harness,
+            "status": "running",
+            "mode": "structured",
+            "awaiting": "input",
+            "turn_active": False,
+        }
+
+    settled("resumable-work", "codex", "retained-work-turn")
+    settled("resumable-verify", "claude-code", "retained-verify-turn")
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+    bridge.collector = SimpleNamespace(
+        _harness_request=lambda host, path, **kwargs: (
+            200,
+            json.dumps(live[path.rsplit("/", 1)[-1]]),
+        )
+    )
+    service.harness = bridge
+    return client, binding, registry, live, settled
+
+
+def pilot_evidence(client, profile):
+    client.evidence = dict(
+        id=7,
+        head_sha=SHA,
+        name="owner-journey",
+        app={"id": 42},
+        external_id=profile_revision(profile),
+        status="completed",
+        conclusion="success",
+        output={"summary": "journey passed", "text": "negative control failed"},
+    )
+
+
+def install_existing_binding(service, binding):
+    config = service.config.goals[0].model_dump()
+    config["github_existing_session_bindings"] = {"1": binding}
+    scope = GoalScope.model_validate(config)
+    service.config = service.config.model_copy(update={"goals": [scope]})
+
+
 def test_provider_evidence_and_owner_review_close_once_despite_routine_notes(
     service, monkeypatch
 ):
@@ -291,6 +392,135 @@ def test_existing_completed_sessions_bind_once_without_relaunch(service, monkeyp
     verify = bound["links"][1]
     assert independent_verdict(service, verify) == {"outcome": "verified"}
     assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert client.closed == 1
+
+
+def test_verified_accepts_current_strict_resumable_existing_pair(
+    service, monkeypatch, pg_control_path
+):
+    """A proven parked turn is distinct from a completed session lifetime."""
+    client, binding, _, _, _ = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    bound = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    pilot_evidence(client, independent_profile())
+
+    verify = bound["links"][1]
+    assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert client.closed == 1
+    assert binding["verifier_session_id"] == verify["session_id"]
+
+
+@pytest.mark.parametrize("change", ["busy", "unavailable", "failed", "newer_input"])
+def test_verified_rejects_unsafe_resumable_verifier_at_service_boundary(
+    service, monkeypatch, pg_control_path, change
+):
+    client, _, registry, live, _ = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    verify = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)[
+        "links"
+    ][1]
+    pilot_evidence(client, independent_profile())
+    if change == "busy":
+        live["resumable-verify"]["turn_active"] = True
+    elif change == "unavailable":
+        service.harness.collector = SimpleNamespace(
+            _harness_request=lambda host, path, **kwargs: (503, "{}")
+        )
+    elif change == "failed":
+        registry.append_event(
+            session_id="resumable-verify",
+            event_type="error",
+            seq=12,
+            payload={"returncode": 1},
+        )
+    else:
+        registry.append_event(
+            session_id="resumable-verify",
+            event_type="user_input",
+            seq=12,
+            payload={"turn_id": "newer-turn"},
+        )
+
+    with pytest.raises(ValueError, match="existing verification session"):
+        independent_verdict(service, verify)
+
+    assert client.closed == 0
+
+
+def test_running_unbound_verifier_cannot_use_existing_session_exception(
+    service, monkeypatch
+):
+    client, verify = ready(service, monkeypatch, independent_profile())
+    service.harness.sessions[verify["run_key"]].status = "running"
+
+    with pytest.raises(ValueError, match="verification session must complete"):
+        independent_verdict(service, verify)
+
+    assert client.closed == 0
+
+
+def test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict(
+    service, monkeypatch, pg_control_path
+):
+    client, old_binding, _, _, settled = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    profile = independent_profile()
+    replacement = existing_binding(
+        profile,
+        work_session_id="replacement-work",
+        work_turn_id="replacement-work-turn",
+        verifier_session_id="replacement-verify",
+        verifier_turn_id="replacement-verify-turn",
+    )
+    settled("replacement-work", "codex", "replacement-work-turn")
+    settled("replacement-verify", "claude-code", "replacement-verify-turn")
+    install_existing_binding(service, replacement)
+
+    current = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    assert {row["id"] for row in old["links"]}.isdisjoint(
+        {row["id"] for row in current["links"]}
+    )
+    assert all(len(service.store.link_events(row["id"])) == 1 for row in old["links"])
+    pilot_evidence(client, profile)
+
+    with pytest.raises(ValueError, match="binding superseded"):
+        independent_verdict(service, old["links"][1])
+    assert independent_verdict(service, current["links"][1]) == {"outcome": "verified"}
+    assert client.closed == 1
+    assert old_binding["source_head"] == replacement["source_head"] == SHA
+
+
+def test_existing_pair_with_uncertain_close_cannot_be_replaced(
+    service, monkeypatch, pg_control_path
+):
+    client, _, _, _, settled = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    pilot_evidence(client, independent_profile())
+    client.close_timeout = True
+    with pytest.raises(TimeoutError):
+        independent_verdict(service, old["links"][1])
+
+    profile = independent_profile()
+    replacement = existing_binding(
+        profile,
+        work_session_id="replacement-work",
+        work_turn_id="replacement-work-turn",
+        verifier_session_id="replacement-verify",
+        verifier_turn_id="replacement-verify-turn",
+    )
+    settled("replacement-work", "codex", "replacement-work-turn")
+    settled("replacement-verify", "claude-code", "replacement-verify-turn")
+    install_existing_binding(service, replacement)
+
+    with pytest.raises(RuntimeError, match="existing execution requires inspection"):
+        service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
     assert client.closed == 1
 
 

@@ -95,6 +95,14 @@ link-keyed `bind_existing_session` policy event for each generated link.
 Historical links without that event remain unchanged; the existing signed
 local-file continuity envelope is not reused or overwritten.
 
+At `verified`, this exception applies only when the stored link event is
+byte-for-byte the pair selected by the *current* installed profile/binding and
+the strict reader still returns that exact session/turn. This is the narrow
+place where a proven `running` structured lifetime is treated as settled. A
+normal queue link still requires the ordinary lifetime `completed` state; an
+uninstalled profile or older retained pair cannot use this exception or reach
+a verdict after the configuration has changed.
+
 With the issue in its ordinary `status:review` state, a coordinator calls:
 
 ```json
@@ -110,6 +118,16 @@ retained records return 400; an incompatible or malformed stored link returns
 409 for inspection. The regular `verified` request remains required and
 rechecks retained turns, profile/criteria source, provider evidence, required
 checks, and close idempotency.
+
+If a later reviewed durable input supersedes a never-accepted pair, the owner
+updates the installed exact binding and repeats this same request. The service
+creates a new deterministic pair and retains the old links and their policy
+events as history; it never rewrites a session, link, or audit record. This is
+allowed only when every old link has its single `bind_existing_session` event.
+Any progress, verification intent/outcome, extra event, malformed binding, or
+uncertain close is an inspection-required 409: reconcile the prior effect
+before considering another pair. The old pair is no longer eligible once the
+current binding changes.
 
 The checked issue must contain exactly one marked section whose trimmed contents
 equal `criteria`:
@@ -252,6 +270,7 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_exact_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_accepts_only_an_idle_structured_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_rejects_unsafe_resumable_turns`](../../tests/test_work_queue_github_acceptance.py) |
+| A current strict resumable pair may verify, while unsafe, superseded, or uncertain pairs cannot | [`test_verified_accepts_current_strict_resumable_existing_pair`](../../tests/test_work_queue_github_acceptance.py), [`test_verified_rejects_unsafe_resumable_verifier_at_service_boundary`](../../tests/test_work_queue_github_acceptance.py), [`test_running_unbound_verifier_cannot_use_existing_session_exception`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_with_uncertain_close_cannot_be_replaced`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |
 

@@ -81,6 +81,10 @@ retained repository identity, pins deterministic work and verify links, and
 rechecks both before an acceptance request. Its precise configuration and error
 contract is in the
 [pilot contract](../operations/github-acceptance-pilot.md#existing-session-reuse).
+Only the current installed exact pair can use that resumable exception at
+`verified`; an older pair remains append-only history. A later reviewed pair
+can be bound only when the old pair has no decision event beyond its original
+binding, so an uncertain provider effect always remains inspection-required.
 
 `update(action="complete")` schedules a separate verify run and leaves the issue
 open in review. For the default path, acceptance requires that run to finish,

@@ -680,6 +680,8 @@ class WorkService:
         binding = self._existing_session_binding(row)
         if binding is None:
             return self.harness.resolve(row["run_key"])
+        if self._current_existing_session_binding(scope, row, binding) is None:
+            return None
         reader = getattr(self.harness, "existing_session", None)
         if not callable(reader):
             return None
@@ -687,6 +689,81 @@ class WorkService:
         if session is None or session.session_id != row["session_id"]:
             return None
         return session
+
+    def _current_existing_session_binding(self, scope, row, binding=None):
+        """Return an existing binding only while installed policy selects it.
+
+        A link-keyed binding remains immutable audit history after a later
+        reviewed input turn replaces it.  It must not remain eligible merely
+        because its old session is still readable.
+        """
+        binding = (
+            binding if binding is not None else self._existing_session_binding(row)
+        )
+        if binding is None:
+            return None
+        profile = scope.github_acceptance_profiles.get(str(row["item_number"]))
+        configured = scope.github_existing_session_bindings.get(str(row["item_number"]))
+        if (
+            profile is None
+            or configured is None
+            or configured.profile_revision != profile.revision
+        ):
+            return None
+        work_request = identity(
+            "existing-session",
+            configured.profile_revision,
+            configured.source_head,
+            configured.work_session_id,
+            configured.work_turn_id,
+        )
+        work_key = identity(
+            self.config.workspace_id,
+            scope.goal_id,
+            row["item_number"],
+            work_request,
+            "work",
+        )
+        expected = self._existing_binding_payload(
+            configured,
+            role=row["run_role"],
+            parent_run_key=work_key if row["run_role"] == "verify" else None,
+        )
+        return binding if binding == expected else None
+
+    def _existing_pair_is_replaceable(self, links):
+        """Allow a new reviewed pair only before any old pair effect/intention.
+
+        Old links and their immutable policy events remain audit history.  A
+        provider intent, outcome, progress, or any malformed extra event means
+        an effect may be uncertain and requires inspection instead.
+        """
+        for link in links:
+            if self._existing_session_binding(link) is None:
+                return False
+            events = self.store.link_events(link["id"])
+            if len(events) != 1:
+                return False
+            event = events[0]
+            if (
+                event["event_kind"] != "policy"
+                or event["action_category"] != "bind_existing_session"
+                or event["outcome"] != "bound"
+            ):
+                return False
+        return True
+
+    def _acceptance_session_is_settled(self, scope, row, session):
+        """Accept a running lifetime only through the strict existing reader."""
+        if row is None:
+            return False
+        binding = self._existing_session_binding(row)
+        if binding is None:
+            return session is not None and session.status == "completed"
+        return (
+            session is not None
+            and self._current_existing_session_binding(scope, row, binding) is not None
+        )
 
     def _existing_binding_payload(self, binding, *, role, parent_run_key=None):
         field_prefix = "verifier" if role == "verify" else role
@@ -751,7 +828,9 @@ class WorkService:
             self.config.workspace_id, goal_id, number, work_key, source
         )
         links = self.store.links(goal_id=goal_id, number=number)
-        if any(link["run_key"] not in {work_key, verify_key} for link in links):
+        if any(
+            link["run_key"] not in {work_key, verify_key} for link in links
+        ) and not self._existing_pair_is_replaceable(links):
             raise WorkDenied("existing execution requires inspection")
         goal_ref = scope.goal_label or f"milestone:{scope.milestone}"
         work = self.store.intent(
@@ -1021,6 +1100,15 @@ class WorkService:
             raise PermissionError("execution outside item")
         row = rows[0]
         scope = next(scope for scope in self.config.goals if scope.goal_id == goal_id)
+        existing_binding = self._existing_session_binding(row)
+        if (
+            existing_binding is not None
+            and self._current_existing_session_binding(scope, row, existing_binding)
+            is None
+        ):
+            raise ValueError(
+                "existing session binding superseded; new verification required"
+            )
         session = self._bound_session(scope, row)
         bound_host_verification = self._bound_host_verification_report(
             scope, row, run_key, session, actor
@@ -1162,11 +1250,11 @@ class WorkService:
                     link_id=row["id"],
                 )
                 return {"outcome": "deferred"}
-            if session is None and self._existing_session_binding(row) is not None:
+            if session is None and existing_binding is not None:
                 raise ValueError(
                     "existing verification session lacks terminal provenance"
                 )
-            if session is None or session.status != "completed":
+            if not self._acceptance_session_is_settled(scope, row, session):
                 raise ValueError("verification session must complete before acceptance")
             if pilot:
                 parent_key = self._work_parent(
@@ -1185,7 +1273,7 @@ class WorkService:
                     if parent_row is not None
                     else None
                 )
-                if parent is None or parent.status != "completed":
+                if not self._acceptance_session_is_settled(scope, parent_row, parent):
                     raise ValueError("work session must complete before acceptance")
                 facts = provider.acceptance_facts(ref, evidence_key)
                 if any(facts.get(k) != v for k, v in criteria.items()):
