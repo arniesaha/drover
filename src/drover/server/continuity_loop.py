@@ -46,6 +46,7 @@ class ContinuityPolicy:
     ci_pending_minutes: float = 40.0
     release_running_minutes: float = 60.0
     explicit_deadlines: bool = False
+    require_advancement: bool = False
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,39 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
                 value, f"facts.external_session_activity.{key}", required=True
             )
 
+    # Owner/provider projections supply evidence identities, never observation times.
+    advancement = facts.get("advancement", [])
+    if not isinstance(advancement, list) or len(advancement) > 100:
+        raise ValueError("facts.advancement must be a bounded list")
+    advances = {}
+    for entry in advancement:
+        if not isinstance(entry, dict):
+            raise ValueError("facts.advancement entries must be objects")
+        ref = _bounded_text(entry.get("ref"), limit=512)
+        if not ref or not ref.strip():
+            raise ValueError("facts.advancement.ref must be non-empty bounded text")
+        at = timestamp(entry.get("at"), "facts.advancement.at", required=True)
+        # Repeating one receipt cannot refresh its original advancement time.
+        if ref not in advances or _time(at) < _time(advances[ref]):
+            advances[ref] = at
+
+    def packet(name: str, fields: tuple[str, ...]) -> dict[str, str]:
+        value = facts.get(name, {})
+        if not isinstance(value, dict) or set(value) - set(fields):
+            raise ValueError(f"facts.{name} must be a bounded packet")
+        result = {}
+        for key, val in value.items():
+            if not isinstance(val, str) or not val.strip() or len(val) > 2048:
+                raise ValueError(f"facts.{name}.{key} must be non-empty bounded text")
+            result[key] = val
+        return result
+
+    human_handoff = packet(
+        "human_handoff",
+        ("artifact", "tested_capability", "requested_action", "resume_when"),
+    )
+    recovery = packet("recovery", ("scope", "checkpoint", "result", "next_action"))
+
     return {
         "number": number,
         "labels": labels,
@@ -307,6 +341,9 @@ def normalize_facts(facts: dict[str, Any]) -> dict[str, Any]:
         "worker": normalized_worker,
         "release": normalized_release,
         "external_session_activity": normalized_external_activity,
+        "advancement": [{"ref": ref, "at": advances[ref]} for ref in sorted(advances)],
+        "human_handoff": human_handoff,
+        "recovery": recovery,
     }
 
 
@@ -323,9 +360,9 @@ def normalize_policy(
     if set(policy) - allowed:
         raise ValueError("policy contains unsupported fields")
     for key, value in policy.items():
-        if key == "explicit_deadlines":
+        if key in {"explicit_deadlines", "require_advancement"}:
             if not isinstance(value, bool):
-                raise ValueError("policy.explicit_deadlines must be boolean")
+                raise ValueError(f"policy.{key} must be boolean")
         elif (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -371,7 +408,9 @@ def _deadline(
     return None, None
 
 
-def _fingerprint(facts: dict[str, Any], action: str, reason: str | None) -> str:
+def _fingerprint(
+    facts: dict[str, Any], action: str, reason: str | None, *, substantive: bool = False
+) -> str:
     markers = facts.get("markers") or {}
     material = {
         "issue": facts.get("number") or facts.get("issue"),
@@ -386,20 +425,33 @@ def _fingerprint(facts: dict[str, Any], action: str, reason: str | None) -> str:
             for pr in facts.get("prs") or []
         ],
     }
+    if substantive:
+        # Check/activity churn must not mint another durable recovery effect.
+        material.pop("worker_state")
+        material.pop("prs")
+        material["owner"] = markers.get("owner")
+        material["advancement"] = sorted(
+            {entry["ref"] for entry in facts["advancement"]}
+        )
     return sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
 
 
 def _decision(
-    facts: dict[str, Any], action: str, reason: str | None, stage: str | None
+    facts: dict[str, Any],
+    action: str,
+    reason: str | None,
+    stage: str | None,
+    *,
+    substantive: bool = False,
 ) -> Decision:
     return Decision(
         action,
         reason,
         facts.get("number") or facts.get("issue"),
         stage,
-        _fingerprint(facts, action, reason),
+        _fingerprint(facts, action, reason, substantive=substantive),
     )
 
 
@@ -416,32 +468,72 @@ def decide(
     policy = normalize_policy(policy)
     labels = list(facts.get("labels") or [])
     stage = _stage(labels)
+    if policy.require_advancement:
+        # Provider clock skew must not postpone recovery or mint a new wake.
+        # Ignore future receipts consistently in both the clock and identity.
+        facts["advancement"] = [
+            entry for entry in facts["advancement"] if _time(entry["at"]) <= now
+        ]
+
+    def decision(action: str, reason: str | None = None) -> Decision:
+        return _decision(
+            facts, action, reason, stage, substantive=policy.require_advancement
+        )
+
+    def progress() -> datetime | None:
+        if not policy.require_advancement:
+            return _activity(facts)
+        return max(
+            (
+                stamp
+                for stamp in [
+                    _time(facts.get("created")),
+                    *(_time(entry["at"]) for entry in facts["advancement"]),
+                ]
+                if stamp
+            ),
+            default=None,
+        )
+
     if not stage:
-        return _decision(facts, "none", "no_operator_approved_autonomy_label", stage)
+        return decision("none", "no_operator_approved_autonomy_label")
     if "blocked:human" in labels:
-        return _decision(facts, "none", "blocked_human", stage)
+        prepared = set(facts["human_handoff"]) == {
+            "artifact",
+            "tested_capability",
+            "requested_action",
+            "resume_when",
+        }
+        reason = (
+            "blocked_human_unprepared"
+            if policy.require_advancement and not prepared
+            else "blocked_human"
+        )
+        return decision("none", reason)
     if "stalled" in labels:
-        return _decision(facts, "none", "stalled", stage)
+        return decision("none", "stalled")
     if _reached(facts, stage):
-        last = _activity(facts) or now
+        last = progress() or now
         if not _marker_seen(facts, "handoff", last):
-            return _decision(facts, "handoff", None, stage)
-        return _decision(facts, "none", "handoff_recorded", stage)
+            return decision("handoff", None)
+        return decision("none", "handoff_recorded")
 
     worker = facts.get("worker") or {}
     if worker.get("state") == "needs_approval":
         gate = worker.get("gate")
         if gate in STAGES and STAGES.index(gate) <= STAGES.index(stage):
-            return _decision(facts, "auto_approve", gate, stage)
-        return _decision(facts, "wake", "needs_approval", stage)
+            return decision("auto_approve", gate)
+        return decision("wake", "needs_approval")
     if worker.get("state") == "blocked":
-        return _decision(facts, "wake", "worker_blocked", stage)
+        return decision("wake", "worker_blocked")
 
-    active = _activity(facts)
+    active = progress()
     if active is None:
-        return _decision(facts, "none", "missing_activity", stage)
+        return decision("none", "missing_activity")
     deadline, deadline_kind = (
-        _deadline(facts, policy) if policy.explicit_deadlines else (None, None)
+        _deadline(facts, policy)
+        if policy.explicit_deadlines and not policy.require_advancement
+        else (None, None)
     )
     # Old reconcile behavior uses a 30 minute idle window and starts the next
     # window after a post-activity marker (not the original activity event).
@@ -449,13 +541,13 @@ def decide(
         minutes=policy.stall_minutes
     )
     if now < due:
-        return _decision(facts, "none", None, stage)
+        return decision("none", None)
     # Legacy markers are deliberately considered after normal activity. Newer
     # worker state deadlines are level-triggered and retain the same two-step
     # nudge/stall protocol.
     if _marker_seen(facts, "nudge", active):
-        return _decision(facts, "stall", deadline_kind, stage)
-    return _decision(facts, "nudge", deadline_kind, stage)
+        return decision("stall", deadline_kind)
+    return decision("nudge", deadline_kind)
 
 
 def action_identity(decision: Decision) -> tuple[str, str]:
