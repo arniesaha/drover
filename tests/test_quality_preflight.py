@@ -7,12 +7,16 @@ get their own ``env``.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -113,8 +117,15 @@ def stub_python(
 
 def run(capsys, argv, path=GIT_DIR):
     code = preflight.main([str(a) for a in argv], path=path)
-    lines = capsys.readouterr().out.strip().splitlines()
-    return code, json.loads(lines[-1])
+    captured = capsys.readouterr()
+    result = json.loads(captured.out.strip().splitlines()[-1])
+    if result["classification"] != "pass":
+        # Diagnostic contract: every failure names its item, cause and a
+        # concrete next step, in the JSON and on stderr.
+        assert result["check"] and result["message"]
+        assert len(result["action"].strip()) >= 20, result
+        assert result["action"] in captured.err
+    return code, result
 
 
 def base_args(repo: Path, out: Path, python: Path) -> list:
@@ -154,7 +165,12 @@ def test_bootstrap_classifies_absent_supported_interpreter(tmp_path):
         text=True,
     )
     assert result.returncode == 3
-    assert json.loads(result.stdout)["classification"] == "environment_unavailable"
+    diagnostic = json.loads(result.stdout)
+    assert diagnostic["classification"] == "environment_unavailable"
+    assert diagnostic["check"] == "bootstrap_interpreter"
+    assert "Python >= 3.11" in diagnostic["action"]
+    assert "DROVER_PREFLIGHT_PYTHON" in diagnostic["action"]
+    assert "uv sync --locked --extra dev" in diagnostic["action"]
     assert "no Python >= 3.11" in result.stderr
 
 
@@ -295,6 +311,268 @@ def test_stale_receipt_cannot_certify_new_source(capsys, repo, out, tmp_path):
     )
     assert (code, result["check"]) == (3, "receipt")
     assert "head" in result["message"] and "lock_sha256" in result["message"]
+
+
+def test_wrong_head_receipt_names_values_and_safe_rerun(capsys, repo, out, tmp_path):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    old_head = _git(repo, "rev-parse", "HEAD")
+    _, first = run(capsys, base_args(repo, out, py))
+    (repo / "src" / "drover" / "__init__.py").write_text("# moved\n")
+    _git(repo, "commit", "-qam", "move head")
+    new_head = _git(repo, "rev-parse", "HEAD")
+    receipt_bytes = Path(first["receipt"]).read_bytes()
+    marker = tmp_path / "expensive-ran"
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            first["receipt"],
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+    )
+    # Unchanged classification, exit code and fail-fast behaviour.
+    assert (code, result["classification"], result["check"]) == (
+        3,
+        "environment_unavailable",
+        "receipt",
+    )
+    assert "differs in ['head']" in result["message"]
+    assert f"receipt={old_head}" in result["message"]
+    assert f"current={new_head}" in result["message"]
+    assert not marker.exists()
+    # Concrete and safe: rerun canonical preflight, never edit or relax gates.
+    action = result["action"]
+    assert "Check out the intended source" in action
+    assert "Rerun scripts/quality/preflight.sh without --verify-receipt" in action
+    assert "Do not edit or reuse this receipt" in action
+    assert "do not drop --verify-receipt or --expect-base" in action
+    assert Path(first["receipt"]).read_bytes() == receipt_bytes
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", '{"created_at": "x"}'])
+def test_unreadable_receipt_is_classified_with_rerun_action(
+    capsys, repo, out, tmp_path, content
+):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    bad = tmp_path / "bad-receipt.json"
+    bad.write_text(content)
+    marker = tmp_path / "expensive-ran"
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            bad,
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+    )
+    assert (code, result["check"]) == (3, "receipt")
+    assert "cannot read receipt" in result["message"]
+    assert result["action"] == preflight.RERUN_ACTION
+    assert not marker.exists()
+
+
+def test_aged_receipt_reports_age_and_rerun_action(capsys, repo, out, tmp_path):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    _, first = run(capsys, base_args(repo, out, py))
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            first["receipt"],
+            "--max-receipt-age",
+            "-1",
+        ],
+    )
+    assert (code, result["check"]) == (3, "receipt")
+    assert "older than --max-receipt-age -1s" in result["message"]
+    assert result["action"] == preflight.RERUN_ACTION
+
+
+def test_failure_without_action_cannot_be_constructed():
+    with pytest.raises(TypeError):
+        preflight.Failure(preflight.ENV, "x", "message")
+    with pytest.raises(ValueError):
+        preflight.Failure(preflight.ENV, "x", "message", "  ")
+
+
+# --- SIGINT interruption through the real preflight.sh process ---------------
+
+# An idempotent, invocation-owned marker: announces start, waits, then writes
+# its one effect only if absent. A clean SIGINT exit mirrors well-behaved tools.
+MARKER_HELPER = """\
+import pathlib, sys, time
+started, effect, delay = sys.argv[1], pathlib.Path(sys.argv[2]), float(sys.argv[3])
+pathlib.Path(started).write_text("started")
+try:
+    time.sleep(delay)
+except KeyboardInterrupt:
+    sys.exit(130)
+if not effect.exists():
+    effect.write_text("effect\\n")
+"""
+
+
+@pytest.fixture
+def process_out():
+    """An --out directory a *real* preflight.sh child accepts.
+
+    The autouse ``shared_temp`` monkeypatch only changes this test process's
+    module; a subprocess loads preflight.py afresh with the production
+    SHARED_TEMP_ROOTS. On Linux CI, tmp_path is under /tmp and is correctly
+    refused, so in-process patching cannot certify subprocess policy. This
+    fixture creates a unique directory under ~/scratch (the documented owned
+    scratch root), fails loudly if that is itself under a real shared temp
+    root, and removes only what it created, on every exit.
+    """
+    scratch = Path.home() / "scratch"
+    base = scratch / "drover-preflight-tests"
+    created = [p for p in (scratch, base) if not p.exists()]
+    base.mkdir(parents=True, exist_ok=True)
+    owned = Path(tempfile.mkdtemp(prefix="sigint-", dir=base)).resolve()
+    try:
+        for root in DEFAULT_SHARED:
+            shared = Path(root).resolve()
+            assert (
+                owned != shared and shared not in owned.parents
+            ), f"{owned} is under real shared temp {root}; refusing to run"
+        yield owned
+    finally:
+        shutil.rmtree(owned, ignore_errors=True)
+        for directory in reversed(created):  # only parents this fixture made
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # only if still empty
+
+
+def _wait_for(path: Path, proc: subprocess.Popen, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, proc.communicate()
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+def _start(argv: list, tmp_path: Path) -> subprocess.Popen:
+    env = {
+        "PATH": os.pathsep.join([GIT_DIR, str(Path(sys.executable).parent)]),
+        "HOME": str(tmp_path),
+        "LC_ALL": "C",
+    }
+    # Own session => own process group: the SIGINT below reaches only this
+    # invocation and its children, never the test runner or the host.
+    return subprocess.Popen(
+        ["/bin/sh", str(QUALITY / "preflight.sh"), *map(str, argv)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def _interrupt(proc: subprocess.Popen) -> tuple[dict, str]:
+    os.killpg(proc.pid, signal.SIGINT)
+    out, err = proc.communicate(timeout=30)
+    return json.loads(out.strip().splitlines()[-1]), err
+
+
+def test_sigint_during_then_is_classified_and_retry_has_one_effect(
+    repo, process_out, tmp_path
+):
+    out = process_out
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    helper = tmp_path / "marker_helper.py"
+    helper.write_text(MARKER_HELPER)
+    started, effect = tmp_path / "started", tmp_path / "effect"
+
+    def argv(delay):
+        return [
+            *base_args(repo, out, py),
+            "--then",
+            sys.executable,
+            "-I",
+            helper,
+            started,
+            effect,
+            delay,
+        ]
+
+    proc = _start(argv("60"), tmp_path)
+    _wait_for(started, proc)  # --then is observably running
+    result, err = _interrupt(proc)
+    assert proc.returncode == 130
+    assert (result["classification"], result["check"]) == (
+        "harness_failure",
+        "interrupted",
+    )
+    assert "Traceback" not in err and result["action"] in err
+    receipt = Path(result["receipt"])
+    assert receipt.is_file() and str(receipt) in result["action"]
+    assert json.loads(receipt.read_text())["head"] == _git(repo, "rev-parse", "HEAD")
+    assert result["then"] == {
+        "argv0": Path(sys.executable).name,
+        "returncode": 130,
+        "stopped_by": "exited",
+    }
+    assert not effect.exists()  # no premature effect
+
+    started.unlink()
+    retry = _start(argv("0"), tmp_path)
+    out_text, err_text = retry.communicate(timeout=60)
+    second = json.loads(out_text.strip().splitlines()[-1])
+    assert (retry.returncode, second["classification"]) == (0, "pass"), err_text
+    assert effect.read_text() == "effect\n"  # exactly one effect
+    assert receipt.is_file() and second["receipt"] != str(receipt)
+
+
+def test_sigint_before_receipt_is_classified_and_leaves_nothing(
+    repo, process_out, tmp_path
+):
+    out = process_out
+    started = tmp_path / "probe-started"
+    slow = tmp_path / "slow-python"
+    slow.write_text(f"#!/bin/sh\necho > '{started}'\n/bin/sleep 60\n")
+    slow.chmod(0o755)
+    proc = _start(["--root", repo, "--out", out, "--python", slow], tmp_path)
+    _wait_for(started, proc)  # the interpreter probe is running: pre-receipt
+    result, err = _interrupt(proc)
+    assert proc.returncode == 130
+    assert (result["classification"], result["check"]) == (
+        "harness_failure",
+        "interrupted",
+    )
+    assert "no receipt exists" in result["message"] and "receipt" not in result
+    assert "Traceback" not in err
+    assert list(out.iterdir()) == []  # own write probe removed, no receipt
+
+
+def test_reap_terminates_an_own_child_that_ignores_sigint(monkeypatch, tmp_path):
+    monkeypatch.setattr(preflight, "CHILD_GRACE_SECONDS", 0.5)
+    ready = tmp_path / "ready"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, signal, sys, time\n"
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).write_text('ready')\n"
+            "time.sleep(60)\n",
+            str(ready),
+        ]
+    )
+    _wait_for(ready, child)
+    child.send_signal(signal.SIGINT)
+    state = preflight._reap(child)
+    assert state["stopped_by"] == "was terminated"
+    assert state["returncode"] == -signal.SIGTERM and child.poll() is not None
 
 
 @pytest.mark.parametrize(

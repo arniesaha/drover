@@ -470,7 +470,7 @@ def test_bridge_quota_refreshes_through_collector_transport(monkeypatch, tmp_pat
         calls.append(kwargs)
         return {"accounts": [{"provider": "openai"}]}
 
-    monkeypatch.setattr("drover.server.mcp.tools.drover_provider_quota", quota)
+    monkeypatch.setattr("drover.server.providers.quota_read.read_provider_quota", quota)
 
     assert bridge.quota() == [{"provider": "openai"}]
     assert calls == [

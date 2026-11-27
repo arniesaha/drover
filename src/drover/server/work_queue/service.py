@@ -51,7 +51,7 @@ def code(value):
 
 def route(accounts, policy, estimate, eligible):
     """Reuse quota hint semantics; each subscription retains its own constraints."""
-    from drover.server.mcp.tools import _build_routing_hint
+    from drover.server.providers.quota_read import _build_routing_hint
 
     if (
         isinstance(estimate, bool)

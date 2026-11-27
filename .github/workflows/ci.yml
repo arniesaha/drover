@@ -192,6 +192,10 @@ jobs:
         git diff --check "$BASE_SHA"...HEAD
         python scripts/check_public_release.py
 
+    - name: Enforce strict work coordinator dependency boundary
+      if: steps.scope.outputs.python == 'true'
+      run: python -I scripts/quality/boundaries.py
+
     - name: Run tests with pytest
       if: steps.scope.outputs.python == 'true'
       env:

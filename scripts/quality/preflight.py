@@ -3,7 +3,8 @@
 Run through ``scripts/quality/preflight.sh`` so an absent interpreter is
 classified too. Contract: docs/operations/dev-preflight.md. Exit codes:
 0 pass, 1 product_test_failure (only from ``--then``), 3 environment_unavailable,
-4 harness_failure. The ``--then`` argv runs only after every check passed.
+4 harness_failure, 130 harness_failure/interrupted (SIGINT). The ``--then`` argv
+runs only after every check passed.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -56,6 +58,8 @@ RECEIPT_KEYS = (
     "pg",
 )
 SYNC_ACTION = "Run `uv sync --locked --extra dev` in this worktree, or pass --python."
+INTERRUPTED_EXIT = 130  # shell convention for SIGINT; classification stays harness
+CHILD_GRACE_SECONDS = 5.0
 _remove = os.unlink  # indirection so tests can induce a cleanup failure
 
 # Executed by the resolved interpreter in isolated mode. Module names come from
@@ -93,8 +97,24 @@ with psycopg.connect(os.environ[sys.argv[1]], connect_timeout=5) as con:
 """
 
 
+RERUN_ACTION = (
+    "Do not edit or reuse this receipt, and do not drop --verify-receipt or "
+    "--expect-base. Rerun scripts/quality/preflight.sh without --verify-receipt "
+    "at the intended source and context to write a new receipt, then verify "
+    "against that new receipt."
+)
+PG_FIXTURE_ACTION = (
+    "Point --pg-dsn-env at the intended isolated fixture; never start, repair "
+    "or query a shared or production cluster, and do not relax the --pg-expect-* "
+    "flags."
+)
+
+
 class Failure(Exception):
-    def __init__(self, classification: str, check: str, message: str, action: str = ""):
+    # action is required: every failure must name a concrete next step.
+    def __init__(self, classification: str, check: str, message: str, action: str):
+        if not action.strip():
+            raise ValueError("Failure requires a non-empty action")
         super().__init__(message)
         self.classification, self.check, self.message, self.action = (
             classification,
@@ -102,6 +122,56 @@ class Failure(Exception):
             message,
             action,
         )
+
+
+class Interrupted(Failure):
+    """SIGINT during this invocation: never pass, never product_test_failure."""
+
+    exit_code = INTERRUPTED_EXIT
+
+    def __init__(self, message: str, action: str, then: dict | None = None):
+        super().__init__(HARNESS, "interrupted", message, action)
+        self.then = then
+
+
+def _interrupted(receipt_path: str | None, then: dict | None = None) -> Interrupted:
+    if receipt_path is None or then is None:
+        return Interrupted(
+            "interrupted (SIGINT) before the receipt was written; checks did not "
+            "complete, --then did not start, and no receipt exists",
+            "Rerun scripts/quality/preflight.sh with the same arguments; nothing "
+            "from this invocation needs reconciling.",
+        )
+    return Interrupted(
+        "interrupted (SIGINT) while --then ran; its effects are unknown. The "
+        f"direct child {then['stopped_by']} with returncode {then['returncode']}",
+        f"The retained receipt {receipt_path} certifies only the environment, "
+        "not the command. Reconcile any partial effects of the --then command, "
+        "then rerun scripts/quality/preflight.sh with the same arguments; it "
+        "writes a new receipt.",
+        then,
+    )
+
+
+def _reap(proc: subprocess.Popen) -> dict:
+    """Stop only the child this invocation started, observed to its exit."""
+    stopped_by = "exited"
+    try:
+        proc.wait(timeout=CHILD_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        stopped_by = "was terminated"
+        proc.terminate()
+        try:
+            proc.wait(timeout=CHILD_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            stopped_by = "was killed"
+            proc.kill()
+            proc.wait()
+    return {
+        "argv0": Path(proc.args[0]).name,
+        "returncode": proc.returncode,
+        "stopped_by": stopped_by,
+    }
 
 
 def _run(argv, *, cwd=None, timeout=30):
@@ -113,7 +183,12 @@ def _run(argv, *, cwd=None, timeout=30):
 def check_worktree(root: Path, args, git: str) -> dict:
     top = _run([git, "rev-parse", "--show-toplevel"], cwd=root)
     if top.returncode != 0:
-        raise Failure(ENV, "worktree", f"{root} is not a git checkout")
+        raise Failure(
+            ENV,
+            "worktree",
+            f"{root} is not a git checkout",
+            "Run from, or pass --root for, a git checkout of the intended worktree.",
+        )
     actual = Path(top.stdout.strip()).resolve()
     if args.expect_worktree and actual != Path(args.expect_worktree).resolve():
         raise Failure(
@@ -156,7 +231,13 @@ def check_worktree(root: Path, args, git: str) -> dict:
 def check_inputs(root: Path) -> tuple[str, str]:
     for rel in ("pyproject.toml", "uv.lock"):
         if not os.access(root / rel, os.R_OK):
-            raise Failure(ENV, "readable_input", f"{rel} is not readable in {root}")
+            raise Failure(
+                ENV,
+                "readable_input",
+                f"{rel} is not readable in {root}",
+                "Run against a complete checkout of the intended source; do not "
+                "create or regenerate this file to pass the check.",
+            )
     meta = tomllib.loads((root / "pyproject.toml").read_text())
     lock = hashlib.sha256((root / "uv.lock").read_bytes()).hexdigest()
     return meta.get("project", {}).get("requires-python", ""), lock
@@ -184,14 +265,22 @@ def check_output(out: Path, stack: contextlib.ExitStack) -> str:
         fd, probe = tempfile.mkstemp(prefix=".preflight-probe-", dir=out)
     except OSError as exc:
         raise Failure(
-            ENV, "output_dir", f"{out} is not writable: {exc.strerror}"
+            ENV,
+            "output_dir",
+            f"{out} is not writable: {exc.strerror}",
+            "Pass --out an isolated directory you own, such as ~/scratch/<run>.",
         ) from exc
     # The only resource this run creates before the receipt; always removed.
     stack.callback(lambda: _cleanup(probe))
     with os.fdopen(fd, "w") as handle:
         handle.write("ok")
     if Path(probe).read_text() != "ok":
-        raise Failure(ENV, "output_dir", f"{out} did not read back the probe")
+        raise Failure(
+            ENV,
+            "output_dir",
+            f"{out} did not read back the probe",
+            "Use a different isolated --out directory on a local filesystem.",
+        )
     return str(out)
 
 
@@ -204,6 +293,8 @@ def _cleanup(probe: str) -> None:
             "cleanup",
             f"could not remove own probe {probe} "
             f"({exc.strerror}); left in place as proof",
+            "Inspect the retained probe and the permissions on --out before "
+            "rerunning; the helper never deletes anything it did not create.",
         ) from exc
 
 
@@ -234,6 +325,7 @@ def check_interpreter(
             "interpreter",
             f"{candidate} did not run the probe "
             f"(exit {probe.returncode}): {probe.stderr[-200:]}",
+            SYNC_ACTION,
         ) from exc
     version = ".".join(map(str, info["version"]))
     if not _meets(info["version"], requires):
@@ -299,10 +391,17 @@ def check_postgres(interpreter: str, args, path: str) -> dict:
     try:
         probe = _run([interpreter, "-I", "-c", _PG_PROBE, args.pg_dsn_env], timeout=20)
     except subprocess.TimeoutExpired as exc:
-        raise Failure(ENV, "pg:query", "read-only fixture query timed out") from exc
+        raise Failure(
+            ENV, "pg:query", "read-only fixture query timed out", PG_FIXTURE_ACTION
+        ) from exc
     if probe.returncode != 0:
         last = (probe.stderr.strip().splitlines() or ["?"])[-1][:200]
-        raise Failure(ENV, "pg:query", f"read-only fixture query failed: {last}")
+        raise Failure(
+            ENV,
+            "pg:query",
+            f"read-only fixture query failed: {last}",
+            PG_FIXTURE_ACTION,
+        )
     info = json.loads(probe.stdout)
     endpoint = f"{info['host']}:{info['port']}"
     forbidden = set(args.pg_forbid_endpoint or ())
@@ -318,6 +417,7 @@ def check_postgres(interpreter: str, args, path: str) -> dict:
             ENV,
             "pg:role",
             f"connected as {info['user']!r}, expected " f"{args.pg_expect_role!r}",
+            PG_FIXTURE_ACTION,
         )
     data = info.get("data_directory")
     if args.pg_expect_data_prefix and not (data or "").startswith(
@@ -328,6 +428,7 @@ def check_postgres(interpreter: str, args, path: str) -> dict:
             "pg:data_directory",
             f"fixture data directory is {data!r}, "
             f"not under {args.pg_expect_data_prefix}",
+            PG_FIXTURE_ACTION,
         )
     major = info["server_version_num"] // 10000
     if args.pg_expect_major and major != args.pg_expect_major:
@@ -335,6 +436,7 @@ def check_postgres(interpreter: str, args, path: str) -> dict:
             ENV,
             "pg:version",
             f"server major {major}, expected " f"{args.pg_expect_major}",
+            PG_FIXTURE_ACTION,
         )
     if int(match.group(2)) != major:
         raise Failure(
@@ -344,7 +446,12 @@ def check_postgres(interpreter: str, args, path: str) -> dict:
             "Put the matching PostgreSQL bindir first on PATH.",
         )
     if info["read_only"] != "on":
-        raise Failure(HARNESS, "pg:query", "probe transaction was not read-only")
+        raise Failure(
+            HARNESS,
+            "pg:query",
+            "probe transaction was not read-only",
+            "Do not run tests against this fixture; report the endpoint for review.",
+        )
     return {
         "pg": {
             "endpoint": endpoint,
@@ -364,7 +471,12 @@ def run_checks(args, stack: contextlib.ExitStack, path: str) -> dict:
     for tool in profile["tools"]:
         tools[tool] = shutil.which(tool, path=path)
         if tools[tool] is None:
-            raise Failure(ENV, f"tool:{tool}", f"{tool} is not on PATH")
+            raise Failure(
+                ENV,
+                f"tool:{tool}",
+                f"{tool} is not on PATH",
+                f"Put {tool} on PATH for this shell; the helper never installs it.",
+            )
     receipt = {
         "profile": args.profile,
         "host": socket.gethostname(),
@@ -389,27 +501,94 @@ def run_checks(args, stack: contextlib.ExitStack, path: str) -> dict:
 def verify_receipt(receipt_path: Path, current: dict, max_age: int) -> None:
     try:
         old = json.loads(receipt_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise Failure(ENV, "receipt", f"cannot read receipt {receipt_path}") from exc
+        if not isinstance(old, dict):
+            raise ValueError("not a JSON object")
+        age = current["created_at"] - int(old.get("created_at", 0))
+    except (OSError, ValueError, TypeError) as exc:  # JSONDecodeError is ValueError
+        raise Failure(
+            ENV,
+            "receipt",
+            f"cannot read receipt {receipt_path} ({type(exc).__name__})",
+            RERUN_ACTION,
+        ) from exc
     stale = [k for k in RECEIPT_KEYS if old.get(k) != current.get(k)]
     if stale:
-        raise Failure(
-            ENV, "receipt", f"receipt does not certify this run; differs in {stale}"
+        # Show the receipt and current values (no DSN or secret is ever stored).
+        values = "; ".join(
+            f"{k}: receipt={_short(old.get(k))} current={_short(current.get(k))}"
+            for k in stale
         )
-    if current["created_at"] - int(old.get("created_at", 0)) > max_age:
-        raise Failure(ENV, "receipt", f"receipt is older than {max_age}s")
+        raise Failure(
+            ENV,
+            "receipt",
+            f"receipt does not certify this run; differs in {stale} ({values})",
+            _mismatch_hint(stale) + RERUN_ACTION,
+        )
+    if age > max_age:
+        raise Failure(
+            ENV,
+            "receipt",
+            f"receipt is {age}s old, older than --max-receipt-age {max_age}s",
+            RERUN_ACTION,
+        )
 
 
-def run_then(argv: list[str], receipt: dict) -> dict:
+def _short(value) -> str:
+    text = json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _mismatch_hint(stale: list[str]) -> str:
+    if {"head", "lock_sha256", "worktree"} & set(stale):
+        return "Check out the intended source in the allocated worktree first. "
+    if {"interpreter", "python_version"} & set(stale):
+        return "Use the intended project interpreter (--python) first. "
+    if "pg" in stale:
+        return "Use the intended isolated PG fixture first. "
+    return ""
+
+
+def _ignore_sigint() -> None:
+    with contextlib.suppress(ValueError):  # only possible on the main thread
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def run_then(argv: list[str], receipt: dict, receipt_path: str | None = None) -> dict:
     if argv[0] in ("python", "python3"):
-        raise Failure(HARNESS, "then", "use {python} so the verified interpreter runs")
+        raise Failure(
+            HARNESS,
+            "then",
+            f"--then names unversioned {argv[0]!r}",
+            "Pass '{python}' as the --then interpreter so the verified one runs.",
+        )
     argv = [receipt["interpreter"] if a == "{python}" else a for a in argv]
-    rc = subprocess.run(argv, cwd=receipt["worktree"], check=False).returncode
+    proc = subprocess.Popen(argv, cwd=receipt["worktree"])
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        _ignore_sigint()  # a second Ctrl-C must not lose the result line
+        raise _interrupted(receipt_path, _reap(proc)) from None
+    if rc < 0:
+        raise Failure(
+            HARNESS,
+            "then",
+            f"command was killed by signal {-rc}",
+            "Find what signalled the --then command, reconcile its partial "
+            "effects, then rerun scripts/quality/preflight.sh.",
+        )
     if rc == 1:
-        raise Failure(PRODUCT, "then", "focused command reported failures (exit 1)")
+        raise Failure(
+            PRODUCT,
+            "then",
+            "focused command reported failures (exit 1)",
+            "Fix the failing tests shown above; the environment was certified.",
+        )
     if rc != 0:
         raise Failure(
-            HARNESS, "then", f"command exited {rc} (usage/collection/internal)"
+            HARNESS,
+            "then",
+            f"command exited {rc} (usage/collection/internal)",
+            "Correct the --then command using its output above, then rerun.",
         )
     return {"argv0": Path(argv[0]).name, "returncode": rc}
 
@@ -449,6 +628,8 @@ def main(argv=None, *, path: str | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
     path = os.environ.get("PATH", "") if path is None else path
     result: dict = {"profile": args.profile}
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    code = None
     try:
         try:
             with contextlib.ExitStack() as stack:
@@ -458,29 +639,58 @@ def main(argv=None, *, path: str | None = None) -> int:
                         Path(args.verify_receipt), receipt, args.max_receipt_age
                     )
         except OSError as exc:
-            raise Failure(HARNESS, "io", f"{type(exc).__name__}: {exc}") from exc
+            raise Failure(
+                HARNESS,
+                "io",
+                f"{type(exc).__name__}: {exc}",
+                "Check permissions and free space for --out and the checkout.",
+            ) from exc
         # Written only after our own probe was cleaned up, so a receipt exists
         # only for a fully passed, fully cleaned preflight.
         target = Path(receipt["output_dir"]) / f"preflight-{receipt['run_id']}.json"
         target.write_text(json.dumps(receipt, indent=2, sort_keys=True))
         result.update(classification=PASS, receipt=str(target))
         if args.then:
-            result["then"] = run_then(args.then, receipt)
+            result["then"] = run_then(args.then, receipt, str(target))
+    except KeyboardInterrupt:
+        # Before --then: the ExitStack has already removed our own probe.
+        _ignore_sigint()
+        if "receipt" in result:  # receipt written, --then not yet started
+            failure = Interrupted(
+                "interrupted (SIGINT) after the receipt was written and before "
+                "--then started",
+                f"Rerun scripts/quality/preflight.sh; the retained receipt "
+                f"{result['receipt']} certifies only the environment.",
+            )
+        else:
+            failure = _interrupted(None)
+        code = _record(result, failure)
     except Failure as exc:
-        result.update(
-            classification=exc.classification,
-            check=exc.check,
-            message=exc.message,
-            action=exc.action,
-        )
-    print(json.dumps(result, sort_keys=True))
+        code = _record(result, exc)
+    print(json.dumps(result, sort_keys=True), flush=True)
     if result["classification"] != PASS:
         print(
             f"preflight {result['classification']}: [{result['check']}] "
             f"{result['message']} {result['action']}".rstrip(),
             file=sys.stderr,
         )
-    return EXIT[result["classification"]]
+    # Restored only after the result is reported, so a second SIGINT while
+    # reporting cannot replace it with a traceback.
+    with contextlib.suppress(ValueError):
+        signal.signal(signal.SIGINT, previous_sigint)
+    return EXIT[result["classification"]] if code is None else code
+
+
+def _record(result: dict, exc: Failure) -> int | None:
+    result.update(
+        classification=exc.classification,
+        check=exc.check,
+        message=exc.message,
+        action=exc.action,
+    )
+    if getattr(exc, "then", None):
+        result["then"] = exc.then
+    return getattr(exc, "exit_code", None)
 
 
 if __name__ == "__main__":
