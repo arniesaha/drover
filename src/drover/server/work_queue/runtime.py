@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import threading
+from urllib.parse import quote
 
 from drover.server.harness.models import TERMINAL_SESSION_STATUSES
 from drover.server.harness.registry import HarnessRegistry
@@ -108,7 +109,7 @@ class HarnessBridge:
         return None
 
     def existing_session(self, session_id, turn_id, repo):
-        """Read one pre-existing completed session without changing its key.
+        """Read one pre-existing settled session without changing its key.
 
         Existing sessions predate the coordinator and therefore cannot safely
         be made to satisfy ``resolve(run_key)`` by rewriting their client ID.
@@ -121,15 +122,64 @@ class HarnessBridge:
             return None
         owner, name = repo.split("/", 1)
         session = self.registry.get_session(session_id)
-        if (
-            session is None
-            or session.status != "completed"
-            or session.repo_owner != owner
-            or session.repo_name != name
-            or not self.registry.has_successfully_completed_turn(session_id, turn_id)
-        ):
+        if session is None or session.repo_owner != owner or session.repo_name != name:
             return None
-        return session
+        if session.status == "completed":
+            return (
+                session
+                if self.registry.has_successfully_completed_turn(session_id, turn_id)
+                else None
+            )
+        if (
+            session.status == "running"
+            and session.mode == "structured"
+            and self.registry.has_successfully_completed_resumable_turn(
+                session_id, turn_id, harness=session.harness
+            )
+            and self._resumable_session_is_idle(session)
+        ):
+            return session
+        return None
+
+    def _resumable_session_is_idle(self, session):
+        """Read the owning daemon's narrow live-turn fact for a parked session.
+
+        A structured session remains ``running`` between turns.  Its durable
+        result records what happened, but only the owning daemon can confirm
+        that it has released that exact session's turn.  An unavailable or
+        malformed response is deliberately not equivalent to idle.
+        """
+        host = next(
+            (
+                candidate
+                for candidate in self.registry.list_hosts()
+                if candidate.host_id == session.host_id and candidate.liveness().usable
+            ),
+            None,
+        )
+        if host is None:
+            return False
+        try:
+            status, body = self.collector._harness_request(
+                host,
+                "/sessions/" + quote(session.session_id, safe=""),
+                method="GET",
+                timeout_s=10,
+            )
+            if status != 200:
+                return False
+            row = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(row, dict)
+            and row.get("session_id") == session.session_id
+            and row.get("harness") == session.harness
+            and row.get("status") == "running"
+            and row.get("mode") == "structured"
+            and row.get("awaiting") == "input"
+            and row.get("turn_active") is False
+        )
 
     def _require_bound_work_continuity(self, session, run_key):
         """Reject a coordinator session that lacks its immutable ledger.

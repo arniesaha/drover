@@ -71,12 +71,15 @@ never sends another launch request.
 
 `bind_existing` is a coordinator-only, exact-GitHub-pilot operation. It has
 only `goal_id` and `number`; reviewed server configuration, never its caller,
-selects a completed work session/turn and a distinct completed verifier
-session/turn. It does not alter either session's `client_session_id`, launch a
-replacement, or apply to `local_file`. The service reads their retained
-repository identity and successful terminal turns, pins deterministic work and
-verify links, and rechecks both before an acceptance request. Its precise
-configuration and error contract is in the
+selects a settled work session/turn and a distinct settled verifier session/turn.
+It does not alter either session's `client_session_id`, launch a replacement,
+or apply to `local_file`. A lifetime-completed session uses its exact successful
+terminal exit. A supported structured session may remain `running` only when
+its exact durable input/result window and the owning daemon's idle-turn fact
+both pass; routine `awaiting` state is never enough. The service reads their
+retained repository identity, pins deterministic work and verify links, and
+rechecks both before an acceptance request. Its precise configuration and error
+contract is in the
 [pilot contract](../operations/github-acceptance-pilot.md#existing-session-reuse).
 
 `update(action="complete")` schedules a separate verify run and leaves the issue
