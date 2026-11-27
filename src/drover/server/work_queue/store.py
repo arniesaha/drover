@@ -121,6 +121,66 @@ class WorkStore:
             raise ValueError("stored work coordinator binding is invalid")
         return persisted
 
+    def bind_existing_session(self, actor, ref, request_key, link_id, binding):
+        """Append one immutable owner-reviewed existing-session reference.
+
+        ``decision_events`` is append-only and already scopes a record to an
+        execution link.  Keeping this binding there avoids reinterpreting the
+        signed local-file launch envelope or requiring a schema change.
+        """
+        if not isinstance(binding, dict):
+            raise ValueError("existing session binding must be an object")
+        encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+        if len(encoded) > 4096:
+            raise ValueError("existing session binding is too large")
+        events = self.events(request_key)
+        if events:
+            if len(events) != 1:
+                raise ValueError("existing session binding conflict")
+            event = events[0]
+            if (
+                event["event_kind"] != "policy"
+                or event["action_category"] != "bind_existing_session"
+                or event["outcome"] != "bound"
+                or event["provider_operation_id"] != encoded
+                or event["execution_link_id"] != link_id
+            ):
+                raise ValueError("existing session binding conflict")
+            return binding
+        self.event(
+            actor,
+            ref,
+            request_key,
+            "policy",
+            "bind_existing_session",
+            outcome="bound",
+            operation_id=encoded,
+            link_id=link_id,
+        )
+        return binding
+
+    def existing_session_binding(self, request_key, link_id):
+        events = self.events(request_key)
+        if not events:
+            return None
+        if len(events) != 1:
+            raise ValueError("existing session binding conflict")
+        event = events[0]
+        if (
+            event["event_kind"] != "policy"
+            or event["action_category"] != "bind_existing_session"
+            or event["outcome"] != "bound"
+            or event["execution_link_id"] != link_id
+        ):
+            raise ValueError("stored existing session binding is invalid")
+        try:
+            binding = json.loads(event["provider_operation_id"])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored existing session binding is invalid") from exc
+        if not isinstance(binding, dict):
+            raise ValueError("stored existing session binding is invalid")
+        return binding
+
     def associate(self, run_key, session_id, pr_ref=None):
         with self.connection() as con:
             con.execute(

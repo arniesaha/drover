@@ -24,6 +24,7 @@ def control_call(url, headers, operation, args):
         "get",
         "launch",
         "link",
+        "bind_existing",
         "update",
         "question",
         "decide",

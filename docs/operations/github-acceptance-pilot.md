@@ -54,6 +54,54 @@ owner_id = 81
 amendment_record = "Initial independently reviewed contract"
 ```
 
+## Existing-session reuse
+
+The normal `launch` and `link` path remains unchanged: it only resolves a
+queue-created `client_session_id`. A narrow recovery path is available only
+when an exact installed GitHub profile has a separate reviewed binding. It is
+for a retained completed work session and a separate completed verifier session
+that predate their queue links; it never rewrites either session identity.
+
+```toml
+[work_queue.goals.github_existing_session_bindings."1024"]
+# SHA-256 revision of the complete profile above; do not change that profile
+# after its check output was published.
+profile_revision = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# Current configured PR head read during the bind and again at verdict.
+source_head = "0123456789abcdef0123456789abcdef01234567"
+work_session_id = "retained-work-session"
+work_turn_id = "retained-work-turn"
+verifier_session_id = "retained-verifier-session"
+verifier_turn_id = "retained-verifier-turn"
+```
+
+The map key must name an installed profile and its `profile_revision` must
+match. Each retained session must have the goal repository's stored owner/name,
+`status=completed`, and a named durable input turn with a successful terminal
+result. The session IDs must differ. `running`, `created`/queued, failed,
+missing, wrong-repository, or ambiguous records fail closed; `awaiting: input`
+alone never qualifies. The issue key/profile revision bind the pair to the exact
+issue; `source_head` binds it to the configured PR source. The binding is stored
+as one append-only, link-keyed `bind_existing_session` policy event for each
+generated link. Historical links without that event remain unchanged; the
+existing signed local-file continuity envelope is not reused or overwritten.
+
+With the issue in its ordinary `status:review` state, a coordinator calls:
+
+```json
+POST /work/bind_existing
+{"goal_id":"reviewed-goal","number":1024}
+```
+
+The request contains no session, turn, run key, source, or evidence fields.
+Success returns `200` with deterministic `work` and `verify` links. A repeat
+returns those same link identities and never launches a session. Missing or
+uninstalled bindings return 403; stale-source, unready-label, or nonterminal
+retained records return 400; an incompatible or malformed stored link returns
+409 for inspection. The regular `verified` request remains required and
+rechecks retained turns, profile/criteria source, provider evidence, required
+checks, and close idempotency.
+
 The checked issue must contain exactly one marked section whose trimmed contents
 equal `criteria`:
 
@@ -194,6 +242,7 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | A changed retained result cannot replace the reviewed observation | [`test_changed_behavioral_result_at_final_boundary_cannot_close`](../../tests/test_work_queue_github_acceptance.py) |
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
+| Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_binding_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |
 

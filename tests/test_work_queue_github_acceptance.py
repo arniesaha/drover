@@ -4,13 +4,22 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from test_work_queue_execution import complete, launch, service, update  # noqa: F401
+from test_work_queue_execution import (  # noqa: F401
+    ACTOR,
+    complete,
+    launch,
+    service,
+    update,
+)
 from test_work_queue_github import Response
 
+from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
 from drover.server.work_queue.github import GitHubProvider
+from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import identity
 
 SHA = "a" * 40
@@ -167,6 +176,47 @@ def independent_verdict(service, verify):
     return update(service, verify, "verified", evidence_key="check-run:7")
 
 
+def existing_binding(profile, **changes):
+    binding = {
+        "profile_revision": GitHubAcceptanceProfile.model_validate(profile).revision,
+        "source_head": SHA,
+        "work_session_id": "existing-work-session",
+        "work_turn_id": "existing-work-turn",
+        "verifier_session_id": "existing-verify-session",
+        "verifier_turn_id": "existing-verify-turn",
+    }
+    binding.update(changes)
+    return binding
+
+
+def existing_pilot(service, monkeypatch, binding):
+    monkeypatch.setenv("TEST_TOKEN", "synthetic")
+    profile = independent_profile()
+    config = service.config.goals[0].model_dump()
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["github_existing_session_bindings"] = {"1": binding}
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    scope = GoalScope.model_validate(config)
+    service.config = service.config.model_copy(update={"goals": [scope]})
+    client = GitHub()
+    service.providers["goal"] = GitHubProvider(
+        service.config.workspace_id, scope, session=client
+    )
+    for session_id, turn_id in (
+        (binding["work_session_id"], binding["work_turn_id"]),
+        (binding["verifier_session_id"], binding["verifier_turn_id"]),
+    ):
+        service.harness.existing_sessions[(session_id, turn_id)] = SimpleNamespace(
+            session_id=session_id,
+            parent_session_id=None,
+            status="completed",
+            repo="example/project",
+            turn_completed=True,
+            host_id="host",
+        )
+    return client
+
+
 def test_provider_evidence_and_owner_review_close_once_despite_routine_notes(
     service, monkeypatch
 ):
@@ -192,6 +242,251 @@ def test_explicit_independent_check_profile_does_not_require_human_review(
     assert independent_verdict(service, verify) == {"outcome": "verified"}
     assert client.closed == 1
     assert not any("/reviews/" in path for _, path in client.reads)
+
+
+def test_existing_completed_sessions_bind_once_without_relaunch(service, monkeypatch):
+    profile = independent_profile()
+    client = existing_pilot(service, monkeypatch, existing_binding(profile))
+
+    bound = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+
+    assert [row["run_role"] for row in bound["links"]] == ["work", "verify"]
+    assert [row["session_id"] for row in bound["links"]] == [
+        "existing-work-session",
+        "existing-verify-session",
+    ]
+    assert service.harness.calls == []
+    repeated = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    assert [(row["id"], row["run_key"]) for row in repeated["links"]] == [
+        (row["id"], row["run_key"]) for row in bound["links"]
+    ]
+    binding_events = [
+        event
+        for link in bound["links"]
+        for event in service.store.events(
+            identity(link["run_key"], "bind-existing-session")
+        )
+    ]
+    assert [
+        (event["event_kind"], event["action_category"], event["outcome"])
+        for event in binding_events
+    ] == [
+        ("policy", "bind_existing_session", "bound"),
+        ("policy", "bind_existing_session", "bound"),
+    ]
+    assert {event["execution_link_id"] for event in binding_events} == {
+        link["id"] for link in bound["links"]
+    }
+
+    client.evidence = dict(
+        id=7,
+        head_sha=SHA,
+        name="owner-journey",
+        app={"id": 42},
+        external_id=profile_revision(profile),
+        status="completed",
+        conclusion="success",
+        output={"summary": "journey passed", "text": "negative control failed"},
+    )
+    verify = bound["links"][1]
+    assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert client.closed == 1
+
+
+def profile_revision(profile):
+    return GitHubAcceptanceProfile.model_validate(profile).revision
+
+
+@pytest.mark.parametrize(
+    "change,error",
+    [
+        ({"source_head": "b" * 40}, "source changed"),
+    ],
+)
+def test_existing_session_binding_rejects_wrong_reviewed_contract(
+    service, monkeypatch, change, error
+):
+    profile = independent_profile()
+    client = existing_pilot(service, monkeypatch, existing_binding(profile, **change))
+
+    with pytest.raises((ValueError, RuntimeError), match=error):
+        service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+
+    assert service.store.links() == []
+    assert client.closed == 0
+
+
+@pytest.mark.parametrize(
+    "change,error",
+    [
+        ({"profile_revision": "0" * 64}, "profile revision"),
+        ({"verifier_session_id": "existing-work-session"}, "separate"),
+    ],
+)
+def test_existing_session_binding_rejects_invalid_installed_contract(
+    service, monkeypatch, change, error
+):
+    from pydantic import ValidationError
+
+    profile = independent_profile()
+    with pytest.raises(ValidationError, match=error):
+        existing_pilot(service, monkeypatch, existing_binding(profile, **change))
+
+
+@pytest.mark.parametrize("change", ["wrong_repo", "active", "queued", "missing_turn"])
+def test_existing_session_binding_requires_terminal_persisted_sessions(
+    service, monkeypatch, change
+):
+    profile = independent_profile()
+    binding = existing_binding(profile)
+    client = existing_pilot(service, monkeypatch, binding)
+    session = service.harness.existing_sessions[
+        (binding["work_session_id"], binding["work_turn_id"])
+    ]
+    if change == "wrong_repo":
+        session.repo = "other/project"
+    elif change == "active":
+        session.status = "running"
+    elif change == "queued":
+        session.status = "created"
+    else:
+        session.turn_completed = False
+
+    with pytest.raises(ValueError, match="existing work session"):
+        service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+
+    assert service.store.links() == []
+    assert client.closed == 0
+
+
+def test_existing_session_binding_rechecks_terminal_provenance_at_verdict(
+    service, monkeypatch
+):
+    profile = independent_profile()
+    binding = existing_binding(profile)
+    client = existing_pilot(service, monkeypatch, binding)
+    verify = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)[
+        "links"
+    ][1]
+    client.evidence = dict(
+        id=7,
+        head_sha=SHA,
+        name="owner-journey",
+        app={"id": 42},
+        external_id=profile_revision(profile),
+        status="completed",
+        conclusion="success",
+        output={"summary": "journey passed", "text": "negative control failed"},
+    )
+    service.harness.existing_sessions[
+        (binding["verifier_session_id"], binding["verifier_turn_id"])
+    ].turn_completed = False
+
+    with pytest.raises(ValueError, match="existing verification session"):
+        independent_verdict(service, verify)
+
+    assert client.closed == 0
+
+
+def test_existing_session_reader_requires_exact_persisted_terminal_turn(
+    pg_control_path,
+):
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+
+    def session(name):
+        registry.create_session(
+            session_id=name,
+            host_id="fixture",
+            harness="codex",
+            command="codex",
+            status="completed",
+            repo_owner="example",
+            repo_name="project",
+        )
+
+    def input_turn(name, turn):
+        registry.append_event(
+            session_id=name, event_type="user_input", payload={"turn_id": turn}
+        )
+
+    def terminal_turn(name, turn, exited):
+        registry.append_event(
+            session_id=name,
+            event_type="status",
+            payload={"turn_id": turn, "payload": {"exited": exited}},
+        )
+
+    session("existing-registry-session")
+    input_turn("existing-registry-session", "retained-turn")
+    terminal_turn("existing-registry-session", "retained-turn", 0)
+    assert (
+        bridge.existing_session(
+            "existing-registry-session", "retained-turn", "example/project"
+        ).session_id
+        == "existing-registry-session"
+    )
+    assert (
+        bridge.existing_session(
+            "existing-registry-session", "wrong-turn", "example/project"
+        )
+        is None
+    )
+
+    # A newer queued or active input invalidates the older terminal result,
+    # even while a stale session row still says completed.
+    input_turn("existing-registry-session", "newer-queued-or-active-turn")
+    assert (
+        bridge.existing_session(
+            "existing-registry-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-failed-session")
+    input_turn("existing-failed-session", "retained-turn")
+    terminal_turn("existing-failed-session", "retained-turn", 1)
+    assert (
+        bridge.existing_session(
+            "existing-failed-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-missing-status-session")
+    input_turn("existing-missing-status-session", "retained-turn")
+    assert (
+        bridge.existing_session(
+            "existing-missing-status-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-missing-input-session")
+    terminal_turn("existing-missing-input-session", "retained-turn", 0)
+    assert (
+        bridge.existing_session(
+            "existing-missing-input-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-completed-only-session")
+    assert (
+        bridge.existing_session(
+            "existing-completed-only-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+    assert (
+        bridge.existing_session(
+            "existing-registry-session", "retained-turn", "other/project"
+        )
+        is None
+    )
 
 
 def test_independent_check_mode_still_requires_configured_producer(
