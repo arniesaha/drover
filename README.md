@@ -22,17 +22,36 @@ It does not require a Drover cloud service.
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/screenshots/ios-fleet.png" alt="Drover fleet view with active sessions and provider capacity" width="160">
-  <img src="docs/assets/screenshots/ios-launch.png" alt="Drover new session controls" width="160">
-  <img src="docs/assets/screenshots/ios-cockpit.png" alt="Drover cockpit view with observed activity and busiest projects" width="160">
-  <img src="docs/assets/screenshots/ios-analytics.png" alt="Drover analytics view with provider capacity and observed usage" width="160">
+  <img src="docs/assets/screenshots/2026-11-26/ios-home-idle-fixture.png" alt="Native Home idle state showing one synthetic Fixture Mac and no running work" width="200">
+  <img src="docs/assets/screenshots/2026-11-26/ios-configuration-findings-fixture.png" alt="Configuration review with an explicitly labelled model-judgment fixture finding" width="200">
+  <img src="docs/assets/screenshots/2026-11-26/ios-configuration-setup-fixture.png" alt="Optional configuration review setup distinguishing permissions from verified readiness" width="200">
 </p>
 
-The dark-mode fleet view groups live work by host and keeps provider capacity
-within reach. The launch sheet selects a host and harness, checks
-authentication, and carries model and reasoning preferences into a new
-session. The cockpit summarizes observed activity and projects, while
-Analytics expands provider-reported quota windows and usage distributions.
+Native iOS simulator captures from November 26, 2026 (UTC), using synthetic
+fixtures. Home shows idle work; optional Configuration review separates model
+suggestions from confirmed faults and permission from readiness. These are UI
+illustrations, not live fleet metrics, production AI results, or outcome
+acceptance evidence. The illustrated application source matches the reviewed
+`7133442d` baseline; see [capture provenance](docs/assets/screenshots/2026-11-26/README.md).
+
+## From sessions to outcomes
+
+The product direction is a durable, self-hostable execution and orchestration
+layer whose harnesses and clients can be replaced. Success means an intended
+result was independently verified, not that a session ended, a ticket closed,
+or tokens were consumed. This is a direction, not a claim that every harness
+already delivers autonomous end-to-end outcomes.
+
+Today Drover provides host-local execution, capability-based adapters, durable
+context, and bounded work coordination. Configured native-owner `local_file`
+canaries have a separate verification and acknowledgement path. Real
+GitHub-backed work still needs an integration owner to review the result,
+resolve authoritative CI evidence and decide acceptance. OpenClaw collection
+is not a launch adapter; Grokbot orchestration and a managed cloud service are
+not established integrations.
+
+Read [Outcome delivery: current boundaries and acceptance](docs/outcome-delivery.md)
+for what is implemented, what an owner must verify, and what remains a target.
 
 ## How it works
 
@@ -183,6 +202,7 @@ device signing, and server configuration.
 ## Documentation
 
 - [Getting Started](docs/getting-started.md)
+- [Outcome Delivery](docs/outcome-delivery.md)
 - [Architecture](docs/architecture.md)
 - [Harness Adapter Architecture](docs/harness-adapter-architecture.md)
 - [ADR 0001: Harness Adapter Capability Registry](docs/adr/0001-harness-adapter-capability-registry.md)

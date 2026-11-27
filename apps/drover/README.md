@@ -242,3 +242,13 @@ chat starts the deterministic stream again. The **Long streaming transcript**
 SwiftUI preview uses the same fixture. `LongStreamingTranscriptFixtureTests`
 checks paging and live events; the accessibility UI suite captures the approval
 and recovery actions at the largest text size.
+
+## Documentation screenshots
+
+The [November 26 native capture set](../../docs/assets/screenshots/2026-11-26/README.md)
+records exact source commits, XCUITest attachments, fixture status and image
+hashes. Use those captions when reusing the images. UI fixtures demonstrate
+presentation, not production model availability, physical-device acceptance or
+successful autonomous delivery. The app is a client of Drover's execution and
+context services, not the authority that accepts a completed work item; see
+[Outcome delivery](../../docs/outcome-delivery.md).

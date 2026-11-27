@@ -9,6 +9,22 @@ serving backend.
 
 ![Drover architecture](drover-architecture.png)
 
+## Execution, orchestration, and acceptance
+
+The host daemon owns process execution and local filesystem authority. The hub
+owns durable work/context and routing; an authenticated client or integration
+owner drives orchestration within its granted scope. A harness adapter is an
+execution boundary, not a replacement for work state or acceptance policy.
+Collecting events from another agent system does not grant it launch support.
+
+A terminal process status is not an accepted outcome. The separate native-owner
+work → verify → acknowledge flow is currently bounded to configured `local_file`
+canaries; GitHub-backed work has separate integration-owner responsibilities.
+See [Outcome delivery](outcome-delivery.md) and the authoritative
+[verified flow boundaries](operations/verified-event-path-boundaries.md).
+Cloud placement, new orchestration clients and general cross-harness recovery
+must each be demonstrated rather than inferred from this component separation.
+
 ## Command Plane
 
 The command plane carries live fleet operations:
@@ -28,7 +44,8 @@ the authority for processes and filesystem access on its machine.
 Drive-capable harnesses resolve through a registered adapter contract. Hosts
 and the central hub publish a bounded, versioned capability envelope (schema v1,
 #418) in `/capabilities`, `/harness` and `/harness/hosts`; web and iOS controls
-are moving onto it (#419, #420) and today still use the legacy `enabled` flag.
+use capability-driven decisions (#419, #420), with fail-closed mixed-version
+behavior described in the adapter reference.
 Collection remains a separate context-plane boundary: observing a harness does
 not make it a launch target. See [Harness Adapter Architecture](harness-adapter-architecture.md)
 and [ADR 0001](adr/0001-harness-adapter-capability-registry.md).
