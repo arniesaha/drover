@@ -153,3 +153,37 @@ def test_real_outbox_preserves_checkpoint_on_retry_without_duplicate_effect(tmp_
     assert after_ack["wake_id"] == first["wake_id"]
     assert hub.consume(key, **args) is None
     assert hub.status(key)["wake_counts"] == {"acknowledged": 1}
+
+
+def test_future_receipt_cannot_postpone_recovery_or_mint_another_wake():
+    value = facts()
+    before = decide(value, NOW, POLICY)
+    value["advancement"].append(
+        {"ref": "commit:future", "at": (NOW + timedelta(days=365)).isoformat()}
+    )
+    assert decide(value, NOW, POLICY) == before
+    value["advancement"] = value["advancement"][-1:]
+    assert decide(value, NOW, POLICY).action == "nudge"
+    value["advancement"] = [
+        {"ref": "commit:recent", "at": (NOW - timedelta(minutes=1)).isoformat()}
+    ]
+    assert decide(value, NOW, POLICY).action == "none"
+
+
+def test_retry_cannot_replace_original_checkpoint_before_consume(tmp_path):
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    hub = ContinuityHub(path, clock=lambda: NOW)
+    value = facts()
+    original = deepcopy(value["recovery"])
+    key = "pilot/repo#1024"
+    first = hub.decide(issue_key=key, facts=value, now=NOW, policy=POLICY)
+    value["recovery"]["checkpoint"] = "unsubstantiated changed checkpoint"
+    value["recovery"]["next_action"] = "different action without new advancement"
+    repeated = hub.decide(issue_key=key, facts=value, now=NOW, policy=POLICY)
+    assert repeated["wake_id"] == first["wake_id"]
+    lease = hub.lease(key, owner_id="credential:pilot-owner", lease_seconds=60)
+    args = {"owner_id": "credential:pilot-owner", "owner_epoch": lease["owner_epoch"]}
+    delivery = hub.consume(key, **args)
+    assert delivery["payload"]["facts"]["recovery"] == original
+    assert hub.status(key)["wake_counts"] == {"delivered": 1}

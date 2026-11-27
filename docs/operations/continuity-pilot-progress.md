@@ -74,3 +74,21 @@ compatibility, and a real disposable control-store outbox lease/consume/ack
 retry retaining scope/checkpoint/result with one durable effect. These are
 bounded product-path regressions, not a live GitHub accepted outcome or an
 OpenClaw owner-delivery acceptance claim.
+
+
+## Projection and retry invariants
+
+Future-dated advancement receipts are ignored for both the progress clock and
+recovery identity until their provider time is reached. They cannot suppress
+an otherwise due recovery. A supported caller must pin this opt-in policy for
+one issue; switching between legacy and substantive modes is not an idempotent
+retry and may generate separate identities. Changing policy is not a recovery
+mechanism.
+
+A retry with the same advancement refs preserves the first committed recovery
+packet even if the caller submits a different checkpoint or next action before
+consumption. A genuinely new checkpoint needs a new verified advancement ref.
+The ref field remains an authenticated projection trust boundary: string prefixes
+cannot prove that a receipt is substantive. The bounded client must resolve and
+pin actual commit/artifact identities and original times, never invent new refs
+from status, check runs, comments, or poll times.

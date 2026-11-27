@@ -468,6 +468,12 @@ def decide(
     policy = normalize_policy(policy)
     labels = list(facts.get("labels") or [])
     stage = _stage(labels)
+    if policy.require_advancement:
+        # Provider clock skew must not postpone recovery or mint a new wake.
+        # Ignore future receipts consistently in both the clock and identity.
+        facts["advancement"] = [
+            entry for entry in facts["advancement"] if _time(entry["at"]) <= now
+        ]
 
     def decision(action: str, reason: str | None = None) -> Decision:
         return _decision(
