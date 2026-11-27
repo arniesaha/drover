@@ -4,6 +4,7 @@
   "source": "5202c2359483a58b2916c58acac5f11ee2df20b8",
   "tests": 36,
   "skipped": 0,
+  "unknown_quota_admission_direct": false,
   "owner_heldout_seed_rejected": true,
   "profile_schema_valid": true,
   "review_mode": "independent_check",

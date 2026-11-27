@@ -22,19 +22,23 @@ assert profile["pull_number"] == 1029 and profile["app_id"] == 15368
 assert profile["review_mode"] == "independent_check"
 assert "owner_id" not in profile
 assert proof["source"] == PIN and proof["passed"] is True
-assert len(proof["commands"]) == 3 and all(
+assert len(proof["commands"]) == 4 and all(
     item["returncode"] == 0 for item in proof["commands"]
 )
 assert proof["counts"]["tests"] == 36 and all(
     proof["counts"][k] == 0 for k in ("skipped", "errors", "failures")
 )
+assert proof["unknown_quota_admission"] == {
+    "denied": True,
+    "reason": "quota or capability unavailable",
+}
 # GitHubAcceptanceProfile.model_dump() retains this optional field as null.
 # Match that canonical server-side revision without importing candidate code.
 revision_profile = dict(profile, owner_id=None)
 revision = hashlib.sha256(
     json.dumps(revision_profile, sort_keys=True).encode()
 ).hexdigest()
-summary = "Independently executed pinned quota/control proof: 36 tests, zero failures/errors/skips; strict boundary and held-out forbidden-import rejection passed. Arnab's installation decision and required exact-head CI remain separate."
+summary = "Independently executed pinned quota/control proof: 36 tests, zero failures/errors/skips; strict boundary, held-out forbidden-import rejection, and direct unknown-quota route denial passed. Arnab's installation decision and required exact-head CI remain separate."
 text = json.dumps(proof, sort_keys=True, indent=2)
 assert len(text.encode()) < 40000
 payload = dict(
