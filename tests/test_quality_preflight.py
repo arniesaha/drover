@@ -113,8 +113,15 @@ def stub_python(
 
 def run(capsys, argv, path=GIT_DIR):
     code = preflight.main([str(a) for a in argv], path=path)
-    lines = capsys.readouterr().out.strip().splitlines()
-    return code, json.loads(lines[-1])
+    captured = capsys.readouterr()
+    result = json.loads(captured.out.strip().splitlines()[-1])
+    if result["classification"] != "pass":
+        # Diagnostic contract: every failure names its item, cause and a
+        # concrete next step, in the JSON and on stderr.
+        assert result["check"] and result["message"]
+        assert len(result["action"].strip()) >= 20, result
+        assert result["action"] in captured.err
+    return code, result
 
 
 def base_args(repo: Path, out: Path, python: Path) -> list:
@@ -295,6 +302,97 @@ def test_stale_receipt_cannot_certify_new_source(capsys, repo, out, tmp_path):
     )
     assert (code, result["check"]) == (3, "receipt")
     assert "head" in result["message"] and "lock_sha256" in result["message"]
+
+
+def test_wrong_head_receipt_names_values_and_safe_rerun(capsys, repo, out, tmp_path):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    old_head = _git(repo, "rev-parse", "HEAD")
+    _, first = run(capsys, base_args(repo, out, py))
+    (repo / "src" / "drover" / "__init__.py").write_text("# moved\n")
+    _git(repo, "commit", "-qam", "move head")
+    new_head = _git(repo, "rev-parse", "HEAD")
+    receipt_bytes = Path(first["receipt"]).read_bytes()
+    marker = tmp_path / "expensive-ran"
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            first["receipt"],
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+    )
+    # Unchanged classification, exit code and fail-fast behaviour.
+    assert (code, result["classification"], result["check"]) == (
+        3,
+        "environment_unavailable",
+        "receipt",
+    )
+    assert "differs in ['head']" in result["message"]
+    assert f"receipt={old_head}" in result["message"]
+    assert f"current={new_head}" in result["message"]
+    assert not marker.exists()
+    # Concrete and safe: rerun canonical preflight, never edit or relax gates.
+    action = result["action"]
+    assert "Check out the intended source" in action
+    assert "Rerun scripts/quality/preflight.sh without --verify-receipt" in action
+    assert "Do not edit or reuse this receipt" in action
+    assert "do not drop --verify-receipt or --expect-base" in action
+    assert Path(first["receipt"]).read_bytes() == receipt_bytes
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", '{"created_at": "x"}'])
+def test_unreadable_receipt_is_classified_with_rerun_action(
+    capsys, repo, out, tmp_path, content
+):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    bad = tmp_path / "bad-receipt.json"
+    bad.write_text(content)
+    marker = tmp_path / "expensive-ran"
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            bad,
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+    )
+    assert (code, result["check"]) == (3, "receipt")
+    assert "cannot read receipt" in result["message"]
+    assert result["action"] == preflight.RERUN_ACTION
+    assert not marker.exists()
+
+
+def test_aged_receipt_reports_age_and_rerun_action(capsys, repo, out, tmp_path):
+    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
+    _, first = run(capsys, base_args(repo, out, py))
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--verify-receipt",
+            first["receipt"],
+            "--max-receipt-age",
+            "-1",
+        ],
+    )
+    assert (code, result["check"]) == (3, "receipt")
+    assert "older than --max-receipt-age -1s" in result["message"]
+    assert result["action"] == preflight.RERUN_ACTION
+
+
+def test_failure_without_action_cannot_be_constructed():
+    with pytest.raises(TypeError):
+        preflight.Failure(preflight.ENV, "x", "message")
+    with pytest.raises(ValueError):
+        preflight.Failure(preflight.ENV, "x", "message", "  ")
 
 
 @pytest.mark.parametrize(

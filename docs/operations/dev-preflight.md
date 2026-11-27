@@ -38,7 +38,16 @@ Without `--then` the preflight only checks and writes its receipt.
 ## Classification and exit codes
 
 The last stdout line is one JSON object; stderr gets one redacted, actionable
-line on failure.
+line on failure. Every failure from `preflight.py` carries three fields:
+
+- `check`: the failing item;
+- `message`: the cause, with the receipt and current values for a receipt
+  mismatch;
+- `action`: a non-empty, concrete next step. A failure cannot be constructed
+  without one.
+
+The `bootstrap_interpreter` failure from `preflight.sh` prints its next step
+on stderr only.
 
 | exit | classification | meaning |
 |---|---|---|
@@ -115,6 +124,14 @@ It records no environment dump, DSN or secret. `--verify-receipt PATH` refuses
 The receipt must also be newer than `--max-receipt-age` (default 3600 s). A
 stale receipt cannot certify a new source, interpreter or a different PG
 fixture.
+
+All three receipt failures (unreadable, mismatched and too old) exit 3 with
+`check: receipt`, and `--then` does not run. Their action is always the same
+safe remediation. Don't edit or reuse the receipt, and don't drop
+`--verify-receipt`, `--expect-base` or the `--pg-expect-*` flags. Instead,
+first check out the intended source, interpreter or fixture. Then rerun
+`scripts/quality/preflight.sh` without `--verify-receipt` to write a new
+receipt, and verify against that one.
 
 ## Integration recipe (for the parent, after merge)
 
