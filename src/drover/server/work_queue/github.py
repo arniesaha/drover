@@ -313,13 +313,15 @@ class GitHubProvider:
     def acceptance_facts(self, ref, evidence_key):
         source = self.acceptance_source(ref)
         profile = self.scope.github_acceptance_profiles[str(ref.number)]
-        match = re.fullmatch(
-            r"check-run:([1-9][0-9]{0,18}):review:([1-9][0-9]{0,18})",
-            evidence_key or "",
+        pattern = (
+            r"check-run:([1-9][0-9]{0,18}):review:([1-9][0-9]{0,18})"
+            if profile.review_mode == "human_approval"
+            else r"check-run:([1-9][0-9]{0,18})"
         )
+        match = re.fullmatch(pattern, evidence_key or "")
         if not match:
             raise ValueError("resolvable provider evidence required")
-        check_id, review_id = map(int, match.groups())
+        check_id = int(match.group(1))
         check = self._request("GET", self.base + f"/check-runs/{check_id}")
         if (
             not isinstance(check, dict)
@@ -333,20 +335,22 @@ class GitHubProvider:
         ):
             raise ValueError("behavioral evidence mismatch or unsuccessful result")
         result = self.behavioral_result(check)
-        review = self._request(
-            "GET", self.base + f"/pulls/{profile.pull_number}/reviews/{review_id}"
-        )
-        if (
-            not isinstance(review, dict)
-            or review.get("id") != review_id
-            or review.get("state") != "APPROVED"
-            or review.get("commit_id") != source["head"]
-            or review.get("user", {}).get("id") != profile.owner_id
-            or review.get("user", {}).get("type") != "User"
-            or "drover-acceptance:" + profile.revision
-            not in (review.get("body") or "").split()
-        ):
-            raise ValueError("independent owner behavioral review required")
+        if profile.review_mode == "human_approval":
+            review_id = int(match.group(2))
+            review = self._request(
+                "GET", self.base + f"/pulls/{profile.pull_number}/reviews/{review_id}"
+            )
+            if (
+                not isinstance(review, dict)
+                or review.get("id") != review_id
+                or review.get("state") != "APPROVED"
+                or review.get("commit_id") != source["head"]
+                or review.get("user", {}).get("id") != profile.owner_id
+                or review.get("user", {}).get("type") != "User"
+                or "drover-acceptance:" + profile.revision
+                not in (review.get("body") or "").split()
+            ):
+                raise ValueError("independent owner behavioral review required")
         checks = self.exact_head_check_state(
             source["head"], source["branch"], facts=True, behavioral_run=check
         )
@@ -359,6 +363,7 @@ class GitHubProvider:
             "required_checks": checks,
             "evidence": evidence_key,
             "behavioral_result": result,
+            "review_mode": profile.review_mode,
         }
 
     @staticmethod

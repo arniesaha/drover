@@ -72,9 +72,10 @@ never sends another launch request.
 open in review. For the default path, acceptance requires that run to finish,
 affirmative behavioral and rerun-check results, an opaque evidence identity,
 and unchanged acceptance criteria. An exact-issue GitHub pilot profile replaces
-caller assertions with provider-resolved PR/head, check-run/output, and
-owner-review facts; its request/response, unavailable, amendment, and
-idempotency behavior are specified in the [pilot contract](../operations/github-acceptance-pilot.md).
+caller assertions with provider-resolved PR/head, check-run/output, and the
+installed profile's human-review or independent-check facts; its
+request/response, unavailable, amendment, and idempotency behavior are
+specified in the [pilot contract](../operations/github-acceptance-pilot.md).
 Work runs and failed behavioral checks cannot close issues. A failure queues
 revision until the configured attempt budget is exhausted, then blocks and
 writes the generated systemic-review comment. Further launches remain blocked

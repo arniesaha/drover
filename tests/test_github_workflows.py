@@ -319,6 +319,28 @@ def load_workflow(name: str) -> dict[str, Any]:
     return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
 
 
+def test_cohort1024_publisher_isolated_from_credential_free_candidate_proof():
+    workflow = load_workflow("cohort1024-independent-quota.yml")
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"proof", "publish"}
+
+    proof = workflow["jobs"]["proof"]
+    publish = workflow["jobs"]["publish"]
+    assert proof["permissions"] == {"contents": "read"}
+    assert publish["permissions"] == {"contents": "read", "checks": "write"}
+    assert publish["needs"] == "proof"
+    assert "github.ref == 'refs/heads/main'" in proof["if"]
+
+    proof_commands = "\n".join(step.get("run", "") for step in proof["steps"])
+    publish_commands = "\n".join(step.get("run", "") for step in publish["steps"])
+    assert "5202c2359483a58b2916c58acac5f11ee2df20b8" in proof_commands
+    assert "GITHUB_TOKEN" not in proof_commands
+    assert "git -C candidate" not in publish_commands
+    assert "candidate/.venv" not in publish_commands
+    assert "publish-check.py" in publish_commands
+
+
 def test_public_pr_workflows_stay_github_hosted() -> None:
     python_ci = load_workflow("ci.yml")
     ios_ci = load_workflow("ios.yml")

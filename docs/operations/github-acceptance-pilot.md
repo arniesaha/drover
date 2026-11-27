@@ -9,7 +9,7 @@ scratch-only focused-test recipe.
 
 The pilot authorizes only a GitHub issue close. It binds that decision to the
 configured PR's current head, a reviewed quality-profile revision, required
-checks, behavioral evidence, and an independent owner review. It does not mean
+checks, behavioral evidence, and that profile's configured verdict mode. It does not mean
 that a worker has finished, a PR has merged, a release has deployed, or a
 continuity owner has acknowledged work. Those are separate states.
 
@@ -48,6 +48,8 @@ criteria = "The selected journey succeeds and its negative control fails."
 instructions = "Run the reviewed journey and negative control; retain actual observations in the check output."
 behavioral_check = "owner-journey"
 app_id = 42
+# Defaults to "human_approval" when omitted.
+review_mode = "human_approval"
 owner_id = 81
 amendment_record = "Initial independently reviewed contract"
 ```
@@ -67,10 +69,16 @@ changing any profile field or the marked criteria changes the binding and
 requires a new separate verification. The profile's `instructions` tell the
 independent producer what to run; the provider never executes them.
 
-An amendment must be independently reviewed before installation and retain an
-explicit `amendment_record` that identifies the prior contract and rationale.
-This increment has no amendment-approval service, no automatic profile editor,
-and no permission for a candidate to weaken its own acceptance condition.
+`human_approval` is the default and requires `owner_id`. An exact installed
+profile may instead set `review_mode = "independent_check"` and omit `owner_id`.
+That mode treats the configured App check as the independently selected verdict
+source; it does not turn an agent result into a GitHub human approval. Arnab may
+review and install either complete profile as the sole human decision-maker.
+
+An amendment must be reviewed before installation and retain an explicit
+`amendment_record` that identifies the prior contract and rationale. This
+increment has no amendment-approval service, no automatic profile editor, and
+no permission for a candidate to weaken its own acceptance condition.
 
 ## Request, response, and failure contract
 
@@ -84,18 +92,21 @@ POST /work/update
   "number": 1024,
   "run_key": "verification-run-key",
   "action": "verified",
-  "evidence_key": "check-run:7:review:8"
+  "evidence_key": "check-run:7"
 }
 ```
 
-`evidence_key` has the fixed `check-run:<positive-id>:review:<positive-id>`
-shape. For opted-in issues, caller-supplied `behavioral_passed` and
-`checks_rerun` values grant no authority; the provider facts below decide the
-verdict. A successful outcome is `200 {"outcome":"verified"}`. Repeating a
-completed request returns the recorded outcome and does not close a second
-time. If a close intent was recorded but its provider result is uncertain, a
-repeat returns `200 {"outcome":"deferred"}`; inspect provider state before a
-human-authorized recovery rather than treating it as a second close.
+For `human_approval`, `evidence_key` has the fixed
+`check-run:<positive-id>:review:<positive-id>` shape. For the explicit
+`independent_check` profile mode, it is exactly `check-run:<positive-id>`.
+Callers cannot choose the mode: the installed complete profile does. For
+opted-in issues, caller-supplied `behavioral_passed` and `checks_rerun` values
+grant no authority; the provider facts below decide the verdict. A successful
+outcome is `200 {"outcome":"verified"}`. Repeating a completed request returns
+the recorded outcome and does not close a second time. If a close intent was
+recorded but its provider result is uncertain, a repeat returns
+`200 {"outcome":"deferred"}`; inspect provider state before a recovery rather
+than treating it as a second close.
 
 The HTTP boundary returns sanitized failures: malformed or stale requests are
 `400 {"error":"invalid work request"}`; caller/role/shadow-mode failures are
@@ -109,7 +120,8 @@ provider, not in the API response or decision audit.
 
 At acceptance, the trusted GitHub adapter reads only fixed API routes in the
 configured repository. It resolves the issue, configured PR, current head,
-base branch protection, and named check/review IDs. It does not fetch arbitrary
+base branch protection, and named check IDs (plus a review ID only for the
+human mode). It does not fetch arbitrary
 URLs or execute shell commands from issue text, profile instructions, or check
 output.
 
@@ -125,8 +137,13 @@ pending, skipped, failed, wrong-App, wrong-head, missing output, and oversized
 output fail closed. The pilot supports up to 100 branch-protection check-run
 contexts; status-only and ruleset-only requirements are outside this increment.
 
-The configured human owner must submit an `APPROVED` review for that same head
-with the exact whitespace-delimited token `drover-acceptance:<profile-revision>`.
+For `human_approval`, the configured human owner must submit an `APPROVED`
+review for that same head with the exact whitespace-delimited token
+`drover-acceptance:<profile-revision>`. For `independent_check`, no review is
+fetched or synthesized: the configured App ID, exact head, profile revision,
+bounded output, and required checks are the provider verdict. This does not
+waive repository branch-protection rules or turn the App's result into a human
+review.
 Source identity is reread during evidence resolution and all provider facts are
 resolved again immediately before the durable close intent. The retained
 `provider_operation_id` is bounded JSON of the resolved source, required-check
@@ -137,15 +154,15 @@ owner reconciliation gate.
 ## Inspecting the retained behavioral result
 
 The evidence key identifies the sole result location: authenticated GitHub
-`GET /repos/<configured-repo>/check-runs/<check-id>`. Before submitting or
-approving a verdict, the independent owner retrieves that fixed route, inspects
+`GET /repos/<configured-repo>/check-runs/<check-id>`. Before submitting a
+verdict, the owner retrieves that fixed route, inspects
 `output.summary` and `output.text`, and confirms that they record the reviewed
 journey and its negative control. The owner then matches the returned run ID,
-head SHA, App ID, and `external_id` to the configured profile revision, and
-matches the review ID to the same head and revision token. After a close intent,
-the recorded result digest and byte count bind the inspected output to that
-decision without copying potentially private output into the control-store
-audit.
+head SHA, App ID, and `external_id` to the configured profile revision. In
+`human_approval` mode, the owner also matches the review ID to the same head and
+revision token. After a close intent, the recorded result digest and byte count
+bind the inspected output to that decision without copying potentially private
+output into the control-store audit.
 
 An output summary can prove that GitHub retained a bounded result, but it cannot
 interpret whether the observations establish the claim. A producer can still
@@ -157,9 +174,9 @@ turn check text into a general evidence DSL or automate producer trust.
 
 | Boundary | Enforced here | Manual owner/producer responsibility |
 | --- | --- | --- |
-| Profile and criteria | exact issue profile, marked criteria match, revision pin, fresh verification | independently review/install profile and amendments; keep candidate access from weakening it |
+| Profile and criteria | exact issue profile, marked criteria match, revision pin, selected review mode, fresh verification | Arnab reviews/installs profiles and amendments; keep candidate access from weakening it |
 | Behavioral result | provider-resolved check identity/status/head/revision, latest-run check, nonempty bounded GitHub output, and output digest | isolate the App/producer, execute the reviewed journey and negative control, retrieve and judge the retained observations |
-| Owner verdict | configured human ID, approval state, exact head, revision token | decide whether observations establish the substantive claim; dismiss/revise obsolete reviews |
+| Verdict mode | human mode: configured human ID, approval state, exact head, revision token; independent mode: configured App check only | decide whether observations establish the substantive claim; never represent an agent result as a human review |
 | Required CI and close | required check IDs/App IDs/current conclusions, final reread, one intent/outcome path | reconcile a GitHub head change after the final read and inspect uncertain provider operations |
 
 `failed` returns the item to revision until the existing policy attempt budget is
@@ -176,6 +193,7 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | Behavioral evidence and required CI fail closed | [`test_mismatched_behavioral_evidence_cannot_close`](../../tests/test_work_queue_github_acceptance.py), [`test_missing_or_unbounded_behavioral_result_cannot_close`](../../tests/test_work_queue_github_acceptance.py), [`test_required_ci_negative_controls`](../../tests/test_work_queue_github_acceptance.py), [`test_older_success_cannot_replace_latest_behavioral_failure`](../../tests/test_work_queue_github_acceptance.py) |
 | A changed retained result cannot replace the reviewed observation | [`test_changed_behavioral_result_at_final_boundary_cannot_close`](../../tests/test_work_queue_github_acceptance.py) |
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
+| Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |
 

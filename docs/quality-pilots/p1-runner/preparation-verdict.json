@@ -6,6 +6,7 @@
   "skipped": 0,
   "owner_heldout_seed_rejected": true,
   "profile_schema_valid": true,
+  "review_mode": "independent_check",
   "profile_deployable": false,
   "live_accepted": 0,
   "producer_installed": false,
