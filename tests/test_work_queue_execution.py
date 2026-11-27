@@ -47,11 +47,24 @@ class Provider:
 class Harness:
     def __init__(self):
         self.sessions = {}
+        self.existing_sessions = {}
         self.calls = []
         self.timeout = False
 
     def resolve(self, key):
         return self.sessions.get(key)
+
+    def existing_session(self, session_id, turn_id, repo):
+        """Test double for the registry-backed existing-session read."""
+        session = self.existing_sessions.get((session_id, turn_id))
+        if (
+            session is None
+            or session.repo != repo
+            or session.status != "completed"
+            or not session.turn_completed
+        ):
+            return None
+        return session
 
     def active(self, links, *, release_finalised=True):
         return [

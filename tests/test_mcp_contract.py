@@ -65,6 +65,7 @@ def test_every_registered_read_enforces_caps(tmp_path, monkeypatch):
             for operation in (
                 "launch",
                 "link",
+                "bind_existing",
                 "update",
                 "question",
                 "decide",

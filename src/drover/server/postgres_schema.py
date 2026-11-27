@@ -47,6 +47,7 @@ WORK_COORDINATOR_LAUNCH_BINDING_MIGRATION = 45
 M2_ACK_PENDING_MIGRATION = 46
 ATTENTION_GENERATION_MIGRATION = 47
 AUDITED_DELEGATION_MIGRATION = 48
+EXISTING_SESSION_BINDING_MIGRATION = 49
 
 #: Released with migration 32 and pinned by hash: never edit, add a version.
 WORKER_STATES_DDL = """
@@ -1137,6 +1138,14 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )
             """,
             "CREATE INDEX IF NOT EXISTS audited_delegations_lookup ON audited_delegations (workspace_id, id, expires_at)",
+        ),
+    ),
+    # Existing-session reuse is opt-in. Legacy links have no retained binding
+    # and therefore cannot be reinterpreted as completed coordinator work.
+    (
+        EXISTING_SESSION_BINDING_MIGRATION,
+        (
+            "ALTER TABLE execution_links ADD COLUMN IF NOT EXISTS existing_session_binding_json TEXT",
         ),
     ),
 )

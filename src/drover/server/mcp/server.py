@@ -202,6 +202,11 @@ def build_mcp_server(
             ),
         )
 
+    @mutation_tool(path="/work/bind_existing")
+    def drover_work_bind_existing(goal_id: str, number: int) -> dict:
+        """Bind the installed exact-issue existing-session pair, if eligible."""
+        return work_call("bind_existing", dict(goal_id=goal_id, number=number))
+
     @mutation_tool(path="/work/question")
     def drover_work_question(
         goal_id: str, number: int, request_key: str, category: str, options: list[str]

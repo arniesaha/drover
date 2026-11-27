@@ -35,6 +35,7 @@ def test_server_registers_all_tools(tmp_path: Path) -> None:
         "drover_continuity_status",
         "drover_work_launch",
         "drover_work_link",
+        "drover_work_bind_existing",
         "drover_work_update",
         "drover_work_question",
         "drover_work_decide",

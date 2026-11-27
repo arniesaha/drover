@@ -14,7 +14,19 @@ Parent #1024; bounded pilot issue #1031; PR #1029 immutable head `5202c2359483a5
 1. Arnab reviews the exact `independent_check` profile and the retrieved check output. The mode deliberately does not create or require a GitHub human approval; an agent output is never recorded as one.
 2. Arnab reviews and, if appropriate, merges the protected-main producer. Its fresh publication job alone has `checks: write`; proof remains credential-free. No attempt was made to mint an App token or alter repository-wide permissions.
 
-After those decisions: amend/hash/review the complete profile keyed to issue1031; review/install the exact producer and profile under existing owner safeguards; run it once; independently retrieve the check output; then use supported work/verifier/coordinator acceptance and verify one-close/retry. Reconcile uncertain publication before any retry. The parent issue must remain open until every cohort criterion, including the orchestration gap, is accepted.
+After those decisions: retain the complete profile keyed to issue1031 unchanged
+so its published check external ID remains
+`a2faaad79483a3d310af06f13dcb97ffeadca3b0ca82fa56742e3f6777558f06`.
+In private reviewed server configuration, add the exact issue1031
+`github_existing_session_bindings` record from retained work and independent
+verifier session/turn IDs plus source head. Do not put session IDs in this
+packet, change a session client ID, or launch replacements. With `status:review`
+and the installed profile, an authorized coordinator calls
+`POST /work/bind_existing` with only the goal and issue; it must return one
+work/verify pair and no launch. Independently retrieve the check output, submit
+the normal `verified` request, and verify one-close/retry. Reconcile uncertain
+publication before any retry. The parent issue must remain open until every
+cohort criterion, including the orchestration gap, is accepted.
 
 ## Structural orchestration verdict - still OPEN
 

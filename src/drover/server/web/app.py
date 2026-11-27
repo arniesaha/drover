@@ -1730,6 +1730,7 @@ class _MetricsHandler(BaseHTTPRequestHandler):
         if path in {
             "/work/launch",
             "/work/link",
+            "/work/bind_existing",
             "/work/update",
             "/work/question",
             "/work/decide",

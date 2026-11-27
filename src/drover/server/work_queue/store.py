@@ -121,6 +121,47 @@ class WorkStore:
             raise ValueError("stored work coordinator binding is invalid")
         return persisted
 
+    def bind_existing_session(self, run_key, binding):
+        """Persist one immutable owner-reviewed existing-session reference."""
+        if not isinstance(binding, dict):
+            raise ValueError("existing session binding must be an object")
+        encoded = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+        with self.connection() as con:
+            row = con.execute(
+                """UPDATE execution_links
+                   SET existing_session_binding_json = COALESCE(
+                         existing_session_binding_json, ?), updated_at = now()
+                 WHERE workspace_id = ? AND run_key = ?
+                   AND (existing_session_binding_json IS NULL
+                        OR existing_session_binding_json = ?)
+                 RETURNING existing_session_binding_json""",
+                [encoded, self.workspace_id, run_key, encoded],
+            ).fetchone()
+        if row is None:
+            raise ValueError("existing session binding conflict")
+        try:
+            persisted = json.loads(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored existing session binding is invalid") from exc
+        if not isinstance(persisted, dict):
+            raise ValueError("stored existing session binding is invalid")
+        return persisted
+
+    def existing_session_binding(self, run_key):
+        rows = self.links(run_key=run_key)
+        if len(rows) != 1:
+            return None
+        raw = rows[0].get("existing_session_binding_json")
+        if raw is None:
+            return None
+        try:
+            binding = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored existing session binding is invalid") from exc
+        if not isinstance(binding, dict):
+            raise ValueError("stored existing session binding is invalid")
+        return binding
+
     def associate(self, run_key, session_id, pr_ref=None):
         with self.connection() as con:
             con.execute(

@@ -206,6 +206,28 @@ class GitHubAcceptanceProfile(Model):
         ).hexdigest()
 
 
+class GitHubExistingSessionBinding(Model):
+    """One owner-reviewed reuse of already completed coordinator sessions.
+
+    This is deliberately outside ``GitHubAcceptanceProfile``: it binds a
+    reviewed profile revision to retained session/turn records without
+    changing the profile's evidence revision after its check has published.
+    """
+
+    profile_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_head: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    work_session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$")
+    work_turn_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$")
+    verifier_session_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$")
+    verifier_turn_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,190}$")
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.work_session_id == self.verifier_session_id:
+            raise ValueError("existing work and verifier sessions must be separate")
+        return self
+
+
 class GoalScope(Model):
     goal_id: str = Field(min_length=1)
     repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -245,6 +267,12 @@ class GoalScope(Model):
     github_acceptance_profiles: dict[str, GitHubAcceptanceProfile] = Field(
         default_factory=dict
     )
+    # An exact owner-reviewed reuse mapping for sessions that predate the
+    # queue link. It is opt-in and keyed to the same exact issue as its
+    # acceptance profile; neither a caller nor a session transcript selects it.
+    github_existing_session_bindings: dict[str, GitHubExistingSessionBinding] = Field(
+        default_factory=dict
+    )
     local_candidates_path: str | None = None
     # Per-item worktrees are local-file-only and must be declared in the
     # server configuration; manifest content cannot choose an arbitrary path.
@@ -282,6 +310,25 @@ class GoalScope(Model):
                 self.credential.capabilities
             ):
                 raise ValueError("GitHub acceptance profiles require provider reads")
+        if self.github_existing_session_bindings:
+            if self.candidate_source != "github" or any(
+                not key.isascii()
+                or not key.isdigit()
+                or str(int(key)) != key
+                or int(key) <= 0
+                for key in self.github_existing_session_bindings
+            ):
+                raise ValueError("existing session bindings require exact issue keys")
+            for key, binding in self.github_existing_session_bindings.items():
+                profile = self.github_acceptance_profiles.get(key)
+                if profile is None:
+                    raise ValueError(
+                        "existing session binding requires an acceptance profile"
+                    )
+                if binding.profile_revision != profile.revision:
+                    raise ValueError(
+                        "existing session binding profile revision mismatch"
+                    )
         if any(part in {".", ".."} for part in self.repo.split("/")):
             raise ValueError("repository traversal is forbidden")
         if bool(self.goal_label) == bool(self.milestone):

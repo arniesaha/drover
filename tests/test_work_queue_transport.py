@@ -242,6 +242,7 @@ def test_mcp_nine_tools_are_thin_control_proxies(
             "get",
             "launch",
             "link",
+            "bind_existing",
             "update",
             "question",
             "decide",

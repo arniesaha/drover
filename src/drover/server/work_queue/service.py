@@ -240,6 +240,7 @@ class WorkService:
                 "get",
                 "launch",
                 "link",
+                "bind_existing",
                 "update",
                 "question",
                 "decide",
@@ -653,6 +654,123 @@ class WorkService:
             pr = f"https://github.com/{ref.repo}/pull/{pr_number}"
         return self.store.associate(run_key, session_id, pr)
 
+    def _existing_session_binding(self, row):
+        binding = self.store.existing_session_binding(row["run_key"])
+        if binding is None:
+            return None
+        required = {
+            "role",
+            "session_id",
+            "turn_id",
+            "profile_revision",
+            "source_head",
+        }
+        if not required <= set(binding) or binding["role"] not in {"work", "verify"}:
+            raise WorkDenied("stored existing session binding is invalid")
+        if (
+            row["run_role"] != binding["role"]
+            or row["session_id"] != binding["session_id"]
+        ):
+            raise WorkDenied("stored existing session binding is invalid")
+        return binding
+
+    def _bound_session(self, scope, row):
+        binding = self._existing_session_binding(row)
+        if binding is None:
+            return self.harness.resolve(row["run_key"])
+        reader = getattr(self.harness, "existing_session", None)
+        if not callable(reader):
+            return None
+        session = reader(binding["session_id"], binding["turn_id"], scope.repo)
+        if session is None or session.session_id != row["session_id"]:
+            return None
+        return session
+
+    def _existing_binding_payload(self, binding, *, role, parent_run_key=None):
+        field_prefix = "verifier" if role == "verify" else role
+        payload = {
+            "role": role,
+            "session_id": getattr(binding, field_prefix + "_session_id"),
+            "turn_id": getattr(binding, field_prefix + "_turn_id"),
+            "profile_revision": binding.profile_revision,
+            "source_head": binding.source_head,
+        }
+        if parent_run_key is not None:
+            payload["parent_run_key"] = parent_run_key
+        return payload
+
+    def bind_existing(self, goal_id, number, *, actor):
+        """Bind one reviewed, completed session pair without launching work.
+
+        Only the installed exact-issue configuration chooses session and turn
+        identifiers. The request deliberately carries neither so a caller
+        cannot attach an arbitrary transcript to a GitHub close decision.
+        """
+        provider, policy, ref, item = self.item(goal_id, number)
+        self.coordinator(actor, policy)
+        scope = next(scope for scope in self.config.goals if scope.goal_id == goal_id)
+        profile = scope.github_acceptance_profiles.get(str(number))
+        binding = scope.github_existing_session_bindings.get(str(number))
+        if profile is None or binding is None:
+            raise PermissionError("existing session binding is not installed")
+        if binding.profile_revision != profile.revision:
+            raise WorkDenied("existing session binding profile revision mismatch")
+        labels = {label["name"] for label in item["labels"]}
+        if policy.labels.status_prefix + "review" not in labels:
+            raise ValueError("item not ready for existing verification")
+        source = self._verification_criteria(provider, ref, item)
+        if source.get("head") != binding.source_head:
+            raise ValueError("acceptance source changed; new verification required")
+        reader = getattr(self.harness, "existing_session", None)
+        if not callable(reader):
+            raise WorkDenied("existing session inspection unavailable")
+        work_session = reader(binding.work_session_id, binding.work_turn_id, scope.repo)
+        if work_session is None:
+            raise ValueError("existing work session lacks terminal provenance")
+        verifier_session = reader(
+            binding.verifier_session_id, binding.verifier_turn_id, scope.repo
+        )
+        if verifier_session is None:
+            raise ValueError("existing verification session lacks terminal provenance")
+        if verifier_session.session_id == work_session.session_id:
+            raise ValueError("existing work and verifier sessions must be separate")
+
+        work_request = identity(
+            "existing-session",
+            binding.profile_revision,
+            binding.source_head,
+            binding.work_session_id,
+            binding.work_turn_id,
+        )
+        work_key = identity(
+            self.config.workspace_id, goal_id, number, work_request, "work"
+        )
+        _, verify_key = verification_identity(
+            self.config.workspace_id, goal_id, number, work_key, source
+        )
+        links = self.store.links(goal_id=goal_id, number=number)
+        if any(link["run_key"] not in {work_key, verify_key} for link in links):
+            raise WorkDenied("existing execution requires inspection")
+        goal_ref = scope.goal_label or f"milestone:{scope.milestone}"
+        work = self.store.intent(
+            actor.principal, ref, goal_id, work_key, "work", 0, goal_ref
+        )
+        self.store.bind_existing_session(
+            work_key, self._existing_binding_payload(binding, role="work")
+        )
+        work = self.store.associate(work_key, work_session.session_id)
+        verify = self.store.intent(
+            actor.principal, ref, goal_id, verify_key, "verify", 0, goal_ref
+        )
+        self.store.bind_existing_session(
+            verify_key,
+            self._existing_binding_payload(
+                binding, role="verify", parent_run_key=work_key
+            ),
+        )
+        verify = self.store.associate(verify_key, verifier_session.session_id)
+        return {"links": [work, verify]}
+
     @staticmethod
     def status(provider, policy, ref, item, status):
         labels = [
@@ -894,7 +1012,7 @@ class WorkService:
             raise PermissionError("execution outside item")
         row = rows[0]
         scope = next(scope for scope in self.config.goals if scope.goal_id == goal_id)
-        session = self.harness.resolve(run_key)
+        session = self._bound_session(scope, row)
         bound_host_verification = self._bound_host_verification_report(
             scope, row, run_key, session, actor
         )
@@ -925,7 +1043,7 @@ class WorkService:
         if action == "complete":
             if row["run_role"] != "work":
                 raise ValueError("verification needs behavioral result")
-            session = self.harness.resolve(run_key)
+            session = self._bound_session(scope, row)
             if session is None:
                 raise ValueError("work session must complete before verification")
             # A bound host may request only its own immutable, signed local
@@ -1035,13 +1153,28 @@ class WorkService:
                     link_id=row["id"],
                 )
                 return {"outcome": "deferred"}
+            if session is None and self._existing_session_binding(row) is not None:
+                raise ValueError(
+                    "existing verification session lacks terminal provenance"
+                )
             if session is None or session.status != "completed":
                 raise ValueError("verification session must complete before acceptance")
             if pilot:
-                parent = self.harness.resolve(
-                    self._work_parent(
-                        links=self.store.links(goal_id=goal_id, number=number), row=row
-                    )
+                parent_key = self._work_parent(
+                    links=self.store.links(goal_id=goal_id, number=number), row=row
+                )
+                parent_row = next(
+                    (
+                        link
+                        for link in self.store.links(goal_id=goal_id, number=number)
+                        if link["run_key"] == parent_key
+                    ),
+                    None,
+                )
+                parent = (
+                    self._bound_session(scope, parent_row)
+                    if parent_row is not None
+                    else None
                 )
                 if parent is None or parent.status != "completed":
                     raise ValueError("work session must complete before acceptance")
@@ -1099,6 +1232,19 @@ class WorkService:
         return {"outcome": action}
 
     def _work_parent(self, links, row):
+        binding = self._existing_session_binding(row)
+        if binding is not None:
+            parent_run_key = binding.get("parent_run_key")
+            if not isinstance(parent_run_key, str):
+                return None
+            return next(
+                (
+                    link["run_key"]
+                    for link in links
+                    if link["run_key"] == parent_run_key and link["run_role"] == "work"
+                ),
+                None,
+            )
         session = self.harness.resolve(row["run_key"])
         return next(
             (

@@ -107,6 +107,30 @@ class HarnessBridge:
             raise WorkDenied("harness inspection unavailable")
         return None
 
+    def existing_session(self, session_id, turn_id, repo):
+        """Read one pre-existing completed session without changing its key.
+
+        Existing sessions predate the coordinator and therefore cannot safely
+        be made to satisfy ``resolve(run_key)`` by rewriting their client ID.
+        The explicit opt-in path reads their persisted repository identity and
+        exact successful terminal turn instead.
+        """
+        if not all(isinstance(value, str) and value for value in (session_id, turn_id)):
+            return None
+        if not isinstance(repo, str) or repo.count("/") != 1:
+            return None
+        owner, name = repo.split("/", 1)
+        session = self.registry.get_session(session_id)
+        if (
+            session is None
+            or session.status != "completed"
+            or session.repo_owner != owner
+            or session.repo_name != name
+            or not self.registry.has_successfully_completed_turn(session_id, turn_id)
+        ):
+            return None
+        return session
+
     def _require_bound_work_continuity(self, session, run_key):
         """Reject a coordinator session that lacks its immutable ledger.
 

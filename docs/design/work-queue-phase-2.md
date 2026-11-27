@@ -9,7 +9,8 @@ triggers reject updates and deletes of audit history.
 
 The API owns one serialized `WorkService`. MCP forwards the verified caller's
 bearer credential to that API; analytics never launches or mutates locally.
-`drover_work_list/get/launch/link/update/question/decide` map to `/work/<operation>`.
+`drover_work_list/get/launch/link/bind_existing/update/question/decide` map to
+`/work/<operation>`.
 List and get use GET; the other operations use POST. Read responses use the
 existing MCP row/text/byte bounds, admission and freshness envelope. HTTP reads
 also bound text and bytes. Restricted credentials and cookie-only callers cannot
@@ -22,7 +23,7 @@ an authenticated `credential:<id>` to the coordinator role from that policy.
 The legacy operator bearer is identified as `control:operator` and also needs an
 explicit role mapping.
 
-**Who may launch.** `launch`, `link`, `update`, `question` and `decide` require the
+**Who may launch.** `launch`, `link`, `bind_existing`, `update`, `question` and `decide` require the
 policy's coordinator role (`authority.coordinator`, `nix` in policy v1). An
 unmapped principal is a `worker` and gets a 403 `coordinator required`. The direct
 hub API call uses the legacy bearer (`control:operator`); the MCP
@@ -67,6 +68,16 @@ response or restart, a nullable link resolves through the control registry or a
 read-only daemon lookup by key, including terminal sessions. Missing or
 unreachable outcomes remain inspectable and block relaunch. The daemon lookup
 never sends another launch request.
+
+`bind_existing` is a coordinator-only, exact-GitHub-pilot operation. It has
+only `goal_id` and `number`; reviewed server configuration, never its caller,
+selects a completed work session/turn and a distinct completed verifier
+session/turn. It does not alter either session's `client_session_id`, launch a
+replacement, or apply to `local_file`. The service reads their retained
+repository identity and successful terminal turns, pins deterministic work and
+verify links, and rechecks both before an acceptance request. Its precise
+configuration and error contract is in the
+[pilot contract](../operations/github-acceptance-pilot.md#existing-session-reuse).
 
 `update(action="complete")` schedules a separate verify run and leaves the issue
 open in review. For the default path, acceptance requires that run to finish,
