@@ -2,17 +2,15 @@
 
 **Status: preparation only. No pilot has been executed and none has passed.**
 
-Written against baseline `7133442d`. Lane A (work-queue acceptance fix) was
-reported merged while this was being prepared, and Lane B (preflight CLI) was
-not; neither accepted source was inspected. This map therefore names no new
-A/B function, flag, command, exit code or message. Every `UNBOUND` slot is
-filled only from owner-supplied accepted source at the
-[binding gate](#binding-gate).
+This branch is based on `7133442d`. Lane A is merged as `b36305f6`; its
+contract was read from that object and the Lane A facts below come from it.
+Lane B (preflight CLI) and the integrated runtime were not available, so their
+slots stay `UNBOUND` and are filled only at the [binding gate](#binding-gate).
 
 Case definitions:
 [`tests/fixtures/quality-pilots/scenarios.json`](../../tests/fixtures/quality-pilots/scenarios.json).
 They are data. No runner, score or service is added. The one executable piece
-is the P2 pin, because it has value today.
+is the P2 pin.
 
 ## Evidence tiers
 
@@ -22,82 +20,159 @@ higher one, and agreement between models or reviewers is not evidence.
 | Tier | Meaning | Does not prove |
 | --- | --- | --- |
 | T0 implementation | A diff exists at a named SHA | That it works |
-| T1 mocked test | Scoped `pytest` with fakes (for example the in-memory provider and harness in `tests/test_work_queue_execution.py`) | Real transport, store or process boundary |
+| T1 mocked test | Scoped `pytest` with fakes (stub provider, harness, HTTP session) | Real provider, transport, store or process boundary |
 | T2 CI | The same SHA green in `.github/workflows/ci.yml` | Installed behaviour |
-| T3 installed behavioural acceptance | The installed artifact driven through its real entry point in an isolated root, with side effects read back from durable state | Production, GitHub-backed or iOS behaviour |
+| T3 installed behavioural acceptance | The installed artifact driven through its real entry point, with results read back from the real system of record | Anything outside the exact case run |
 
 ## P1 · Bug fix (Lane A): acceptance cannot be forged
 
+Lane A hardens **only exact opted-in GitHub issues**. `local_file` goals and
+GitHub issues without a profile are deliberately unchanged. P1 therefore has
+two parts with opposite expectations, and they must not be mixed.
+
+Contract of record: `docs/operations/github-acceptance-pilot.md` at `b36305f6`
+(not linked because this branch predates it).
+
+### P1a · GitHub gate (the fix)
+
 | | |
 | --- | --- |
-| Observable outcome | A work item closes only on a real, separately produced verification result. Asserted success flags, or an evidence label alone, leave it open and record no `verified` outcome. |
-| Baseline defect (`7133442d`) | `WorkService.update(action="verified")` in `src/drover/server/work_queue/service.py` trusts caller-supplied `behavioral_passed` / `checks_rerun` and accepts any `evidence_key` matching the opaque-code pattern. `BoundWorkControl.update` in `src/drover/server/work_queue/worker_mcp.py` hard-codes both flags to `True`. Nothing retrieves what the key names. |
-| Approved criterion / profile | The `acceptance` block of `src/drover/server/work_queue/policy-v1.json` (separate verification run, behavioural evidence required, relevant checks rerun; criteria owner `nix`). Run profile: `UNBOUND`. |
-| Source / build / context | Accepted A source at the owner-supplied SHA; isolated control store and data root; a `local_file` canary goal only. |
-| Commands / paths | T1 at baseline: `uv run --locked --extra dev pytest -q tests/test_work_queue_execution.py tests/test_work_queue_worker_mcp.py tests/test_work_queue_local_candidates.py`. A's own tests and the T3 entry point: `UNBOUND`. |
-| Expected side effect | Positive: one `outcome=verified` row in `decision_events`, one close, retry returns the same outcome. Negative: no close, no `verified` outcome row, item state unchanged. |
-| Negative cases | `P1-N1`…`P1-N6`; `P1-N5` held out. |
-| Evidence capture | Command, exit status, SHA, and before/after `decision_events` and item state per case. |
-| Owner verdict | Nix, per case, with tier. |
+| Observable outcome | For an issue with a reviewed profile, a close happens only when trusted provider reads agree with that profile. Caller `behavioral_passed` / `checks_rerun` values grant nothing; an evidence label alone closes nothing. |
+| Approved criterion / profile | The issue's entry in `work_queue.goals.github_acceptance_profiles`, installed by an independent owner: `pull_number`, `criteria`, `instructions`, `behavioral_check`, `app_id`, `owner_id`, `amendment_record`. Its revision is SHA-256 over the whole profile. The issue body must carry exactly one `<!-- drover:acceptance -->` section equal to `criteria`. Actual profile values: `UNBOUND`. |
+| Source / build / context | Integrated SHA, installed runtime, repository, issue, PR, producer App: `UNBOUND`. |
+| Request | `POST /work/update`, `action=verified`, `evidence_key=check-run:<id>:review:<id>`, after the separate verification session is terminal. |
+| What the gate resolves | Current PR head; behavioural check with the configured name and App, success, at that head, `external_id` equal to the profile revision, still the latest run, non-empty output within 64 KiB; `APPROVED` review by the configured human owner at that head carrying `drover-acceptance:<revision>`; required branch-protection checks green; everything reread before the close intent. |
+| Expected side effect | Positive: `200 {"outcome":"verified"}`, one close, audit row holding resolved source, check facts, evidence reference and result byte count/digest. Negative: issue stays open, no `verified` outcome. Lost close response then repeat: `deferred`, no second close. |
+| Negative cases | `P1-N1`…`P1-N12` (forged flags and label, unresolvable evidence, stale head, changed profile or criteria, wrong or superseded check, missing or oversized output, wrong review, required CI, unfinished sessions, change at the final boundary, uncertain close); `P1-N12` held out. |
+| T1 | `tests/test_work_queue_github_acceptance.py` at `b36305f6`, run with Lane A's own recipe in its `AGENTS.md`. Fixtures prove the code contract only. |
+
+**Acceptance gates (T3, owner-performed; not satisfied by any test):**
+
+1. The owner independently reviews and installs the profile.
+2. The owner retrieves the retained result from
+   `GET /repos/<repo>/check-runs/<check-id>` and reads `output.summary` and
+   `output.text`.
+3. The owner judges whether those observations establish the claim and
+   whether the producer was isolated. A success conclusion is not that
+   judgment, and the gate does not automate it.
+4. Source head, profile revision, check-run, App and review identities match
+   the audit row.
+5. Stale and forged negatives, retry and interruption are observed on the
+   installed gate where they can be produced without harm.
+6. One real, subsequent, authorized PR goes through the installed gate with a
+   single close.
+
+This worker closes no live issue and mutates no service. It can prepare and,
+after binding, run isolated cases and read back owner-supplied evidence.
+
+### P1b · Compatibility regression (must not change)
+
+| | |
+| --- | --- |
+| Scope | `local_file` goals and unprofiled GitHub issues. |
+| Expectation | Identical to baseline. On these paths caller flags plus an opaque `evidence_key` are still what the service checks. The pilot does **not** expect them to reject opaque evidence; that would contradict Lane A's preserved compatibility. This is a stated limit of the fix, not a pass. |
+| Cases | `P1-C1`…`P1-C6`, including that a `local_file` goal cannot declare an acceptance profile. |
+| Commands | `tests/test_work_queue_execution.py`, `tests/test_work_queue_worker_mcp.py`, `tests/test_work_queue_local_candidates.py` (T1). |
+| Boundary | The signed deferred work → verify → acknowledge chain stays `local_file`-only. The GitHub gate is a close gate; it creates no acknowledgement and proves no merge or deploy. |
 
 ## P2 · Behaviour-preserving refactor: verification run-key derivation
 
 Chosen boundary: the verification request/run-key derivation, written out four
-times in `service.py` at baseline (`launch`, `_verification_request`,
-`advance_deferred_verification`, `update`). It is the smallest known
-duplicated boundary inside the acceptance path, it is pure (`identity()` is
-SHA-256 over a JSON array), and it is what makes a criteria change invalidate
-a verification. The refactor is "one derivation, four callers". If accepted A
-already consolidated it, the pilot picks the next duplicated pure boundary and
-says so; it does not invent a product change.
+times in `service.py` (`launch`, `_verification_request`,
+`advance_deferred_verification`, `update`), at baseline and still at
+`b36305f6`. It is the smallest known duplicated boundary in the acceptance
+path and is what makes a criteria change invalidate a verification. The
+refactor is "one derivation, four callers" and is **not implemented here**.
 
 | | |
 | --- | --- |
 | Observable outcome | Identical inputs give byte-identical request and verify run keys before and after. |
 | Approved criterion | Equivalence, not review opinion: pinned digests match exactly and existing suites stay green with no test expectation edited. |
-| Characterization pin | [`p2-run-key-vectors.json`](../../tests/fixtures/quality-pilots/p2-run-key-vectors.json): six vectors captured from the real source at `7133442d`, covering changed body, null body, non-ASCII body, other item, other parent. |
-| Source / build / context | Pre- and post-refactor SHA of one lineage; no store or network. |
-| Commands / paths | `uv run --locked python tests/fixtures/quality-pilots/check_p2_run_key_vectors.py` at each SHA (0 match, 1 mismatch, 2 pinned entry point missing), then the P1 baseline suites. |
-| Expected side effect | None. `git diff --stat` touches only the derivation sites. |
+| Characterization pin | [`p2-run-key-vectors.json`](../../tests/fixtures/quality-pilots/p2-run-key-vectors.json): six vectors captured from the real source at `7133442d` (changed, null and non-ASCII body; other item; other parent). |
+| Command | See [Running the checker](#running-the-checker). Exit 0 match, 1 mismatch, 2 pinned entry point missing or reshaped. |
+| Expected side effect | None. The diff touches only the derivation sites. |
 | Negative cases | `P2-N1`…`P2-N4`; `P2-N2` held out. |
-| Evidence capture | Checker output at both SHAs, held-out differential output, test output, diff stat. |
 | Owner verdict | Nix. T3 does not apply to a pure internal refactor; the verdict says so. |
 
-What the pin does and does not cover: it pins `identity()` and
-`WorkService._verification_request` and checks they agree. The other three
-call sites are covered only by the existing suites (T1). During preparation
-the checker returned 6/6 on baseline and exit 1 against an in-memory mutant
-that dropped the criteria body (`P2-N1`). That shows the pin discriminates; it
-is not a pilot result.
+Limits of the pin:
+
+- It pins `identity()` and `WorkService._verification_request` for items with
+  no acceptance profile (criteria = item body). The profiled GitHub path and
+  the other three call sites are covered only by existing suites (T1).
+- During preparation it returned 6/6 on baseline, exit 1 against an in-memory
+  mutant that drops the criteria body, and 6/6 against `b36305f6`'s
+  `service.py` loaded in memory over baseline sibling modules. The last is an
+  indication, not a run of the integrated tree. None of this is a pilot result.
 
 ## P3 · User-visible feature (Lane B): preflight CLI gives actionable context diagnostics
 
 | | |
 | --- | --- |
-| Observable outcome | Before work starts, the operator learns from the shell whether required context is usable and, if not, which item failed, why, and what to do next. |
-| Approved criterion / profile | "Actionable" is checked per diagnostic: it names the failing item, states the cause, states a concrete next step, and failure is distinguishable by exit status. Profile: `UNBOUND`. |
+| Observable outcome | Before work starts, the operator learns from the shell whether the required context is usable and, if not, the first thing that failed, why, and what to do next. |
+| Approved contract | Fail-fast: stop at the first failing prerequisite before any expensive work. "Actionable" is checked per diagnostic: it names the failing item, states the cause, states a concrete next step, and exits non-zero. |
 | Source / build / context | Accepted B source at the owner-supplied SHA. T3 uses the installed entry point as a real process, not an in-process `CliRunner` call. One throwaway root per case. |
-| Commands / paths | Command, flags, exit codes, context items and message text: all `UNBOUND`. Existing surfaces named "preflight" (`drover lake preflight`, cutover `release-preflight`, `credentials issue-preflight`) are different features. |
-| Expected side effect | None: tree listing and control-store state identical before and after. No secret in output. |
+| Commands / paths | Command, flags, exit codes, prerequisite order, what counts as expensive work, message text: all `UNBOUND`. Existing surfaces named "preflight" (`drover lake preflight`, cutover `release-preflight`, `credentials issue-preflight`) are different features. |
+| Expected side effect | None: tree and store identical before and after. No secret in output. |
 | Negative cases | `P3-N1`…`P3-N6`; `P3-N5` held out. |
-| Evidence capture | argv, stdout, stderr, exit status, before/after tree listing; output checked for secret material before it is kept. |
 | Owner verdict | Nix, per diagnostic, with tier. |
+
+`P3-N3` (two broken prerequisites) follows the fail-fast contract: the first
+run reports the first failure only, with zero expensive work; after only that
+one is remedied, the rerun surfaces the second; after both, exit zero.
+Aggregate reporting of all failures in one run is not required and not
+expected. The bar per diagnostic is unchanged.
 
 ## Held-out cases
 
 Each class has one case marked `held_out`. Because this repository is visible
 to candidates, only its property and expectation are committed; the owner
-chooses the concrete inputs at execution and runs it. Expectations are fixed
-here, before A/B were seen, and are not lowered at binding. A case that cannot
-be expressed against the accepted API is reported as a gap, not dropped.
+chooses the concrete inputs at execution. Expectations are not lowered at
+binding. A case that cannot be expressed against the accepted source is
+reported as a gap, not dropped.
+
+## Running the checker
+
+Supported context: Python ≥ 3.11 (`requires-python`), `uv` with the committed
+lock. It needs only the base project, no extras. Proven during preparation
+with CPython 3.14.7 and uv 0.13.6:
+
+```sh
+uv run --locked --python <python3> python tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+```
+
+Format checks on the checker use the project's pinned tools and need the `dev`
+extra:
+
+```sh
+uv run --locked --python <python3> --extra dev black --check tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+uv run --locked --python <python3> --extra dev isort --check-only tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+uv run --locked --python <python3> python scripts/check_markdown_links.py docs/quality-pilots/README.md
+```
+
+The T1 suites named above need `--extra dev`; Lane A's GitHub acceptance suite
+additionally follows the Postgres recipe in its `AGENTS.md`.
+
+## Evidence storage
+
+Two different things:
+
+- **Worker-authorized paths.** A Lane C worker writes only
+  `docs/quality-pilots/` and `tests/fixtures/quality-pilots/`. During
+  preparation a worker write outside the worktree, to a scratch directory, was
+  denied by the harness; no scratch write path is granted or assumed here.
+- **Owner-managed evidence.** Run evidence (command, exit status, SHA,
+  retrieved provider results, before/after state) is kept by the owner in a
+  location the owner chooses, outside the repository and never in `/tmp`. A
+  worker without such a grant returns its observations in its report for the
+  owner to retain.
 
 ## Boundaries
 
 - Automatic work → separate verification → native acknowledgement is proven
   only for configured `local_file` canary goals
   ([`verified-event-path-boundaries.md`](../operations/verified-event-path-boundaries.md)).
-  The pilot stays inside that. It closes no live GitHub issue, touches no
-  production state and manufactures no owner acknowledgement.
+- The pilot manufactures no owner acknowledgement, performs no demo close of a
+  live GitHub issue, and touches no production state.
 - iOS physical-device acceptance and public-release gates
   ([`public-release-readiness.md`](../design/public-release-readiness.md)) are
   separate. Nothing here counts toward them.
@@ -106,14 +181,16 @@ be expressed against the accepted API is reported as a gap, not dropped.
 ## Binding gate
 
 Execution waits for the owner to supply: reviewed, integrated A and B source
-with the exact current SHA; a valid profile; and an isolated root.
+with the exact current SHA; the installed profile and its revision; and an
+isolated root.
 
 Then, in the same Lane C session:
 
-1. Fill every `UNBOUND` slot from the accepted source, not from this document.
+1. Fill every `UNBOUND` slot from the accepted source or installed runtime,
+   not from this document.
 2. Re-run the P2 checker at the pre-refactor SHA before any refactor starts.
-3. Run each case with real criteria and real evidence retrieval, including the
-   `retry` and `interruption` cases.
-4. Keep evidence under `~/scratch/quality-pilots/<sha>/<pilot>/`, never `/tmp`.
-5. Report the denominator (cases defined / bound / run / passed / failed /
-   not run) and the limits of what was exercised.
+3. Run the isolated cases, including `retry` and `interruption`, and read back
+   the real criteria and provider evidence for P1a.
+4. Report the denominator (cases defined / bound / run / passed / failed /
+   not run), which P1a gates the owner performed, and the limits of what was
+   exercised.

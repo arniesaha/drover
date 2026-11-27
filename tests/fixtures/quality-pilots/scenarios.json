@@ -1,66 +1,112 @@
 {
-  "version": 1,
+  "version": 2,
   "issue": 1024,
   "status": "preparation; not executed; no case has a verdict",
   "baseline_sha": "7133442dbe4a0525f7e19076d404dca356f17756",
-  "unbound": "A value of UNBOUND is filled only from owner-supplied accepted A/B source at binding, never guessed.",
-  "held_out_rule": "For held_out cases only the property and expectation are committed. The owner picks the concrete inputs at execution and does not give them to the candidate author or worker. Expectations are not lowered at binding; a case that cannot be expressed against the accepted API is reported as a gap.",
+  "lane_a_merged_sha": "b36305f69629f64e159bc24436638c2ca5145c62",
+  "unbound": "A value of UNBOUND is filled only from owner-supplied reviewed, integrated source or installed runtime at binding, never guessed. Lane A facts below were read from the merged object; Lane B and the integrated runtime were not available.",
+  "held_out_rule": "For held_out cases only the property and expectation are committed. The owner picks the concrete inputs at execution and does not give them to the candidate author or worker. Expectations are not lowered at binding; a case that cannot be expressed against the accepted source is reported as a gap.",
   "tiers": ["T0 implementation", "T1 mocked test", "T2 CI", "T3 installed behavioural acceptance"],
   "pilots": [
     {
       "id": "P1",
       "class": "bugfix",
       "lane": "A",
-      "outcome": "A work item closes only on a real, separately produced verification result; asserted flags or an evidence label alone never close it.",
-      "boundary": "local_file canary goal in an isolated root only",
-      "bindings": {"entry_point": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND", "evidence_retrieval": "UNBOUND"},
-      "positive": [
-        {"id": "P1-P1", "given": "work run terminal, separate verify run terminal, its check actually rerun and its evidence retrievable", "expect": "one outcome=verified decision event; item closed exactly once"},
-        {"id": "P1-P2", "given": "P1-P1 acceptance request repeated", "expect": "same outcome returned; no second close, no second outcome event", "kind": "retry"}
-      ],
-      "negative": [
-        {"id": "P1-N1", "given": "verify-role caller asserts success flags; no check was rerun and no evidence exists", "expect": "refused; item open; zero verified outcome events"},
-        {"id": "P1-N2", "given": "well-formed evidence label only, naming nothing retrievable", "expect": "refused; item open"},
-        {"id": "P1-N3", "given": "work-role run reports its own verification", "expect": "refused (baseline already refuses: 'separate verification session required'); must stay refused"},
-        {"id": "P1-N4", "given": "criteria body amended after the verify run was launched", "expect": "refused (baseline: 'acceptance criteria changed; new verification required'); must stay refused"},
-        {"id": "P1-N5", "held_out": true, "given": "evidence that is real and well formed but belongs to a different run or item than the one being accepted", "expect": "refused; item open; zero verified outcome events"},
-        {"id": "P1-N6", "given": "verifier turn interrupted after reporting but before it terminates", "expect": "item stays in review; nothing closes until that exact turn is terminal; no duplicate on resume", "kind": "interruption"}
-      ]
+      "outcome": "For an exact opted-in GitHub issue, a close happens only when trusted provider reads agree with the reviewed profile; caller flags or an evidence label alone never close it. Every other path behaves exactly as before.",
+      "contract": "docs/operations/github-acceptance-pilot.md at lane_a_merged_sha",
+      "bound_from_merged_a": {
+        "opt_in": "work_queue.goals.github_acceptance_profiles.\"<issue number>\"; candidate_source must be github; credential needs issues_read, pulls_read, checks_read",
+        "profile_fields": ["pull_number", "criteria", "instructions", "behavioral_check", "app_id", "owner_id", "amendment_record"],
+        "profile_revision": "SHA-256 over sorted JSON of the complete profile",
+        "criteria_section": "exactly one <!-- drover:acceptance --> ... <!-- /drover:acceptance --> section whose trimmed content equals profile.criteria",
+        "request": "POST /work/update action=verified evidence_key=check-run:<positive id>:review:<positive id>",
+        "provider_result_location": "GET /repos/<configured repo>/check-runs/<check id> (output.summary, output.text)",
+        "owner_review": "APPROVED review by profile.owner_id (type User) at the current head whose body contains the token drover-acceptance:<profile revision>",
+        "audit": "decision_events provider_operation_id is bounded JSON of resolved source, required-check facts, evidence reference, and behavioural-result byte count and SHA-256",
+        "t1_tests": "tests/test_work_queue_github_acceptance.py"
+      },
+      "bindings": {"integrated_sha": "UNBOUND", "installed_runtime": "UNBOUND", "repository": "UNBOUND", "issue": "UNBOUND", "pull_number": "UNBOUND", "profile_revision": "UNBOUND", "behavioral_check_and_app": "UNBOUND", "owner_id": "UNBOUND", "producer_isolation": "UNBOUND"},
+      "compatibility_regression": {
+        "scope": "local_file goals and GitHub issues with no profile; deliberately unchanged by Lane A",
+        "note": "On these paths caller flags plus an opaque evidence_key are still what the service checks. The pilot does NOT expect them to reject opaque evidence; it expects no behaviour change.",
+        "cases": [
+          {"id": "P1-C1", "given": "unprofiled item, separate terminal verify run, both flags true, opaque evidence_key", "expect": "closes once, as at baseline"},
+          {"id": "P1-C2", "given": "unprofiled item, a flag false or evidence_key missing", "expect": "refused: 'successful behavioral evidence and rerun checks required'"},
+          {"id": "P1-C3", "given": "work-role run reports its own verification", "expect": "refused: 'separate verification session required'"},
+          {"id": "P1-C4", "given": "unprofiled item body changed after the verify run launched", "expect": "refused: 'acceptance criteria changed; new verification required'"},
+          {"id": "P1-C5", "given": "local_file bound verifier reports while its turn is running", "expect": "deferred; closes only after that exact turn is terminal"},
+          {"id": "P1-C6", "given": "a goal with candidate_source=local_file declares an acceptance profile", "expect": "configuration rejected; the GitHub gate cannot be attached to the local_file chain"}
+        ]
+      },
+      "github_gate": {
+        "scope": "one exact opted-in GitHub issue",
+        "positive": [
+          {"id": "P1-G1", "given": "terminal work and verify sessions; behavioural check success at current head with external_id = profile revision and non-empty retained output; owner approval at that head with the revision token; required checks green", "expect": "200 outcome=verified; one close; audit holds resolved provider facts"},
+          {"id": "P1-G2", "given": "P1-G1 request repeated", "expect": "recorded outcome returned; no second close", "kind": "retry"}
+        ],
+        "negative": [
+          {"id": "P1-N1", "given": "both flags true with an opaque label that is not a check-run/review reference", "expect": "refused; issue open; no verified outcome"},
+          {"id": "P1-N2", "given": "well-formed evidence_key whose check or review does not exist or is not readable", "expect": "refused or provider-unavailable 409; issue open"},
+          {"id": "P1-N3", "given": "PR head moved after the check or review was produced", "expect": "refused as stale; new verification required"},
+          {"id": "P1-N4", "given": "profile field or marked criteria section changed after verification launched", "expect": "refused; new verification required"},
+          {"id": "P1-N5", "given": "behavioural check wrong name, wrong App, not success, or an older success superseded by a later run at that head", "expect": "refused"},
+          {"id": "P1-N6", "given": "retained output missing, empty, or over 64 KiB", "expect": "refused"},
+          {"id": "P1-N7", "given": "review not APPROVED, by another account or a bot, at another commit, or without the exact revision token", "expect": "refused"},
+          {"id": "P1-N8", "given": "a required branch-protection check missing, duplicated, pending, failed, or from the wrong App", "expect": "refused"},
+          {"id": "P1-N9", "given": "work or verify session not terminal", "expect": "refused"},
+          {"id": "P1-N10", "given": "retained result or head changes between evidence resolution and the final reread", "expect": "refused; no close intent recorded"},
+          {"id": "P1-N11", "given": "close intent recorded, provider response lost, request repeated", "expect": "outcome=deferred; no second close; owner inspects provider state", "kind": "interruption"},
+          {"id": "P1-N12", "held_out": true, "given": "evidence that is genuine and successful but bound to a different source than the one being accepted (owner picks which identity differs: pull request, head, or profile revision)", "expect": "refused; issue open; no verified outcome"}
+        ]
+      },
+      "acceptance_gates": {
+        "note": "T1 fixtures and CI are not this outcome. These are performed by the owner on the installed gate, not by this worker.",
+        "gates": [
+          "owner independently reviews and installs the profile; candidate cannot select or weaken it",
+          "owner retrieves the retained behavioural result from the provider_result_location and reads it",
+          "owner judges whether the observations establish the claim and whether the producer was isolated; a success conclusion alone is not that judgment",
+          "exact source, profile revision, check-run id, App id and review id match what the audit recorded",
+          "stale and forged negatives above observed refused on the installed gate where they can be produced without harm",
+          "retry and interruption behaviour observed",
+          "one real, subsequent, authorized PR passes through the installed gate with a single close"
+        ]
+      }
     },
     {
       "id": "P2",
       "class": "behaviour-preserving refactor",
-      "lane": "C-defined task; touches the acceptance path only at binding, by an assigned worker",
+      "lane": "C-defined task; implemented later by an assigned worker, not in preparation",
       "outcome": "One verification run-key derivation with four callers; digests byte-identical before and after.",
       "boundary": "src/drover/server/work_queue/service.py: launch, _verification_request, advance_deferred_verification, update",
       "bindings": {"pre_refactor_sha": "UNBOUND", "post_refactor_sha": "UNBOUND"},
-      "pin": {"vectors": "p2-run-key-vectors.json", "checker": "check_p2_run_key_vectors.py", "captured": true},
+      "pin": {"vectors": "p2-run-key-vectors.json", "checker": "check_p2_run_key_vectors.py", "captured": true, "path_pinned": "items with no acceptance profile (criteria = item body)"},
       "positive": [
         {"id": "P2-P1", "given": "checker run at pre- and post-refactor SHA", "expect": "exit 0 and 6/6 at both"},
         {"id": "P2-P2", "given": "existing scoped suites at post-refactor SHA with no test edited", "expect": "green"}
       ],
       "negative": [
-        {"id": "P2-N1", "given": "invalid candidate: derivation drops the criteria body from the request key", "expect": "checker exit 1"},
+        {"id": "P2-N1", "given": "invalid candidate: derivation drops the criteria from the request key", "expect": "checker exit 1"},
         {"id": "P2-N2", "held_out": true, "given": "owner-chosen fresh inputs (not in the committed vectors) evaluated at both SHAs", "expect": "identical digests; any difference fails the refactor"},
         {"id": "P2-N3", "given": "diff touches behaviour outside the four derivation sites, or edits a test expectation", "expect": "rejected as out of scope regardless of green tests"},
-        {"id": "P2-N4", "given": "pinned entry point renamed or removed", "expect": "checker exit 2; pin is re-bound from the pre-refactor SHA, not skipped"}
+        {"id": "P2-N4", "given": "pinned entry point renamed, removed or reshaped", "expect": "checker exit 2; pin is re-bound from the pre-refactor SHA, not skipped"}
       ]
     },
     {
       "id": "P3",
       "class": "user-visible feature",
       "lane": "B",
-      "outcome": "Before work starts, an operator learns from the shell whether required context is usable and, if not, what failed, why, and what to do next.",
+      "outcome": "Before work starts, an operator learns from the shell whether the required context is usable and, if not, the first thing that failed, why, and what to do next.",
+      "contract": "fail-fast: stop at the first failing prerequisite, before any expensive work",
       "actionable_means": ["names the specific failing item", "states the cause", "states a concrete next step", "non-zero exit distinguishes failure from success"],
-      "bindings": {"command": "UNBOUND", "flags": "UNBOUND", "exit_codes": "UNBOUND", "context_items": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND"},
+      "bindings": {"command": "UNBOUND", "flags": "UNBOUND", "exit_codes": "UNBOUND", "prerequisite_order": "UNBOUND", "what_counts_as_expensive_work": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND"},
       "positive": [
         {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; tree and store unchanged"},
         {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "identical result; still no side effect", "kind": "retry"}
       ],
       "negative": [
-        {"id": "P3-N1", "given": "a required context item is missing", "expect": "non-zero; diagnostic meets all four actionable_means"},
+        {"id": "P3-N1", "given": "a required context item is missing", "expect": "non-zero; diagnostic meets all four actionable_means; no expensive work started"},
         {"id": "P3-N2", "given": "a context item is present but malformed", "expect": "non-zero; names the item and the defect, not a traceback"},
-        {"id": "P3-N3", "given": "two independent items are broken", "expect": "both reported in one run"},
+        {"id": "P3-N3", "given": "two independent prerequisites are broken", "expect": "run 1: non-zero, the first failure only, specific and actionable, zero expensive work. Remedy only that one. Run 2: non-zero and now surfaces the second, equally actionable. Remedy it. Run 3: exit zero."},
         {"id": "P3-N4", "given": "context contains a secret-shaped value", "expect": "value never appears in stdout or stderr"},
         {"id": "P3-N5", "held_out": true, "given": "an item that exists and parses but is unusable (owner picks which: unreadable, stale, or for a different SHA)", "expect": "non-zero with an actionable diagnostic; exit zero here fails the feature"},
         {"id": "P3-N6", "given": "command interrupted mid-run", "expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
