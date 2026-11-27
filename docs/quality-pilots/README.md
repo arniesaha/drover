@@ -1,6 +1,8 @@
 # Quality pilots: feature → proof map (Lane C, issue #1024)
 
-**Status: preparation only. No pilot has been executed and none has passed.**
+**Status on this branch: P1 not run. P2 refactor candidate implemented and
+checked as described below, not yet owner-accepted. P3 is recorded
+separately and is not replayed here. Lane C is not accepted.**
 
 Preparation originated at `7133442d` and is integrated with Lane A
 (`b36305f6`) and the reviewed Lane B preflight increment. The canonical
@@ -84,7 +86,7 @@ times in `service.py` (`launch`, `_verification_request`,
 `advance_deferred_verification`, `update`), at baseline and still at
 `b36305f6`. It is the smallest known duplicated boundary in the acceptance
 path and is what makes a criteria change invalidate a verification. The
-refactor is "one derivation, four callers" and is **not implemented here**.
+refactor is "one derivation, four callers"; see the candidate below.
 
 | | |
 | --- | --- |
@@ -105,6 +107,47 @@ Limits of the pin:
   mutant that drops the criteria body, and 6/6 against `b36305f6`'s
   `service.py` loaded in memory over baseline sibling modules. The last is an
   indication, not a run of the integrated tree. None of this is a pilot result.
+
+### P2 refactor candidate (not yet owner-accepted)
+
+Implemented on top of `9ab079fd` as candidate `990d7e34`: one pure
+`verification_identity(workspace_id, goal_id, number, parent_run_key, criteria)`
+in `service.py`, called by the four sites. Each caller still resolves its own
+criteria in the same place and order, so no authority check or provider read
+moved; `_verification_request` keeps its signature.
+
+What was actually run at `990d7e34`:
+
+- Six pins: 6/6. A derivation that drops the criteria fails them (1/6, exit 1).
+- The AGENTS isolated-PostgreSQL recipe with the `focused-tests-pg` preflight
+  (own role, data directory under the run's scratch root, port 5432
+  forbidden, clean tree): 17 passed, 0 skipped, 0 failed; the disposable
+  cluster was stopped by the recipe's own trap. The 17 are the 9 tests in
+  [`tests/test_quality_p2_derivation.py`](../../tests/test_quality_p2_derivation.py)
+  and 8 existing cases:
+  `test_work_queue_execution.py::test_separate_success_and_changed_criteria`,
+  `test_work_queue_github_acceptance.py::test_provider_evidence_and_owner_review_close_once_despite_routine_notes`
+  and `::test_stale_verdict_and_unfinished_verifier` (parametrized),
+  `test_work_queue_local_candidates.py::test_bound_verifier_reports_then_queue_accepts_only_its_terminal_turn`.
+- The new tests drive the real service on the unprofiled, profiled-GitHub and
+  deferred `local_file` paths and compare stored keys and decisions with an
+  independently written digest. Four seeded wrong derivations, across five
+  control tests, each change a named behaviour (for example, dropping criteria lets a changed-criteria
+  item be accepted).
+
+History, kept because it happened: the first run, at checkpoint `a5fa2c47`,
+was 15 passed, 2 failed. Both failures were wrong predictions inside the new
+negative control about *which* behaviour a wrong derivation breaks; the
+refactor and every real-derivation expectation were unchanged by the fix.
+
+Limits:
+
+- `launch` also stores every run key (work or verify) with its own
+  role-generic expression. That is a fifth, deliberately untouched site; the
+  helper's verify run key must equal it, and acceptance refuses if it does not.
+- The three existing suites were not run in full at this candidate, only the
+  cases named above. No CI run. `P2-N2` (owner-held fresh inputs) and the
+  owner's profile/all-caller baselines are the owner's to compare.
 
 ## P3 · User-visible feature (Lane B): preflight CLI gives actionable context diagnostics
 
