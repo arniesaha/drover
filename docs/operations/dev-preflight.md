@@ -46,8 +46,10 @@ line on failure. Every failure from `preflight.py` carries three fields:
 - `action`: a non-empty, concrete next step. A failure cannot be constructed
   without one.
 
-The `bootstrap_interpreter` failure from `preflight.sh` prints its next step
-on stderr only.
+The `bootstrap_interpreter` failure from `preflight.sh` emits a final JSON
+object on stdout with `check`, `classification`, and an actionable `action`,
+and a redacted diagnostic on stderr. It exits 3 before starting the helper
+or the requested command; no receipt file is created without an interpreter.
 
 | exit | classification | meaning |
 |---|---|---|
