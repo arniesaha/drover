@@ -71,11 +71,14 @@ line on failure.
   shadowing the source under test.
 
 `focused-tests-pg` additionally requires `--pg-dsn-env NAME`. The DSN stays in
-that variable and is never printed. One `SET TRANSACTION READ ONLY` query must
-succeed, and the helper then enforces:
+that variable and is never printed. Before any query, a `psql` must be on `PATH`
+and `psql --version` must report `(PostgreSQL) <major>[.<minor>]`. A missing
+or unparseable client is `pg:binary` (exit 3). One `SET TRANSACTION READ ONLY`
+query must then succeed, and the helper enforces:
 
 - the connected role (`--pg-expect-role`);
-- the server major (`--pg-expect-major`) and a `psql` on `PATH` of the same major;
+- the server major (`--pg-expect-major`), and that the `psql` major always
+  equals the server major;
 - the data directory (`--pg-expect-data-prefix`, readable only with
   `pg_read_all_settings`);
 - that the endpoint is not one of the `--pg-forbid-endpoint` entries (`host:port`
@@ -98,13 +101,20 @@ A pass writes `<out>/preflight-<run_id>.json` after cleanup. It records:
 - lock SHA-256;
 - interpreter path, version and module versions;
 - `uv --version`;
-- PG endpoint, role and major, if that profile ran.
+- PG endpoint, dbname, role, server major, `psql` version and data directory,
+  if that profile ran.
 
 It records no environment dump, DSN or secret. `--verify-receipt PATH` refuses
-(exit 3) unless profile, host, worktree, HEAD, lock hash, interpreter and Python
-version all match the current run and the receipt is newer than
-`--max-receipt-age` (default 3600 s). A stale receipt cannot certify a new source
-or interpreter.
+(exit 3) unless all of the following match the current run:
+
+- profile, host, user and worktree;
+- HEAD and lock hash;
+- interpreter and Python version;
+- for the PG profile, that whole PG context.
+
+The receipt must also be newer than `--max-receipt-age` (default 3600 s). A
+stale receipt cannot certify a new source, interpreter or a different PG
+fixture.
 
 ## Integration recipe (for the parent, after merge)
 

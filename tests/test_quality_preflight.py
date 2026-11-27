@@ -19,7 +19,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 QUALITY = ROOT / "scripts" / "quality"
-_spec = importlib.util.spec_from_file_location("quality_preflight", QUALITY / "preflight.py")
+_spec = importlib.util.spec_from_file_location(
+    "quality_preflight", QUALITY / "preflight.py"
+)
 preflight = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(preflight)
 
@@ -44,7 +46,10 @@ def test_default_policy_refuses_system_temp_roots():
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
-        cwd=repo, check=True, capture_output=True, text=True,
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -53,7 +58,9 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     (root / "src" / "drover").mkdir(parents=True)
     (root / "src" / "drover" / "__init__.py").write_text("")
-    (root / "pyproject.toml").write_text('[project]\nname = "x"\nrequires-python = ">=3.11"\n')
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nrequires-python = ">=3.11"\n'
+    )
     (root / "uv.lock").write_text("version = 1\n")
     _git(root, "init", "-q")
     _git(root, "add", ".")
@@ -68,20 +75,35 @@ def out(tmp_path: Path) -> Path:
     return target
 
 
-def stub_python(where: Path, *, drover_file: str, version=(3, 14, 7), missing=(),
-                pg: dict | None = None) -> Path:
+def stub_python(
+    where: Path,
+    *,
+    drover_file: str,
+    version=(3, 14, 7),
+    missing=(),
+    pg: dict | None = None,
+) -> Path:
     """A fake interpreter answering the module probe and the PG probe."""
     mods = {
-        name: ({"ok": False, "error": f"ModuleNotFoundError: No module named '{name}'"}
-               if name in missing else
-               {"ok": True, "file": drover_file if name == "drover" else f"/x/{name}.py",
-                "version": "1"})
+        name: (
+            {"ok": False, "error": f"ModuleNotFoundError: No module named '{name}'"}
+            if name in missing
+            else {
+                "ok": True,
+                "file": drover_file if name == "drover" else f"/x/{name}.py",
+                "version": "1",
+            }
+        )
         for name in ("pytest", "drover", "psycopg")
     }
-    probe = {"executable": str(where / "python-stub"), "version": list(version), "modules": mods}
+    probe = {
+        "executable": str(where / "python-stub"),
+        "version": list(version),
+        "modules": mods,
+    }
     script = where / "python-stub"
     script.write_text(
-        "#!/bin/sh\ncase \"$3\" in\n"
+        '#!/bin/sh\ncase "$3" in\n'
         f"  *pg_namespace*) printf '%s\\n' '{json.dumps(pg or {})}' ;;\n"
         f"  *) printf '%s\\n' '{json.dumps(probe)}' ;;\nesac\n"
     )
@@ -117,11 +139,20 @@ def test_bootstrap_classifies_absent_supported_interpreter(tmp_path):
     env = {"PATH": str(empty), "HOME": str(tmp_path)}
     # The old assumption: an unversioned interpreter on PATH. It dies 127 with
     # an unclassified "not found" and no diagnosis.
-    naive = subprocess.run(["/bin/sh", "-c", "python3 scripts/quality/preflight.py"],
-                           cwd=tree.parent.parent, env=env, capture_output=True, text=True)
+    naive = subprocess.run(
+        ["/bin/sh", "-c", "python3 scripts/quality/preflight.py"],
+        cwd=tree.parent.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
     assert naive.returncode == 127
-    result = subprocess.run(["/bin/sh", str(tree / "preflight.sh"), "--out", str(tmp_path)],
-                            env=env, capture_output=True, text=True)
+    result = subprocess.run(
+        ["/bin/sh", str(tree / "preflight.sh"), "--out", str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode == 3
     assert json.loads(result.stdout)["classification"] == "environment_unavailable"
     assert "no Python >= 3.11" in result.stderr
@@ -134,8 +165,12 @@ def test_bootstrap_skips_too_old_interpreter(tmp_path):
     old = bindir / "python3"
     old.write_text("#!/bin/sh\nexit 1\n")  # answers the >=3.11 check with "too old"
     old.chmod(0o755)
-    result = subprocess.run(["/bin/sh", str(tree / "preflight.sh"), "--out", str(tmp_path)],
-                            env={"PATH": str(bindir)}, capture_output=True, text=True)
+    result = subprocess.run(
+        ["/bin/sh", str(tree / "preflight.sh"), "--out", str(tmp_path)],
+        env={"PATH": str(bindir)},
+        capture_output=True,
+        text=True,
+    )
     assert result.returncode == 3
 
 
@@ -155,25 +190,37 @@ def test_missing_git_tool(capsys, repo, out, tmp_path):
 
 
 def test_missing_dependency_blocks_expensive_work(capsys, repo, out, tmp_path):
-    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"),
-                     missing=("pytest",))
+    py = stub_python(
+        tmp_path, drover_file=str(repo / "src/drover/__init__.py"), missing=("pytest",)
+    )
     marker = tmp_path / "expensive-ran"
-    code, result = run(capsys, [*base_args(repo, out, py), "--then", sys.executable, "-c",
-                                f"open({str(marker)!r}, 'w')"])
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+    )
     assert (code, result["check"]) == (3, "import:pytest")
     assert not marker.exists()
     assert not list(out.iterdir()), "no receipt and no leftover probe after failure"
 
 
 def test_runtime_shadowing_drover_is_rejected(capsys, repo, out, tmp_path):
-    py = stub_python(tmp_path, drover_file="/Users/x/.drover/runtime/lib/drover/__init__.py")
+    py = stub_python(
+        tmp_path, drover_file="/Users/x/.drover/runtime/lib/drover/__init__.py"
+    )
     code, result = run(capsys, base_args(repo, out, py))
     assert (code, result["check"]) == (3, "import:drover")
 
 
 def test_unsupported_project_python_version(capsys, repo, out, tmp_path):
-    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"),
-                     version=(3, 10, 9))
+    py = stub_python(
+        tmp_path, drover_file=str(repo / "src/drover/__init__.py"), version=(3, 10, 9)
+    )
     code, result = run(capsys, base_args(repo, out, py))
     assert (code, result["check"]) == (3, "interpreter")
 
@@ -184,8 +231,11 @@ def test_unsupported_project_python_version(capsys, repo, out, tmp_path):
 @pytest.mark.parametrize("kind", ["shared_tmp", "missing", "read_only"])
 def test_invalid_or_denied_output(capsys, repo, tmp_path, shared_temp, kind):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
-    target = {"shared_tmp": shared_temp, "missing": tmp_path / "absent",
-              "read_only": tmp_path / "ro"}[kind]
+    target = {
+        "shared_tmp": shared_temp,
+        "missing": tmp_path / "absent",
+        "read_only": tmp_path / "ro",
+    }[kind]
     if kind == "read_only":
         target.mkdir()
         target.chmod(0o500)
@@ -202,21 +252,36 @@ def test_invalid_or_denied_output(capsys, repo, tmp_path, shared_temp, kind):
 
 def test_wrong_worktree_and_base(capsys, repo, out, tmp_path):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
-    code, result = run(capsys, [*base_args(repo, out, py), "--expect-worktree", tmp_path])
+    code, result = run(
+        capsys, [*base_args(repo, out, py), "--expect-worktree", tmp_path]
+    )
     assert (code, result["check"]) == (3, "worktree")
     code, result = run(capsys, [*base_args(repo, out, py), "--expect-base", "0" * 40])
     assert (code, result["check"]) == (3, "base")
 
 
-def test_valid_clean_context_writes_receipt_and_cleans_probe(capsys, repo, out, tmp_path):
+def test_valid_clean_context_writes_receipt_and_cleans_probe(
+    capsys, repo, out, tmp_path
+):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
     head = _git(repo, "rev-parse", "HEAD")
-    code, result = run(capsys, [*base_args(repo, out, py), "--expect-worktree", repo,
-                                "--expect-base", head, "--require-clean"])
+    code, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--expect-worktree",
+            repo,
+            "--expect-base",
+            head,
+            "--require-clean",
+        ],
+    )
     assert (code, result["classification"]) == (0, "pass")
     receipt = json.loads(Path(result["receipt"]).read_text())
     assert receipt["head"] == head and receipt["python_version"] == "3.14.7"
-    assert receipt["worktree"] == str(repo.resolve()) and len(receipt["lock_sha256"]) == 64
+    assert (
+        receipt["worktree"] == str(repo.resolve()) and len(receipt["lock_sha256"]) == 64
+    )
     assert [p.name for p in out.iterdir()] == [Path(result["receipt"]).name]
 
 
@@ -225,18 +290,35 @@ def test_stale_receipt_cannot_certify_new_source(capsys, repo, out, tmp_path):
     _, first = run(capsys, base_args(repo, out, py))
     (repo / "uv.lock").write_text("version = 2\n")
     _git(repo, "commit", "-qam", "lock change")
-    code, result = run(capsys, [*base_args(repo, out, py), "--verify-receipt", first["receipt"]])
+    code, result = run(
+        capsys, [*base_args(repo, out, py), "--verify-receipt", first["receipt"]]
+    )
     assert (code, result["check"]) == (3, "receipt")
     assert "head" in result["message"] and "lock_sha256" in result["message"]
 
 
-@pytest.mark.parametrize("rc,code,classification", [
-    (0, 0, "pass"), (1, 1, "product_test_failure"), (5, 4, "harness_failure"),
-])
-def test_then_classifies_focused_command(capsys, repo, out, tmp_path, rc, code, classification):
+@pytest.mark.parametrize(
+    "rc,code,classification",
+    [
+        (0, 0, "pass"),
+        (1, 1, "product_test_failure"),
+        (5, 4, "harness_failure"),
+    ],
+)
+def test_then_classifies_focused_command(
+    capsys, repo, out, tmp_path, rc, code, classification
+):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
-    got, result = run(capsys, [*base_args(repo, out, py), "--then", sys.executable, "-c",
-                               f"raise SystemExit({rc})"])
+    got, result = run(
+        capsys,
+        [
+            *base_args(repo, out, py),
+            "--then",
+            sys.executable,
+            "-c",
+            f"raise SystemExit({rc})",
+        ],
+    )
     assert (got, result["classification"]) == (code, classification)
 
 
@@ -246,8 +328,9 @@ def test_then_refuses_unversioned_python(capsys, repo, out, tmp_path):
     assert (code, result["check"]) == (4, "then")
 
 
-def test_cleanup_failure_is_harness_failure_and_retains_proof(capsys, repo, out, tmp_path,
-                                                              monkeypatch):
+def test_cleanup_failure_is_harness_failure_and_retains_proof(
+    capsys, repo, out, tmp_path, monkeypatch
+):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
 
     def deny(path):
@@ -263,39 +346,80 @@ def test_cleanup_failure_is_harness_failure_and_retains_proof(capsys, repo, out,
 
 # --- optional PostgreSQL fixture profile -------------------------------------
 
-GOOD_PG = {"user": "drover_test", "server_version_num": 170004, "read_only": "on",
-           "namespaces": 4, "host": "/Users/x/scratch/pg", "port": 55432,
-           "dbname": "postgres", "data_directory": "/Users/x/scratch/pg/data"}
+GOOD_PG = {
+    "user": "drover_test",
+    "server_version_num": 170004,
+    "read_only": "on",
+    "namespaces": 4,
+    "host": "/Users/x/scratch/pg",
+    "port": 55432,
+    "dbname": "postgres",
+    "data_directory": "/Users/x/scratch/pg/data",
+}
 
 
-def _pg_path(tmp_path: Path, client_major: int) -> str:
+def _pg_path(tmp_path: Path, client) -> str:
+    """client: int major, literal --version text, or None for no psql at all."""
     bindir = tmp_path / "pgbin"
     bindir.mkdir(exist_ok=True)
     psql = bindir / "psql"
-    psql.write_text(f"#!/bin/sh\necho 'psql (PostgreSQL) {client_major}.4'\n")
-    psql.chmod(0o755)
+    if client is None:
+        psql.unlink(missing_ok=True)
+    else:
+        text = (
+            f"psql (PostgreSQL) {client}.4 (Homebrew)"
+            if isinstance(client, int)
+            else client
+        )
+        psql.write_text(f"#!/bin/sh\necho '{text}'\n")
+        psql.chmod(0o755)
     return os.pathsep.join([str(bindir), GIT_DIR])
 
 
 def _pg_args(repo, out, py):
-    return [*base_args(repo, out, py), "--profile", "focused-tests-pg",
-            "--pg-dsn-env", "PREFLIGHT_TEST_DSN", "--pg-expect-role", "drover_test",
-            "--pg-expect-major", "17", "--pg-forbid-endpoint", "5432",
-            "--pg-expect-data-prefix", "/Users/x/scratch/"]
+    return [
+        *base_args(repo, out, py),
+        "--profile",
+        "focused-tests-pg",
+        "--pg-dsn-env",
+        "PREFLIGHT_TEST_DSN",
+        "--pg-expect-role",
+        "drover_test",
+        "--pg-expect-major",
+        "17",
+        "--pg-forbid-endpoint",
+        "5432",
+        "--pg-expect-data-prefix",
+        "/Users/x/scratch/",
+    ]
 
 
-@pytest.mark.parametrize("override,client,check", [
-    ({}, 17, None),
-    ({"user": "postgres"}, 17, "pg:role"),
-    ({"port": 5432, "host": "/tmp"}, 17, "pg:endpoint"),
-    ({"data_directory": "/opt/homebrew/var/postgresql@17"}, 17, "pg:data_directory"),
-    ({"server_version_num": 160004}, 17, "pg:version"),
-    ({}, 16, "pg:binary"),
-])
-def test_pg_fixture_checks(capsys, repo, out, tmp_path, monkeypatch, override, client, check):
-    monkeypatch.setenv("PREFLIGHT_TEST_DSN", "host=/x port=1 user=drover_test password=hunter2")
-    py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"),
-                     pg={**GOOD_PG, **override})
+@pytest.mark.parametrize(
+    "override,client,check",
+    [
+        ({}, 17, None),
+        ({"user": "postgres"}, 17, "pg:role"),
+        ({"port": 5432, "host": "/tmp"}, 17, "pg:endpoint"),
+        (
+            {"data_directory": "/opt/homebrew/var/postgresql@17"},
+            17,
+            "pg:data_directory",
+        ),
+        ({"server_version_num": 160004}, 17, "pg:version"),
+        ({}, 16, "pg:binary"),
+    ],
+)
+def test_pg_fixture_checks(
+    capsys, repo, out, tmp_path, monkeypatch, override, client, check
+):
+    monkeypatch.setenv(
+        "PREFLIGHT_TEST_DSN", "host=/x port=1 user=drover_test password=hunter2"
+    )
+    py = stub_python(
+        tmp_path,
+        drover_file=str(repo / "src/drover/__init__.py"),
+        pg={**GOOD_PG, **override},
+    )
     code, result = run(capsys, _pg_args(repo, out, py), path=_pg_path(tmp_path, client))
     assert result.get("check") == check, result
     assert code == (0 if check is None else 3)
@@ -303,8 +427,72 @@ def test_pg_fixture_checks(capsys, repo, out, tmp_path, monkeypatch, override, c
     assert "hunter2" not in blob
 
 
-def test_pg_profile_requires_dsn_and_plain_profile_never_probes_pg(capsys, repo, out,
-                                                                    tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "client", [None, "psql: not a postgres client", "psql (PostgreSQL)"]
+)
+def test_pg_missing_or_malformed_client_blocks_expensive_work(
+    capsys, repo, out, tmp_path, monkeypatch, client
+):
+    monkeypatch.setenv("PREFLIGHT_TEST_DSN", "host=/x port=1 user=drover_test")
+    py = stub_python(
+        tmp_path, drover_file=str(repo / "src/drover/__init__.py"), pg=GOOD_PG
+    )
+    marker = tmp_path / "expensive-ran"
+    code, result = run(
+        capsys,
+        [
+            *_pg_args(repo, out, py),
+            "--then",
+            sys.executable,
+            "-c",
+            f"open({str(marker)!r}, 'w')",
+        ],
+        path=_pg_path(tmp_path, client),
+    )
+    assert (code, result["check"]) == (3, "pg:binary"), result
+    assert not marker.exists()
+    assert not list(out.iterdir()), "no receipt after a PG binary failure"
+
+
+@pytest.mark.parametrize(
+    "override,client",
+    [
+        ({"port": 55433}, 17),
+        ({"user": "other_role"}, 17),
+        ({"server_version_num": 180001}, 18),
+        ({"data_directory": "/Users/x/scratch/pg2/data"}, 17),
+    ],
+)
+def test_receipt_cannot_certify_a_different_pg_fixture(
+    capsys, repo, out, tmp_path, monkeypatch, override, client
+):
+    # No expectation flags: each second fixture is individually acceptable, so
+    # only receipt binding can tell that it is not the fixture first certified.
+    monkeypatch.setenv("PREFLIGHT_TEST_DSN", "host=/x port=1 user=drover_test")
+    drover = str(repo / "src/drover/__init__.py")
+    py = stub_python(tmp_path, drover_file=drover, pg=GOOD_PG)
+    args = [
+        *base_args(repo, out, py),
+        "--profile",
+        "focused-tests-pg",
+        "--pg-dsn-env",
+        "PREFLIGHT_TEST_DSN",
+    ]
+    _, first = run(capsys, args, path=_pg_path(tmp_path, 17))
+    assert first["classification"] == "pass", first
+    stub_python(tmp_path, drover_file=drover, pg={**GOOD_PG, **override})
+    code, result = run(
+        capsys,
+        [*args, "--verify-receipt", first["receipt"]],
+        path=_pg_path(tmp_path, client),
+    )
+    assert (code, result["check"]) == (3, "receipt"), result
+    assert "'pg'" in result["message"]
+
+
+def test_pg_profile_requires_dsn_and_plain_profile_never_probes_pg(
+    capsys, repo, out, tmp_path, monkeypatch
+):
     monkeypatch.delenv("PREFLIGHT_TEST_DSN", raising=False)
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
     code, result = run(capsys, _pg_args(repo, out, py), path=_pg_path(tmp_path, 17))
@@ -317,9 +505,14 @@ def test_pg_profile_requires_dsn_and_plain_profile_never_probes_pg(capsys, repo,
 
 
 def test_real_locked_interpreter_against_this_checkout(capsys, out):
-    if not (ROOT / ".venv").exists() or ROOT.resolve() not in Path(sys.prefix).resolve().parents:
+    if (
+        not (ROOT / ".venv").exists()
+        or ROOT.resolve() not in Path(sys.prefix).resolve().parents
+    ):
         pytest.skip("needs this checkout's own uv venv")
-    code, result = run(capsys, ["--root", ROOT, "--out", out, "--python", sys.executable])
+    code, result = run(
+        capsys, ["--root", ROOT, "--out", out, "--python", sys.executable]
+    )
     assert (code, result["classification"]) == (0, "pass"), result
     receipt = json.loads(Path(result["receipt"]).read_text())
     assert receipt["python_version"] == ".".join(map(str, sys.version_info[:3]))
