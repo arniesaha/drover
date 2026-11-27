@@ -7,8 +7,8 @@ import pytest
 from test_work_queue_execution import complete, launch, service, update  # noqa: F401
 from test_work_queue_github import Response
 
-from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.config import GoalScope
+from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.service import identity
 
 SHA = "a" * 40
