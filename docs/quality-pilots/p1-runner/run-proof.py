@@ -69,7 +69,37 @@ with tempfile.TemporaryDirectory(prefix='cohort1024-owner-seed-') as temp:
     print(json.dumps({'owner_heldout_seed':'forbidden analytical import','observed_exit':code,'classification':report['classification'],'expected_rejection':True}))
 """
 commands.append(["-c", seed_code])
+unknown_quota_admission_code = r"""
+import json
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from drover.server.work_queue.service import WorkDenied, route
+
+now = datetime.now(timezone.utc)
+unknown = {
+    'provider': 'openai',
+    'status': 'ok',
+    'hosts': ['owner-held-fixture'],
+    'windows': [{
+        'kind': 'primary',
+        'status': 'usage_unavailable',
+        'used_percent': None,
+        'resets_at': (now + timedelta(hours=1)).isoformat(),
+    }],
+}
+policy = SimpleNamespace(quota=SimpleNamespace(reserve_fraction=0.1))
+try:
+    route([unknown], policy, 5, {('owner-held-fixture', 'codex')})
+except WorkDenied as exc:
+    assert str(exc) == 'quota or capability unavailable', exc
+    print(json.dumps({'denied': True, 'reason': str(exc)}))
+else:
+    raise AssertionError('unknown quota admitted work')
+"""
+commands.append(["-c", unknown_quota_admission_code])
 results = []
+unknown_quota_admission = None
 for i, args in enumerate(commands):
     r = subprocess.run(
         [a.python, *args], cwd=root, env=env, capture_output=True, text=True, timeout=50
@@ -83,6 +113,11 @@ for i, args in enumerate(commands):
             "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
         }
     )
+    if i == 3 and r.returncode == 0:
+        try:
+            unknown_quota_admission = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            pass
     if r.returncode:
         break
 counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
@@ -91,10 +126,12 @@ if (out / "results.xml").exists():
         for k in counts:
             counts[k] += int(suite.get(k, 0))
 passed = (
-    len(results) == 3
+    len(results) == 4
     and all(x["returncode"] == 0 for x in results)
     and counts["tests"] >= 5
     and not any(counts[k] for k in ("failures", "errors", "skipped"))
+    and unknown_quota_admission
+    == {"denied": True, "reason": "quota or capability unavailable"}
 )
 receipt = {
     "source": PIN,
@@ -106,6 +143,7 @@ receipt = {
     ).strip(),
     "commands": results,
     "counts": counts,
+    "unknown_quota_admission": unknown_quota_admission,
     "passed": passed,
     "scope": "isolated structural/quota behavior; not live GitHub acceptance or profile installation",
 }

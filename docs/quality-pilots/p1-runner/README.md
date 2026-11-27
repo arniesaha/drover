@@ -4,19 +4,21 @@ Parent #1024; bounded pilot issue #1031; PR #1029 immutable head `5202c2359483a5
 
 ## Concrete preparation completed
 
-- Complete proposed profile uses the explicit `independent_check` mode. Current candidate revision: `a2faaad79483a3d310af06f13dcb97ffeadca3b0ca82fa56742e3f6777558f06`. Its configured GitHub Actions App is the verdict source; it neither requests nor represents a GitHub human approval. The candidate remains NOT installed, and every final field change requires regeneration and Arnab's reviewed installation decision.
-- Owner executed the exact pinned source using `run-proof.py`: 36 tests passed, zero failures/errors/skips; strict boundary passed; an additional owner-constructed forbidden import was rejected with exit 1/classification violation. Python 3.14.7 validation is not a claim that the prepared hosted Python 3.11 workflow ran. Dependency lock SHA256: `6c13fe4a81a30bc31a2216f6cef1defef00ad53a46c159f9dab139747f607b22`.
+- The retained revision `a2faaad79483a3d310af06f13dcb97ffeadca3b0ca82fa56742e3f6777558f06` and check `140609025810` remain incomplete historical evidence: their three-command proof did not call `route()` with unknown quota. The amended complete-model revision is `228c9ccced9eac01eea57b8971d83195ab3f25f18e1870b30283f6a0128aed7c` and requires four successful commands plus the exact direct denial observation. It preserves the immutable candidate, criteria, App, and `independent_check` mode. Arnab's existing #1024 authority may install the reviewed amended profile after normal exact-head CI; this mode neither creates nor requires a second GitHub human approval.
+- The retained three-command proof covers 36 tests, the strict boundary, and the held-out forbidden import, but it does **not** directly exercise unknown-quota admission. `run-proof.py` now requires a fourth fresh-process command that passes an unknown quota window to `route()` and records its explicit denial. `publish-check.py` rejects any receipt without that observation, including the retained three-command receipt. Python 3.14.7 validation is not a claim that the prepared hosted Python 3.11 workflow ran. Dependency lock SHA256: `6c13fe4a81a30bc31a2216f6cef1defef00ad53a46c159f9dab139747f607b22`.
 - The prepared `.github/workflows/cohort1024-independent-quota.yml` and inert example use the existing GitHub Actions App15368. Producer code comes from protected main at the dispatched revision; candidate source is fixed, not an input. Credential-free proof and short-lived check publication are separate fresh hosted jobs. No self-hosted runner, new App, stored secret, or provider setup is proposed. This is for this reviewed immutable candidate, not a sandbox for arbitrary hostile source.
-- `publish-check.py` checks source, counts, complete profile revision and exact PR head, and reconciles an identical existing publication. It will only publish an `independent_check` profile and makes no review request. No check, review, config or permission was written during preparation.
+- `publish-check.py` checks source, command shape, direct unknown-quota denial, counts, complete profile revision and exact PR head, and reconciles only an identical existing publication. It will only publish an `independent_check` profile and makes no review request. No check, review, config or permission was written during preparation.
 
 ## Exact decisions remaining - after this reviewable preparation
 
 1. Arnab reviews the exact `independent_check` profile and the retrieved check output. The mode deliberately does not create or require a GitHub human approval; an agent output is never recorded as one.
 2. Arnab reviews and, if appropriate, merges the protected-main producer. Its fresh publication job alone has `checks: write`; proof remains credential-free. No attempt was made to mint an App token or alter repository-wide permissions.
 
-After those decisions: retain the complete profile keyed to issue1031 unchanged
-so its published check external ID remains
-`a2faaad79483a3d310af06f13dcb97ffeadca3b0ca82fa56742e3f6777558f06`.
+After those decisions, use the amended complete profile keyed to issue1031 and
+its new revision identity. The retained publication keeps its old identity and
+three-command receipt. `publish-check.py` deliberately refuses to overwrite a
+different prior publication, so the amended profile is the explicit corrected
+identity for a later reviewed live proof. This commit does not install it.
 In private reviewed server configuration, add the exact issue1031
 `github_existing_session_bindings` record from retained work and independent
 verifier session/turn IDs plus source head. Do not put session IDs in this
