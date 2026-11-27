@@ -32,6 +32,13 @@ the normal `verified` request, and verify one-close/retry. Reconcile uncertain
 publication before any retry. The parent issue must remain open until every
 cohort criterion, including the orchestration gap, is accepted.
 
+If a new retained user input supersedes this reviewed pair before acceptance,
+review and install a new exact binding for that latest work/verifier pair, then
+repeat the same bind request. The prior pair remains audit history and cannot
+verify after the configuration changes. This recovery is available only before
+any old pair progress, verification intent/outcome, or uncertain close; those
+states require reconciliation rather than another bind.
+
 ## Structural orchestration verdict - still OPEN
 
 The installed PR1030 continuity decision function was exercised read-only with preserved issue/authority/checkpoint facts:

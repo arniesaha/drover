@@ -204,6 +204,16 @@ class WorkStore:
                 )
             )
 
+    def link_events(self, link_id):
+        """Return the retained decision history tied to one execution link."""
+        with self.connection() as con:
+            return self.rows(
+                con.execute(
+                    "SELECT * FROM decision_events WHERE workspace_id = ? AND execution_link_id = ? ORDER BY created_at, id",
+                    [self.workspace_id, link_id],
+                )
+            )
+
     def decisions(self, ref):
         with self.connection() as con:
             return self.rows(
