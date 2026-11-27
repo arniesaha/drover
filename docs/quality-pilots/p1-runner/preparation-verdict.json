@@ -1,0 +1,14 @@
+{
+  "pilot_issue": 1031,
+  "parent_issue": 1024,
+  "source": "5202c2359483a58b2916c58acac5f11ee2df20b8",
+  "tests": 36,
+  "skipped": 0,
+  "owner_heldout_seed_rejected": true,
+  "profile_schema_valid": true,
+  "profile_deployable": false,
+  "live_accepted": 0,
+  "producer_installed": false,
+  "permission_changed": false,
+  "structural_orchestration_accepted": false
+}
