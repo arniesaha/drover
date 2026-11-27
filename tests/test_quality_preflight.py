@@ -24,6 +24,21 @@ preflight = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(preflight)
 
 GIT_DIR = str(Path(shutil.which("git")).parent)
+DEFAULT_SHARED = preflight.SHARED_TEMP_ROOTS
+
+
+@pytest.fixture(autouse=True)
+def shared_temp(tmp_path, monkeypatch) -> Path:
+    """Hermetic shared-temp policy: tmp_path itself may live under /tmp when
+    TMPDIR is unset (clean ``env -i`` shell), so tests substitute a fake root."""
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    monkeypatch.setattr(preflight, "SHARED_TEMP_ROOTS", (str(shared),))
+    return shared
+
+
+def test_default_policy_refuses_system_temp_roots():
+    assert {"/tmp", "/private/tmp", "/var/tmp"} <= set(DEFAULT_SHARED)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -167,9 +182,9 @@ def test_unsupported_project_python_version(capsys, repo, out, tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["shared_tmp", "missing", "read_only"])
-def test_invalid_or_denied_output(capsys, repo, tmp_path, kind):
+def test_invalid_or_denied_output(capsys, repo, tmp_path, shared_temp, kind):
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
-    target = {"shared_tmp": Path("/tmp"), "missing": tmp_path / "absent",
+    target = {"shared_tmp": shared_temp, "missing": tmp_path / "absent",
               "read_only": tmp_path / "ro"}[kind]
     if kind == "read_only":
         target.mkdir()

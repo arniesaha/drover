@@ -26,10 +26,12 @@ uv sync --locked --extra dev
 mkdir -p ~/scratch/preflight
 sh scripts/quality/preflight.sh --out ~/scratch/preflight \
   --expect-base <base-sha> --require-clean \
-  --then '{python}' -m pytest -q tests/test_quality_preflight.py
+  --then '{python}' -m pytest -q --basetemp ~/scratch/preflight/pytest \
+  tests/test_quality_preflight.py
 ```
 
-`{python}` is replaced with the interpreter the preflight verified. A bare
+`--basetemp` keeps pytest artifacts out of `/tmp`. A clean `env -i` shell has
+no `TMPDIR`, so pytest would otherwise fall back to `/tmp`. `{python}` is replaced with the interpreter the preflight verified. A bare
 `python`/`python3` as the `--then` command is refused (harness_failure).
 Without `--then` the preflight only checks and writes its receipt.
 
@@ -112,7 +114,7 @@ canonical line:
 
 ```sh
 sh scripts/quality/preflight.sh --out ~/scratch/<run> --expect-base <base-sha> \
-  --then '{python}' -m pytest -q <focused test paths>
+  --then '{python}' -m pytest -q --basetemp ~/scratch/<run>/pytest <focused test paths>
 ```
 
 For PG-backed focused tests, add `--profile focused-tests-pg --pg-dsn-env
