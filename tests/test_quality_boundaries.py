@@ -185,25 +185,20 @@ def test_unmatched_root_or_bad_source_is_harness_failure(capsys, tmp_path):
     assert _guard(capsys, _tree(tmp_path, **{ROOT_FILE: "def (:\n"}))[0] == 4
 
 
-def test_real_source_characterized_violation_and_ratchet(capsys):
-    code, report = _guard(capsys, ROOT / "src", boundary=boundaries.BOUNDARIES[0])
-    hits = report["boundaries"]["work-coordinator-control"]
-    assert code == 1 and {h["forbidden"] for h in hits} == {"drover.server.mcp.tools"}
-    assert hits[0]["path"][0].startswith("drover.server.work_queue.")
-    assert "(lazy)" in hits[0]["path"][0]
-    for flags in (["--ratchet"], ["--eager-only"]):
-        assert (
-            _guard(capsys, ROOT / "src", *flags, boundary=boundaries.BOUNDARIES[0])[0]
-            == 0
-        ), flags
+def test_real_source_passes_strict_without_known_edges(capsys):
+    boundary = boundaries.BOUNDARIES[0]
+    assert boundary.known == ()
+    code, report = _guard(capsys, ROOT / "src", boundary=boundary)
+    assert code == 0
+    assert report["boundaries"]["work-coordinator-control"] == []
 
 
-def test_seeded_real_tree_import_of_lake_fails_the_ratchet(capsys, tmp_path):
+def test_seeded_real_tree_import_of_lake_fails_strict(capsys, tmp_path):
     src = tmp_path / "src"
     shutil.copytree(ROOT / "src" / "drover", src / "drover")
     target = src / "drover" / "server" / "work_queue" / "provider.py"
     target.write_text(target.read_text() + "\nimport drover.server.lake.serving\n")
-    code, report = _guard(capsys, src, "--ratchet", boundary=boundaries.BOUNDARIES[0])
+    code, report = _guard(capsys, src, boundary=boundaries.BOUNDARIES[0])
     hits = report["boundaries"]["work-coordinator-control"]
     assert code == 1 and [h["forbidden"] for h in hits] == ["drover.server.lake"]
     assert hits[0]["path"][0].startswith("drover.server.work_queue.provider:")

@@ -57,12 +57,6 @@ BOUNDARIES = (
             "anthropic",
             "opentelemetry",
         ),
-        # Characterized in docs/operations/structural-quality.md (#1024): quota
-        # admission and routing lazily import the MCP read-tool module.
-        known=(
-            ("drover.server.work_queue.runtime", "drover.server.mcp.tools"),
-            ("drover.server.work_queue.service", "drover.server.mcp.tools"),
-        ),
     ),
 )
 
