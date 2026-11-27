@@ -87,7 +87,17 @@ def unprofiled_observations(service):
         seen["launch_accepts_spec_request"] = verify["run_key"] == wanted[1]
     except ValueError:
         seen["launch_accepts_spec_request"] = False
-        return seen
+        # Continue on the service's own (self-consistent) request so a wrong
+        # derivation is still followed through to the acceptance decision.
+        verify = service.launch(
+            "goal",
+            1,
+            service._verification_request("goal", 1, work, item)[0],
+            5,
+            actor=ACTOR,
+            run_role="verify",
+            parent_session_id=work["session_id"],
+        )
 
     # Caller: update(action="verified"). Changed criteria invalidate; the
     # original criteria accept exactly once.
@@ -151,7 +161,9 @@ def _unsorted_compact_encoding(workspace, goal, number, parent, criteria):
     [
         (_drop_criteria, "update_refuses_changed_criteria"),
         (_ignore_parent, "request_matches_spec"),
-        (_swap_goal_and_number, "launch_accepts_spec_request"),
+        # ``launch`` stores its run key with its own role-generic expression,
+        # so a wrong verify run key surfaces when acceptance recomputes it.
+        (_swap_goal_and_number, "update_accepts_original"),
         (_unsorted_compact_encoding, "request_matches_spec"),
     ],
 )
