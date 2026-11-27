@@ -260,6 +260,23 @@ def test_existing_completed_sessions_bind_once_without_relaunch(service, monkeyp
     assert [(row["id"], row["run_key"]) for row in repeated["links"]] == [
         (row["id"], row["run_key"]) for row in bound["links"]
     ]
+    binding_events = [
+        event
+        for link in bound["links"]
+        for event in service.store.events(
+            identity(link["run_key"], "bind-existing-session")
+        )
+    ]
+    assert [
+        (event["event_kind"], event["action_category"], event["outcome"])
+        for event in binding_events
+    ] == [
+        ("policy", "bind_existing_session", "bound"),
+        ("policy", "bind_existing_session", "bound"),
+    ]
+    assert {event["execution_link_id"] for event in binding_events} == {
+        link["id"] for link in bound["links"]
+    }
 
     client.evidence = dict(
         id=7,
@@ -372,31 +389,40 @@ def test_existing_session_binding_rechecks_terminal_provenance_at_verdict(
     assert client.closed == 0
 
 
-def test_existing_session_reader_requires_persisted_terminal_turn(pg_control_path):
+def test_existing_session_reader_requires_exact_persisted_terminal_turn(
+    pg_control_path,
+):
     registry = HarnessRegistry(pg_control_path)
     registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
-    registry.create_session(
-        session_id="existing-registry-session",
-        host_id="fixture",
-        harness="codex",
-        command="codex",
-        status="completed",
-        repo_owner="example",
-        repo_name="project",
-    )
-    registry.append_event(
-        session_id="existing-registry-session",
-        event_type="user_input",
-        payload={"turn_id": "retained-turn"},
-    )
-    registry.append_event(
-        session_id="existing-registry-session",
-        event_type="status",
-        payload={"turn_id": "retained-turn", "payload": {"exited": 0}},
-    )
     bridge = object.__new__(HarnessBridge)
     bridge.registry = registry
 
+    def session(name):
+        registry.create_session(
+            session_id=name,
+            host_id="fixture",
+            harness="codex",
+            command="codex",
+            status="completed",
+            repo_owner="example",
+            repo_name="project",
+        )
+
+    def input_turn(name, turn):
+        registry.append_event(
+            session_id=name, event_type="user_input", payload={"turn_id": turn}
+        )
+
+    def terminal_turn(name, turn, exited):
+        registry.append_event(
+            session_id=name,
+            event_type="status",
+            payload={"turn_id": turn, "payload": {"exited": exited}},
+        )
+
+    session("existing-registry-session")
+    input_turn("existing-registry-session", "retained-turn")
+    terminal_turn("existing-registry-session", "retained-turn", 0)
     assert (
         bridge.existing_session(
             "existing-registry-session", "retained-turn", "example/project"
@@ -406,6 +432,52 @@ def test_existing_session_reader_requires_persisted_terminal_turn(pg_control_pat
     assert (
         bridge.existing_session(
             "existing-registry-session", "wrong-turn", "example/project"
+        )
+        is None
+    )
+
+    # A newer queued or active input invalidates the older terminal result,
+    # even while a stale session row still says completed.
+    input_turn("existing-registry-session", "newer-queued-or-active-turn")
+    assert (
+        bridge.existing_session(
+            "existing-registry-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-failed-session")
+    input_turn("existing-failed-session", "retained-turn")
+    terminal_turn("existing-failed-session", "retained-turn", 1)
+    assert (
+        bridge.existing_session(
+            "existing-failed-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-missing-status-session")
+    input_turn("existing-missing-status-session", "retained-turn")
+    assert (
+        bridge.existing_session(
+            "existing-missing-status-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-missing-input-session")
+    terminal_turn("existing-missing-input-session", "retained-turn", 0)
+    assert (
+        bridge.existing_session(
+            "existing-missing-input-session", "retained-turn", "example/project"
+        )
+        is None
+    )
+
+    session("existing-completed-only-session")
+    assert (
+        bridge.existing_session(
+            "existing-completed-only-session", "retained-turn", "example/project"
         )
         is None
     )

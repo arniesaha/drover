@@ -82,7 +82,9 @@ result. The session IDs must differ. `running`, `created`/queued, failed,
 missing, wrong-repository, or ambiguous records fail closed; `awaiting: input`
 alone never qualifies. The issue key/profile revision bind the pair to the exact
 issue; `source_head` binds it to the configured PR source. The binding is stored
-immutably on each generated link; historical links without it remain unchanged.
+as one append-only, link-keyed `bind_existing_session` policy event for each
+generated link. Historical links without that event remain unchanged; the
+existing signed local-file continuity envelope is not reused or overwritten.
 
 With the issue in its ordinary `status:review` state, a coordinator calls:
 

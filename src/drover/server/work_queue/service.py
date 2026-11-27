@@ -655,7 +655,9 @@ class WorkService:
         return self.store.associate(run_key, session_id, pr)
 
     def _existing_session_binding(self, row):
-        binding = self.store.existing_session_binding(row["run_key"])
+        binding = self.store.existing_session_binding(
+            identity(row["run_key"], "bind-existing-session"), row["id"]
+        )
         if binding is None:
             return None
         required = {
@@ -756,14 +758,21 @@ class WorkService:
             actor.principal, ref, goal_id, work_key, "work", 0, goal_ref
         )
         self.store.bind_existing_session(
-            work_key, self._existing_binding_payload(binding, role="work")
+            actor.principal,
+            ref,
+            identity(work_key, "bind-existing-session"),
+            work["id"],
+            self._existing_binding_payload(binding, role="work"),
         )
         work = self.store.associate(work_key, work_session.session_id)
         verify = self.store.intent(
             actor.principal, ref, goal_id, verify_key, "verify", 0, goal_ref
         )
         self.store.bind_existing_session(
-            verify_key,
+            actor.principal,
+            ref,
+            identity(verify_key, "bind-existing-session"),
+            verify["id"],
             self._existing_binding_payload(
                 binding, role="verify", parent_run_key=work_key
             ),
