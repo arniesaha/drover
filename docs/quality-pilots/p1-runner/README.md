@@ -1,4 +1,4 @@
-# Prepared independent P1 runner — not installed or approved
+# Prepared independent P1 runner - not installed or approved
 
 Parent #1024; bounded pilot issue #1031; PR #1029 immutable head `5202c2359483a58b2916c58acac5f11ee2df20b8`.
 
@@ -9,14 +9,14 @@ Parent #1024; bounded pilot issue #1031; PR #1029 immutable head `5202c2359483a5
 - Inert `independent-quota.yml.example` stages the existing GitHub Actions App15368. Producer code comes from protected main at the dispatched revision; candidate source is fixed, not an input. Credential-free proof and short-lived check publication are separate fresh hosted jobs. No self-hosted runner, new App, stored secret, or provider setup is proposed. This is for this reviewed immutable candidate, not a sandbox for arbitrary hostile source.
 - `publish-check.py` checks source, counts, full profile revision and exact PR head, and reconciles an identical existing publication. It refuses the current self-review binding before reading a credential or making an HTTP request. No check, review, config or permission was written.
 
-## Exact decisions remaining — after this reviewable preparation
+## Exact decisions remaining - after this reviewable preparation
 
 1. Select a separately authorized **human other than PR author arniesaha (ID3646287)** to independently review PR #1029 at the pinned head. GitHub prohibits authors approving their own PR. An agent using human credentials is not a substitute. No suitable second human identity is established by current authority; do not invent one. If no eligible reviewer exists, explicitly select a different eligible bounded task rather than weaken the gate.
-2. Independently review the proposed protected-main producer and allow only its fresh publication job `checks: write`. Repository Actions default is read-only; existing CI uses contents:read, has no revision-bound retained behavioral summary, and is not this independent producer. This file is inert: reviewing it has not granted a permission. The exact missing facility is a reviewed, installed dispatch producer with check-write permission—not a missing newly-created App. No attempt was made to mint an App token or alter permission settings.
+2. Independently review the proposed protected-main producer and allow only its fresh publication job `checks: write`. Repository Actions default is read-only; existing CI uses contents:read, has no revision-bound retained behavioral summary, and is not this independent producer. This file is inert: reviewing it has not granted a permission. The exact missing facility is a reviewed, installed dispatch producer with check-write permission-not a missing newly-created App. No attempt was made to mint an App token or alter permission settings.
 
 After those decisions: resolve/verify the eligible human ID; amend/hash/review the complete profile keyed to issue1031; review/install the exact producer and profile under existing owner safeguards; run it once; independently retrieve the check output; obtain the genuine head/revision-bound review token; then use supported work/verifier/coordinator acceptance and verify one-close/retry. Reconcile uncertain publication before any retry. The parent issue must remain open until every cohort criterion, including the orchestration gap, is accepted.
 
-## Structural orchestration verdict — still OPEN
+## Structural orchestration verdict - still OPEN
 
 The installed PR1030 continuity decision function was exercised read-only with preserved issue/authority/checkpoint facts:
 
