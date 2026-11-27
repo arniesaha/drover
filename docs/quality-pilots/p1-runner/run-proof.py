@@ -107,7 +107,7 @@ receipt = {
     "commands": results,
     "counts": counts,
     "passed": passed,
-    "scope": "isolated structural/quota behavior; not live GitHub acceptance or human approval",
+    "scope": "isolated structural/quota behavior; not live GitHub acceptance or profile installation",
 }
 (out / "proof.json").write_text(json.dumps(receipt, indent=2))
 print(json.dumps(receipt, indent=2))

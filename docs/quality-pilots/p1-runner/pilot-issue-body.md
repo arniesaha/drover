@@ -8,6 +8,6 @@ At PR1029 head 5202c2359483a58b2916c58acac5f11ee2df20b8, command-plane quota rea
 
 Source: PR #1029, exact head `5202c2359483a58b2916c58acac5f11ee2df20b8`.
 
-Execution recipe prepared and owner-tested in the parent packet; intended producer is existing github-actions App15368 via a separately reviewed protected-main dispatch workflow, not candidate-owned CI. No App creation or credentials are needed by this proposed route. Checks publication currently lacks an enabled reviewed workflow with narrowly scoped checks:write. Genuine human approval must come from an authorized human other than this PR author.
+Execution recipe prepared and owner-tested in the parent packet; intended producer is existing github-actions App15368 via the reviewed protected-main dispatch workflow, not candidate-owned CI. The explicit `independent_check` profile mode binds that App's exact-head output as evidence and does not represent it as a GitHub human approval. Arnab remains the sole human decision-maker for review and installation. No App creation or credentials are needed by this proposed route.
 
-Retain zero live accepted outcomes until producer publication, independent human approval, installed profile and supported coordinator/one-close retry evidence exist. No service, permissions, credentials or approval changed by opening this tracker.
+Retain zero live accepted outcomes until producer publication, installed profile and supported coordinator/one-close retry evidence exist. No service, permissions, credentials or approval changed by opening this tracker.

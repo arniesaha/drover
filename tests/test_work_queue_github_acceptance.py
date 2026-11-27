@@ -1,13 +1,15 @@
 """Pilot acceptance crosses WorkService and the GitHub HTTP client seam."""
 
 import copy
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from test_work_queue_execution import complete, launch, service, update  # noqa: F401
 from test_work_queue_github import Response
 
-from drover.server.work_queue.config import GoalScope
+from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
 from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.service import identity
 
@@ -97,11 +99,11 @@ class GitHub:
         return Response(data, 200 if path in routes else 404)
 
 
-def pilot(service):
+def pilot(service, profile=PROFILE):
     work = launch(service)
     service.harness.sessions[work["run_key"]].status = "completed"
     config = service.config.goals[0].model_dump()
-    config["github_acceptance_profiles"] = {"1": PROFILE}
+    config["github_acceptance_profiles"] = {"1": profile}
     config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
     scope = GoalScope.model_validate(config)
     service.config = service.config.model_copy(update={"goals": [scope]})
@@ -128,9 +130,9 @@ def test_forged_flags_and_evidence_label_cannot_close_pilot(service, monkeypatch
     assert client.closed == 0
 
 
-def ready(service, monkeypatch):
+def ready(service, monkeypatch, profile=PROFILE):
     monkeypatch.setenv("TEST_TOKEN", "synthetic")
-    client, verify = pilot(service)
+    client, verify = pilot(service, profile)
     service.harness.sessions[verify["run_key"]].status = "completed"
     profile = service.config.goals[0].github_acceptance_profiles["1"]
     client.evidence = dict(
@@ -155,6 +157,16 @@ def verdict(service, verify):
     return update(service, verify, "verified", evidence_key="check-run:7:review:8")
 
 
+def independent_profile():
+    profile = dict(PROFILE, review_mode="independent_check")
+    profile.pop("owner_id")
+    return profile
+
+
+def independent_verdict(service, verify):
+    return update(service, verify, "verified", evidence_key="check-run:7")
+
+
 def test_provider_evidence_and_owner_review_close_once_despite_routine_notes(
     service, monkeypatch
 ):
@@ -171,6 +183,84 @@ def test_provider_evidence_and_owner_review_close_once_despite_routine_notes(
     assert proof["evidence"] == "check-run:7:review:8"
     assert proof["behavioral_result"]["bytes"] > 0
     assert len(proof["behavioral_result"]["sha256"]) == 64
+
+
+def test_explicit_independent_check_profile_does_not_require_human_review(
+    service, monkeypatch
+):
+    client, verify = ready(service, monkeypatch, independent_profile())
+    assert independent_verdict(service, verify) == {"outcome": "verified"}
+    assert client.closed == 1
+    assert not any("/reviews/" in path for _, path in client.reads)
+
+
+def test_independent_check_mode_still_requires_configured_producer(
+    service, monkeypatch
+):
+    client, verify = ready(service, monkeypatch, independent_profile())
+    client.evidence["app"] = {"id": 99}
+    with pytest.raises(ValueError, match="behavioral evidence"):
+        independent_verdict(service, verify)
+    assert client.closed == 0
+
+
+def test_human_review_mode_rejects_check_only_evidence(service, monkeypatch):
+    client, verify = ready(service, monkeypatch)
+    with pytest.raises(ValueError, match="resolvable provider evidence"):
+        independent_verdict(service, verify)
+    assert client.closed == 0
+
+
+def test_unsupported_review_mode_cannot_be_installed(service):
+    from pydantic import ValidationError
+
+    config = service.config.goals[0].model_dump()
+    profile = dict(PROFILE, review_mode="automatic")
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    with pytest.raises(ValidationError):
+        GoalScope.model_validate(config)
+
+
+def test_human_review_mode_requires_a_configured_human(service):
+    from pydantic import ValidationError
+
+    config = service.config.goals[0].model_dump()
+    profile = dict(PROFILE)
+    profile.pop("owner_id")
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    with pytest.raises(ValidationError, match="requires an owner"):
+        GoalScope.model_validate(config)
+
+
+def test_independent_mode_cannot_select_a_human_reviewer(service):
+    from pydantic import ValidationError
+
+    config = service.config.goals[0].model_dump()
+    config["github_acceptance_profiles"] = {
+        "1": dict(PROFILE, review_mode="independent_check")
+    }
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    with pytest.raises(ValidationError, match="cannot select a human"):
+        GoalScope.model_validate(config)
+
+
+def test_p1_profile_uses_the_independent_check_revision_contract():
+    profile_path = (
+        Path(__file__).parents[1]
+        / "docs/quality-pilots/p1-runner/profile-candidate.json"
+    )
+    raw = json.loads(profile_path.read_text())
+    profile = GitHubAcceptanceProfile.model_validate(raw)
+    assert profile.review_mode == "independent_check"
+    assert profile.owner_id is None
+    assert (
+        profile.revision
+        == hashlib.sha256(
+            json.dumps(dict(raw, owner_id=None), sort_keys=True).encode()
+        ).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(

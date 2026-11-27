@@ -182,8 +182,20 @@ class GitHubAcceptanceProfile(Model):
     instructions: str = Field(min_length=1, max_length=16000)
     behavioral_check: str = Field(min_length=1, max_length=100)
     app_id: int = Field(gt=0)
-    owner_id: int = Field(gt=0)
+    # The historical human mode remains the default.  An exact profile may
+    # instead select the independently configured behavioral check as its
+    # verdict source; callers can never select this mode.
+    review_mode: Literal["human_approval", "independent_check"] = "human_approval"
+    owner_id: int | None = Field(default=None, gt=0)
     amendment_record: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.review_mode == "human_approval" and self.owner_id is None:
+            raise ValueError("human approval mode requires an owner id")
+        if self.review_mode == "independent_check" and self.owner_id is not None:
+            raise ValueError("independent check mode cannot select a human reviewer")
+        return self
 
     @property
     def revision(self):
