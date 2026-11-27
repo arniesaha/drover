@@ -1,0 +1,35 @@
+[
+  {
+    "file": "ios-home-idle-fixture.png",
+    "source_commit": "acf179ce86cb33ae977905cb2c3aad06227e9cf3",
+    "attachment": "B74A800D-B265-42EE-9E5B-9D74373FF9C7.png",
+    "test": "AccessibilityJourneyUITests/testIdleTerminalMotionAtDefaultTextSize()",
+    "captured_at_utc": "2026-11-26T02:14:40.844000+00:00",
+    "sha256": "1657d43e80063d995b5b2b37aacaa28bbb2729ae617ab0ca13560c40efb7426c",
+    "fixture": true,
+    "platform": "iOS 27.0 simulator",
+    "device_id": "3E61FFDF-A39E-4C59-AE7E-ECE8A22E3CCC"
+  },
+  {
+    "file": "ios-configuration-findings-fixture.png",
+    "source_commit": "f997dab593615ca9b9e89494d98602aa36b79113",
+    "attachment": "67A9F858-C4C4-49D1-AC30-5500BB7ABD2A.png",
+    "test": "ConfigurationReviewUITests/testAIReviewDetailBackAndRootTabReturn()",
+    "captured_at_utc": "2026-11-26T01:35:08.694000+00:00",
+    "sha256": "0f86e73a4fe4ee09f2db0f0232e966419b3fa114c453679822985bd95c9c8962",
+    "fixture": true,
+    "platform": "iOS 27.0 simulator",
+    "device_id": "3E61FFDF-A39E-4C59-AE7E-ECE8A22E3CCC"
+  },
+  {
+    "file": "ios-configuration-setup-fixture.png",
+    "source_commit": "f997dab593615ca9b9e89494d98602aa36b79113",
+    "attachment": "AB634664-149A-46EC-A3B8-8E828041C82C.png",
+    "test": "ConfigurationReviewUITests/testDeterministicOnlyResultsAreNotAIFindings()",
+    "captured_at_utc": "2026-11-26T01:35:58.115000+00:00",
+    "sha256": "d30ea1ed7c1fcccf05b066c69e91ca7f1b48817d2c427198373c105383d89425",
+    "fixture": true,
+    "platform": "iOS 27.0 simulator",
+    "device_id": "3E61FFDF-A39E-4C59-AE7E-ECE8A22E3CCC"
+  }
+]
