@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "captured_from_sha": "7133442dbe4a0525f7e19076d404dca356f17756",
+  "captured_from": "src/drover/server/work_queue/service.py identity() and WorkService._verification_request",
+  "vectors": [
+    {"id": "V1-base", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 7, "parent_run_key": "run-parent-0001", "body": "Pilot criteria v1"}, "expected": {"request_key": "b6158161def71bb082b1705af50e89e3edcf632940282349ee9e8c70efcbc46d", "verify_run_key": "69de88d6e0fef58d04fd0cb0c45dcb3ef4bc391facaf43465cc3808416ae81f4"}},
+    {"id": "V2-amended-body", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 7, "parent_run_key": "run-parent-0001", "body": "Pilot criteria v2"}, "expected": {"request_key": "970e9e027396c12cac41a756339a96c13d9d279f787704614f800643ad9df9c7", "verify_run_key": "e546486144fa477f7096cd9463c8f62ec8602fbd46cd0830b0da9bdcfcc0f0b7"}},
+    {"id": "V3-null-body", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 7, "parent_run_key": "run-parent-0001", "body": null}, "expected": {"request_key": "63298fa85710461c1f0258085629d404c5406c6ce9cdd7d14e34ef58967d1a3a", "verify_run_key": "14a42d01444c281a9f818c2c30b47f9c4864bc251ad31b2027d32b2f4cbecb82"}},
+    {"id": "V4-non-ascii-body", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 7, "parent_run_key": "run-parent-0001", "body": "Critère é ✓\nline two"}, "expected": {"request_key": "57fde272804cad774752a7eb0a4017e030fc6e907908c404d6b8fe1292cac4e4", "verify_run_key": "3c15e8cb6ff4ca989716792b8f3d873163c9cc1efe153f86b72f364329b0f81f"}},
+    {"id": "V5-other-item", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 8, "parent_run_key": "run-parent-0001", "body": "Pilot criteria v1"}, "expected": {"request_key": "b6158161def71bb082b1705af50e89e3edcf632940282349ee9e8c70efcbc46d", "verify_run_key": "b6761da56fd96cace93c71e0d95bc92ee09212703b2fc7c3c8c442f7d28b68c6"}},
+    {"id": "V6-other-parent", "inputs": {"workspace_id": "ws-pilot", "goal_id": "goal-pilot", "number": 7, "parent_run_key": "run-parent-0002", "body": "Pilot criteria v1"}, "expected": {"request_key": "df013e56e9cf7acbf02f769b3c32328ef87e7cb4a46e2163d818619c64e25167", "verify_run_key": "617f3f2eacd246d351cb7c9c54a2f31f24b12abb4823ef7a6b0af3c2b3bb2e82"}}
+  ]
+}

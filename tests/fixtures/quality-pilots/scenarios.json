@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "issue": 1024,
+  "status": "preparation; not executed; no case has a verdict",
+  "baseline_sha": "7133442dbe4a0525f7e19076d404dca356f17756",
+  "unbound": "A value of UNBOUND is filled only from owner-supplied accepted A/B source at binding, never guessed.",
+  "held_out_rule": "For held_out cases only the property and expectation are committed. The owner picks the concrete inputs at execution and does not give them to the candidate author or worker. Expectations are not lowered at binding; a case that cannot be expressed against the accepted API is reported as a gap.",
+  "tiers": ["T0 implementation", "T1 mocked test", "T2 CI", "T3 installed behavioural acceptance"],
+  "pilots": [
+    {
+      "id": "P1",
+      "class": "bugfix",
+      "lane": "A",
+      "outcome": "A work item closes only on a real, separately produced verification result; asserted flags or an evidence label alone never close it.",
+      "boundary": "local_file canary goal in an isolated root only",
+      "bindings": {"entry_point": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND", "evidence_retrieval": "UNBOUND"},
+      "positive": [
+        {"id": "P1-P1", "given": "work run terminal, separate verify run terminal, its check actually rerun and its evidence retrievable", "expect": "one outcome=verified decision event; item closed exactly once"},
+        {"id": "P1-P2", "given": "P1-P1 acceptance request repeated", "expect": "same outcome returned; no second close, no second outcome event", "kind": "retry"}
+      ],
+      "negative": [
+        {"id": "P1-N1", "given": "verify-role caller asserts success flags; no check was rerun and no evidence exists", "expect": "refused; item open; zero verified outcome events"},
+        {"id": "P1-N2", "given": "well-formed evidence label only, naming nothing retrievable", "expect": "refused; item open"},
+        {"id": "P1-N3", "given": "work-role run reports its own verification", "expect": "refused (baseline already refuses: 'separate verification session required'); must stay refused"},
+        {"id": "P1-N4", "given": "criteria body amended after the verify run was launched", "expect": "refused (baseline: 'acceptance criteria changed; new verification required'); must stay refused"},
+        {"id": "P1-N5", "held_out": true, "given": "evidence that is real and well formed but belongs to a different run or item than the one being accepted", "expect": "refused; item open; zero verified outcome events"},
+        {"id": "P1-N6", "given": "verifier turn interrupted after reporting but before it terminates", "expect": "item stays in review; nothing closes until that exact turn is terminal; no duplicate on resume", "kind": "interruption"}
+      ]
+    },
+    {
+      "id": "P2",
+      "class": "behaviour-preserving refactor",
+      "lane": "C-defined task; touches the acceptance path only at binding, by an assigned worker",
+      "outcome": "One verification run-key derivation with four callers; digests byte-identical before and after.",
+      "boundary": "src/drover/server/work_queue/service.py: launch, _verification_request, advance_deferred_verification, update",
+      "bindings": {"pre_refactor_sha": "UNBOUND", "post_refactor_sha": "UNBOUND"},
+      "pin": {"vectors": "p2-run-key-vectors.json", "checker": "check_p2_run_key_vectors.py", "captured": true},
+      "positive": [
+        {"id": "P2-P1", "given": "checker run at pre- and post-refactor SHA", "expect": "exit 0 and 6/6 at both"},
+        {"id": "P2-P2", "given": "existing scoped suites at post-refactor SHA with no test edited", "expect": "green"}
+      ],
+      "negative": [
+        {"id": "P2-N1", "given": "invalid candidate: derivation drops the criteria body from the request key", "expect": "checker exit 1"},
+        {"id": "P2-N2", "held_out": true, "given": "owner-chosen fresh inputs (not in the committed vectors) evaluated at both SHAs", "expect": "identical digests; any difference fails the refactor"},
+        {"id": "P2-N3", "given": "diff touches behaviour outside the four derivation sites, or edits a test expectation", "expect": "rejected as out of scope regardless of green tests"},
+        {"id": "P2-N4", "given": "pinned entry point renamed or removed", "expect": "checker exit 2; pin is re-bound from the pre-refactor SHA, not skipped"}
+      ]
+    },
+    {
+      "id": "P3",
+      "class": "user-visible feature",
+      "lane": "B",
+      "outcome": "Before work starts, an operator learns from the shell whether required context is usable and, if not, what failed, why, and what to do next.",
+      "actionable_means": ["names the specific failing item", "states the cause", "states a concrete next step", "non-zero exit distinguishes failure from success"],
+      "bindings": {"command": "UNBOUND", "flags": "UNBOUND", "exit_codes": "UNBOUND", "context_items": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND"},
+      "positive": [
+        {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; tree and store unchanged"},
+        {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "identical result; still no side effect", "kind": "retry"}
+      ],
+      "negative": [
+        {"id": "P3-N1", "given": "a required context item is missing", "expect": "non-zero; diagnostic meets all four actionable_means"},
+        {"id": "P3-N2", "given": "a context item is present but malformed", "expect": "non-zero; names the item and the defect, not a traceback"},
+        {"id": "P3-N3", "given": "two independent items are broken", "expect": "both reported in one run"},
+        {"id": "P3-N4", "given": "context contains a secret-shaped value", "expect": "value never appears in stdout or stderr"},
+        {"id": "P3-N5", "held_out": true, "given": "an item that exists and parses but is unusable (owner picks which: unreadable, stale, or for a different SHA)", "expect": "non-zero with an actionable diagnostic; exit zero here fails the feature"},
+        {"id": "P3-N6", "given": "command interrupted mid-run", "expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
+      ]
+    }
+  ]
+}
