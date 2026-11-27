@@ -59,8 +59,8 @@ amendment_record = "Initial independently reviewed contract"
 The normal `launch` and `link` path remains unchanged: it only resolves a
 queue-created `client_session_id`. A narrow recovery path is available only
 when an exact installed GitHub profile has a separate reviewed binding. It is
-for a retained completed work session and a separate completed verifier session
-that predate their queue links; it never rewrites either session identity.
+for retained work and verifier sessions that predate their queue links; it
+never rewrites either session identity.
 
 ```toml
 [work_queue.goals.github_existing_session_bindings."1024"]
@@ -77,14 +77,23 @@ verifier_turn_id = "retained-verifier-turn"
 
 The map key must name an installed profile and its `profile_revision` must
 match. Each retained session must have the goal repository's stored owner/name,
-`status=completed`, and a named durable input turn with a successful terminal
-result. The session IDs must differ. `running`, `created`/queued, failed,
-missing, wrong-repository, or ambiguous records fail closed; `awaiting: input`
-alone never qualifies. The issue key/profile revision bind the pair to the exact
-issue; `source_head` binds it to the configured PR source. The binding is stored
-as one append-only, link-keyed `bind_existing_session` policy event for each
-generated link. Historical links without that event remain unchanged; the
-existing signed local-file continuity envelope is not reused or overwritten.
+a named durable input turn, and either a completed lifetime with its correlated
+successful terminal exit or a supported structured session that remains
+`running` between turns. The resumable form is deliberately narrower: the
+reader accepts only a Codex turn's exact `exited: 0`, or Claude Code's complete
+driver result (`is_error: false`, `subtype: success`,
+`terminal_reason: completed`, and zero queued turns). Its named input must be
+the latest durable input, the terminal result must be final in that input
+window, and the trusted owning daemon must report the same structured session
+as `awaiting: input` with `turn_active: false`. The session IDs must differ.
+`running` records without those facts, `created`/queued, busy, unavailable,
+failed, missing, wrong-repository, or ambiguous records fail closed;
+`awaiting: input` or `turn_complete` alone never qualifies. The issue
+key/profile revision bind the pair to the exact issue; `source_head` binds it
+to the configured PR source. The binding is stored as one append-only,
+link-keyed `bind_existing_session` policy event for each generated link.
+Historical links without that event remain unchanged; the existing signed
+local-file continuity envelope is not reused or overwritten.
 
 With the issue in its ordinary `status:review` state, a coordinator calls:
 
@@ -242,7 +251,7 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | A changed retained result cannot replace the reviewed observation | [`test_changed_behavioral_result_at_final_boundary_cannot_close`](../../tests/test_work_queue_github_acceptance.py) |
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
-| Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_binding_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py) |
+| Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_exact_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_accepts_only_an_idle_structured_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_rejects_unsafe_resumable_turns`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |
 

@@ -489,6 +489,234 @@ def test_existing_session_reader_requires_exact_persisted_terminal_turn(
     )
 
 
+def test_existing_session_reader_accepts_only_an_idle_structured_turn(
+    pg_control_path,
+):
+    """A resumable Claude session is not a completed lifetime session.
+
+    Claude's structured result has no outer turn id.  The exact preceding
+    durable input and the host's ``turn_active: false`` reading are therefore
+    both required before this narrow existing-session reader can reuse it.
+    """
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
+    registry.create_session(
+        session_id="resumable-claude",
+        host_id="fixture",
+        harness="claude-code",
+        command="claude",
+        status="running",
+        mode="structured",
+        repo_owner="example",
+        repo_name="project",
+    )
+    registry.append_event(
+        session_id="resumable-claude",
+        event_type="user_input",
+        seq=2619,
+        payload={"turn_id": "retained-turn"},
+    )
+    registry.append_event(
+        session_id="resumable-claude",
+        event_type="status",
+        seq=2754,
+        payload={
+            "type": "status",
+            "role": "system",
+            "turn_id": None,
+            "payload": {
+                "turn_complete": True,
+                "awaiting": "input",
+                "result": {
+                    "type": "result",
+                    "is_error": False,
+                    "subtype": "success",
+                    "terminal_reason": "completed",
+                    "queued_turn_count": 0,
+                },
+            },
+        },
+    )
+    registry.update_session_activity("resumable-claude", awaiting="input")
+
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+    bridge.collector = SimpleNamespace(
+        _harness_request=lambda host, path, **kwargs: (
+            200,
+            json.dumps(
+                {
+                    "session_id": "resumable-claude",
+                    "harness": "claude-code",
+                    "status": "running",
+                    "mode": "structured",
+                    "awaiting": "input",
+                    "turn_active": False,
+                }
+            ),
+        )
+    )
+
+    accepted = bridge.existing_session(
+        "resumable-claude", "retained-turn", "example/project"
+    )
+    assert accepted is not None
+    assert accepted.status == "running"
+
+
+def test_existing_session_reader_accepts_idle_resumable_codex_exit(pg_control_path):
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
+    registry.create_session(
+        session_id="resumable-codex",
+        host_id="fixture",
+        harness="codex",
+        command="codex",
+        status="running",
+        mode="structured",
+        repo_owner="example",
+        repo_name="project",
+    )
+    registry.append_event(
+        session_id="resumable-codex",
+        event_type="user_input",
+        seq=797,
+        payload={"turn_id": "correlated-turn"},
+    )
+    registry.append_event(
+        session_id="resumable-codex",
+        event_type="status",
+        seq=798,
+        payload={
+            "type": "status",
+            "role": "system",
+            "turn_id": "correlated-turn",
+            "payload": {"exited": 0},
+        },
+    )
+    registry.update_session_activity("resumable-codex", awaiting="input")
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+    bridge.collector = SimpleNamespace(
+        _harness_request=lambda host, path, **kwargs: (
+            200,
+            json.dumps(
+                {
+                    "session_id": "resumable-codex",
+                    "harness": "codex",
+                    "status": "running",
+                    "mode": "structured",
+                    "awaiting": "input",
+                    "turn_active": False,
+                }
+            ),
+        )
+    )
+
+    assert (
+        bridge.existing_session("resumable-codex", "correlated-turn", "example/project")
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "busy",
+        "unknown_live_state",
+        "error_result",
+        "wrong_terminal_reason",
+        "queued_turn",
+        "missing_result",
+        "newer_input",
+        "post_turn_error",
+    ],
+)
+def test_existing_session_reader_rejects_unsafe_resumable_turns(
+    pg_control_path, change
+):
+    registry = HarnessRegistry(pg_control_path)
+    registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
+    registry.create_session(
+        session_id="resumable-unsafe",
+        host_id="fixture",
+        harness="claude-code",
+        command="claude",
+        status="running",
+        mode="structured",
+        repo_owner="example",
+        repo_name="project",
+    )
+    registry.append_event(
+        session_id="resumable-unsafe",
+        event_type="user_input",
+        seq=10,
+        payload={"turn_id": "retained-turn"},
+    )
+    result = {
+        "type": "result",
+        "is_error": False,
+        "subtype": "success",
+        "terminal_reason": "completed",
+        "queued_turn_count": 0,
+    }
+    if change == "error_result":
+        result["is_error"] = True
+    elif change == "wrong_terminal_reason":
+        result["terminal_reason"] = "interrupted"
+    elif change == "queued_turn":
+        result["queued_turn_count"] = 1
+    terminal = {
+        "type": "status",
+        "role": "system",
+        "turn_id": None,
+        "payload": {"turn_complete": True, "awaiting": "input", "result": result},
+    }
+    if change == "missing_result":
+        terminal["payload"] = {"turn_complete": True, "awaiting": "input"}
+    registry.append_event(
+        session_id="resumable-unsafe", event_type="status", seq=11, payload=terminal
+    )
+    if change == "newer_input":
+        registry.append_event(
+            session_id="resumable-unsafe",
+            event_type="user_input",
+            seq=12,
+            payload={"turn_id": "newer-turn"},
+        )
+    elif change == "post_turn_error":
+        registry.append_event(
+            session_id="resumable-unsafe",
+            event_type="error",
+            seq=12,
+            payload={"returncode": 1},
+        )
+    registry.update_session_activity("resumable-unsafe", awaiting="input")
+    live_turn = None if change == "unknown_live_state" else change == "busy"
+    bridge = object.__new__(HarnessBridge)
+    bridge.registry = registry
+    bridge.collector = SimpleNamespace(
+        _harness_request=lambda host, path, **kwargs: (
+            200,
+            json.dumps(
+                {
+                    "session_id": "resumable-unsafe",
+                    "harness": "claude-code",
+                    "status": "running",
+                    "mode": "structured",
+                    "awaiting": "input",
+                    "turn_active": live_turn,
+                }
+            ),
+        )
+    )
+
+    assert (
+        bridge.existing_session("resumable-unsafe", "retained-turn", "example/project")
+        is None
+    )
+
+
 def test_independent_check_mode_still_requires_configured_producer(
     service, monkeypatch
 ):

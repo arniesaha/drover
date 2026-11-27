@@ -2832,6 +2832,132 @@ class HarnessRegistry:
                 pending_success = True
         return submitted and successful
 
+    def has_successfully_completed_resumable_turn(
+        self, session_id: str, turn_id: str, *, harness: str
+    ) -> bool:
+        """Read a completed turn from an otherwise resumable structured session.
+
+        This deliberately does not relax :meth:`has_successfully_completed_turn`.
+        A completed session keeps its legacy ``exited == 0`` contract.  A live
+        Codex session has that same correlated exit shape, while Claude's
+        persistent protocol emits an uncorrelated result envelope.  The latter
+        is accepted only in the exact input window and only for the complete
+        success result emitted by the supported Claude driver.
+        """
+        if harness not in {"codex", "claude-code"}:
+            return False
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT event_id, event_type FROM harness_events
+                WHERE session_id = ? AND event_type IN ('user_input', 'status', 'error')
+                ORDER BY created_at, COALESCE(seq, 0), event_id""",
+                [session_id],
+            ).fetchall()
+            payloads = self._event_payloads(con, [str(row[0]) for row in rows])
+
+        submitted = False
+        settled = False
+        for event_id, event_type in rows:
+            try:
+                payload = json.loads(payloads.get(str(event_id)) or "{}")
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict):
+                return False
+            if event_type == "user_input":
+                submitted_turn_id = payload.get("turn_id")
+                if submitted:
+                    # A later durable input means work could be queued or in
+                    # flight.  Even a duplicate is ambiguous in this recovery
+                    # reader and must not borrow the earlier result.
+                    return False
+                submitted = submitted_turn_id == turn_id
+                continue
+            if not submitted:
+                continue
+            if event_type == "error":
+                return False
+            if settled:
+                # The terminal result must be the final durable status in its
+                # input window; later status is not evidence of an idle turn.
+                return False
+            if self._is_resumable_turn_success(payload, turn_id, harness=harness):
+                settled = True
+                continue
+            if self._is_resumable_turn_failure(payload, turn_id, harness=harness):
+                return False
+        return submitted and settled
+
+    @staticmethod
+    def _is_resumable_turn_success(
+        payload: dict[str, Any], turn_id: str, *, harness: str
+    ) -> bool:
+        """Recognize only a driver-provided terminal success envelope."""
+        inner = payload.get("payload")
+        if not isinstance(inner, dict):
+            return False
+        completed_turn_id = _completion_turn_id(payload)
+        if completed_turn_id is not None:
+            exited = inner.get("exited")
+            return (
+                completed_turn_id == turn_id
+                and isinstance(exited, int)
+                and not isinstance(exited, bool)
+                and exited == 0
+            )
+        if harness != "claude-code":
+            return False
+        result = inner.get("result")
+        return (
+            payload.get("type") == "status"
+            and payload.get("role") == "system"
+            and payload.get("turn_id") is None
+            and inner.get("turn_complete") is True
+            and inner.get("awaiting") == "input"
+            and isinstance(result, dict)
+            and result.get("type") == "result"
+            and result.get("is_error") is False
+            and result.get("subtype") == "success"
+            and result.get("terminal_reason") == "completed"
+            and isinstance(result.get("queued_turn_count"), int)
+            and not isinstance(result.get("queued_turn_count"), bool)
+            and result.get("queued_turn_count") == 0
+        )
+
+    @staticmethod
+    def _is_resumable_turn_failure(
+        payload: dict[str, Any], turn_id: str, *, harness: str
+    ) -> bool:
+        """Fence a known failure or another turn's terminal status."""
+        inner = payload.get("payload")
+        if not isinstance(inner, dict):
+            return False
+        completed_turn_id = _completion_turn_id(payload)
+        if completed_turn_id is not None:
+            if completed_turn_id != turn_id:
+                return True
+            exited = inner.get("exited")
+            return not (
+                isinstance(exited, int) and not isinstance(exited, bool) and exited == 0
+            )
+        if harness != "claude-code" or inner.get("turn_complete") is not True:
+            return False
+        result = inner.get("result")
+        return not (
+            payload.get("type") == "status"
+            and payload.get("role") == "system"
+            and payload.get("turn_id") is None
+            and inner.get("awaiting") == "input"
+            and isinstance(result, dict)
+            and result.get("type") == "result"
+            and result.get("is_error") is False
+            and result.get("subtype") == "success"
+            and result.get("terminal_reason") == "completed"
+            and isinstance(result.get("queued_turn_count"), int)
+            and not isinstance(result.get("queued_turn_count"), bool)
+            and result.get("queued_turn_count") == 0
+        )
+
     def owner_turn_failure_category(self, session_id: str, turn_id: str) -> str | None:
         """Return a bounded structured infrastructure category for one turn.
 

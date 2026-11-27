@@ -21,9 +21,11 @@ different prior publication, so the amended profile is the explicit corrected
 identity for a later reviewed live proof. This commit does not install it.
 In private reviewed server configuration, add the exact issue1031
 `github_existing_session_bindings` record from retained work and independent
-verifier session/turn IDs plus source head. Do not put session IDs in this
-packet, change a session client ID, or launch replacements. With `status:review`
-and the installed profile, an authorized coordinator calls
+verifier session/turn IDs plus source head. A reusable structured session must
+pass the pilot contract's exact input/result and trusted live idle-turn checks;
+its `running` lifetime state is not rewritten to `completed`. Do not put session
+IDs in this packet, change a session client ID, or launch replacements. With
+`status:review` and the installed profile, an authorized coordinator calls
 `POST /work/bind_existing` with only the goal and issue; it must return one
 work/verify pair and no launch. Independently retrieve the check output, submit
 the normal `verified` request, and verify one-close/retry. Reconcile uncertain
