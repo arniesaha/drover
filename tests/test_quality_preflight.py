@@ -7,6 +7,7 @@ get their own ``env``.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -419,6 +421,37 @@ if not effect.exists():
 """
 
 
+@pytest.fixture
+def process_out():
+    """An --out directory a *real* preflight.sh child accepts.
+
+    The autouse ``shared_temp`` monkeypatch only changes this test process's
+    module; a subprocess loads preflight.py afresh with the production
+    SHARED_TEMP_ROOTS. On Linux CI, tmp_path is under /tmp and is correctly
+    refused, so in-process patching cannot certify subprocess policy. This
+    fixture creates a unique directory under ~/scratch (the documented owned
+    scratch root), fails loudly if that is itself under a real shared temp
+    root, and removes only what it created, on every exit.
+    """
+    scratch = Path.home() / "scratch"
+    base = scratch / "drover-preflight-tests"
+    created = [p for p in (scratch, base) if not p.exists()]
+    base.mkdir(parents=True, exist_ok=True)
+    owned = Path(tempfile.mkdtemp(prefix="sigint-", dir=base)).resolve()
+    try:
+        for root in DEFAULT_SHARED:
+            shared = Path(root).resolve()
+            assert (
+                owned != shared and shared not in owned.parents
+            ), f"{owned} is under real shared temp {root}; refusing to run"
+        yield owned
+    finally:
+        shutil.rmtree(owned, ignore_errors=True)
+        for directory in reversed(created):  # only parents this fixture made
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # only if still empty
+
+
 def _wait_for(path: Path, proc: subprocess.Popen, seconds: float = 30.0) -> None:
     deadline = time.monotonic() + seconds
     while not path.exists():
@@ -451,7 +484,10 @@ def _interrupt(proc: subprocess.Popen) -> tuple[dict, str]:
     return json.loads(out.strip().splitlines()[-1]), err
 
 
-def test_sigint_during_then_is_classified_and_retry_has_one_effect(repo, out, tmp_path):
+def test_sigint_during_then_is_classified_and_retry_has_one_effect(
+    repo, process_out, tmp_path
+):
+    out = process_out
     py = stub_python(tmp_path, drover_file=str(repo / "src/drover/__init__.py"))
     helper = tmp_path / "marker_helper.py"
     helper.write_text(MARKER_HELPER)
@@ -497,7 +533,10 @@ def test_sigint_during_then_is_classified_and_retry_has_one_effect(repo, out, tm
     assert receipt.is_file() and second["receipt"] != str(receipt)
 
 
-def test_sigint_before_receipt_is_classified_and_leaves_nothing(repo, out, tmp_path):
+def test_sigint_before_receipt_is_classified_and_leaves_nothing(
+    repo, process_out, tmp_path
+):
+    out = process_out
     started = tmp_path / "probe-started"
     slow = tmp_path / "slow-python"
     slow.write_text(f"#!/bin/sh\necho > '{started}'\n/bin/sleep 60\n")
