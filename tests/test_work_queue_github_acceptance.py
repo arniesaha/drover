@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_hub_work_items import _register
 from test_work_queue_execution import (  # noqa: F401
     ACTOR,
     complete,
@@ -16,7 +17,6 @@ from test_work_queue_execution import (  # noqa: F401
     update,
 )
 from test_work_queue_github import Response
-from test_hub_work_items import _register
 
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import (
