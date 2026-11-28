@@ -8,7 +8,8 @@
   "lane_a_merged_sha": "b36305f69629f64e159bc24436638c2ca5145c62",
   "unbound": "Historical rule: an UNBOUND value was filled only from owner-supplied reviewed, integrated source or installed runtime, never guessed. No UNBOUND slot remains in version 3.",
   "held_out_rule": "For held_out cases only the property and expectation are committed. The owner picks the concrete inputs at execution and does not give them to the candidate author or worker. Expectations are not lowered at binding; a case that cannot be expressed against the accepted source is reported as a gap.",
-  "tiers": ["T0 implementation", "T1 mocked test", "T2 CI", "T3 installed behavioural acceptance"],
+  "tiers": {"T0 implementation": "a diff exists at a named SHA", "T1 scoped test": "pytest against fakes or an isolated real PostgreSQL store; not a real provider, transport or installed process", "T2 CI": "the same SHA green in the repository CI workflow", "T3 real entry point": "the installed gate, or the real script process, driven for an exact case with results read back from the system of record"},
+  "tier_note": "The pilots reach different tiers and are not interchangeable: P1 is a real installed outcome (T3 installed gate), P2 is internal equivalence (T1 with real PostgreSQL plus T2, no T3), P3 is a real script process from the source checkout (T3 script process, not installed-server behaviour).",
   "pilots": [
     {
       "id": "P1",
@@ -65,16 +66,26 @@
         ]
       },
       "acceptance_gates": {
-        "note": "T1 fixtures and CI are not this outcome. These are performed by the owner on the installed gate, not by this worker. The review identity in gate 4 applies to human_approval mode only.",
-        "gates": [
-          "owner independently reviews and installs the profile; candidate cannot select or weaken it",
-          "owner retrieves the retained behavioural result from the provider_result_location and reads it",
-          "owner judges whether the observations establish the claim and whether the producer was isolated; a success conclusion alone is not that judgment",
-          "exact source, profile revision, check-run id, App id and review id match what the audit recorded",
-          "stale and forged negatives above observed refused on the installed gate where they can be produced without harm",
-          "retry and interruption behaviour observed",
-          "one real, subsequent, authorized PR passes through the installed gate with a single close"
-        ]
+        "current_supported_contract": {
+          "note": "Performed by the integration owner under the sole-human policy Arnab authorized. No personal human review or approval is recorded or implied.",
+          "gates": [
+            "the integration owner reviews and installs the profile; the candidate cannot select or weaken it",
+            "the owner retrieves the retained behavioural result from the provider_result_location and reads it",
+            "the owner judges whether the observations establish the claim and whether the producer was isolated; a success conclusion alone is not that judgment",
+            "one real, authorized PR passes through the installed gate with a single close; source, profile revision, check-run id and App id match what the audit recorded",
+            "a repeat of the current verified request returns the recorded outcome with no second close",
+            "forged, stale, wrong-source, required-CI and uncertain-close negatives hold at the exact gate source in the scoped real-PostgreSQL service suites (tests/test_work_queue_github_acceptance.py)"
+          ]
+        },
+        "historical_expectations_not_claimed": {
+          "note": "Earlier versions of this fixture required these. They were not done and are not claimed as satisfied.",
+          "items": [
+            "stale and forged negatives observed refused on the installed gate itself (they were exercised in scoped real-PostgreSQL suites instead)",
+            "interruption behaviour observed on the installed gate (the designed lost-response case was not produced; the first response was simply not retained and the owner reconciled the recorded outcome before repeating)",
+            "a human review id matching the audit (human_approval mode only; the accepted outcome used independent_check and no human approval exists)",
+            "held-out P1-N12 run with owner-chosen inputs: not separately reported. Committed tests refuse related cases (test_wrong_repository_source_cannot_close, test_mismatched_behavioral_evidence_cannot_close, test_stale_verdict_and_unfinished_verifier); that is source-bound coverage, not the held-out case"
+          ]
+        }
       }
     },
     {
@@ -106,10 +117,10 @@
       "actionable_means": ["names the specific failing item", "states the cause", "states a concrete next step", "non-zero exit distinguishes failure from success"],
       "bindings": {"command": "sh scripts/quality/preflight.sh", "flags": ["--out", "--expect-base", "--expect-worktree", "--require-clean", "--python", "--verify-receipt", "--max-receipt-age", "--profile", "--pg-dsn-env", "--then"], "exit_codes": {"0": "pass", "1": "product_test_failure", "3": "environment_unavailable", "4": "harness_failure", "130": "harness_failure, check interrupted (SIGINT)"}, "prerequisite_order": ["tools", "worktree and base", "readable inputs", "output directory", "project interpreter", "postgres (pg profile)", "receipt verification"], "what_counts_as_expensive_work": "the --then command", "profile": "focused-tests; focused-tests-pg for the DSN case", "sha": "87990e95911d3897fcc0d2a195f0650d67fbf277", "contract": "docs/operations/dev-preflight.md"},
       "result": {"tier": "T3 real script process from the source checkout; not installed-server behaviour", "owner_reported": "every run case passed at the bound sha, including held-out P3-N5 and a real SIGINT (exit 130, no traceback, receipt retained)", "owner_verdict": "pending owner review and integration", "history": "At 70a332c1 the first process run failed P3-N1 and P3-N2: 7 of 14 failing diagnostics had no next step, and an interrupted run had no result line. Those failures stand as recorded."},
-      "clarifications": {"P3-P2": "Each valid invocation writes its own receipt; that is not a duplicate effect. The guarded --then effect must not be duplicated.", "P3-N6": "The preflight makes no exactly-once claim for an arbitrary --then command; the caller reconciles partial effects before rerunning."},
+      "superseded_expect_note": "A superseded_expect value is the earlier, incorrect assumption for that case, kept as history. It is not a criterion that was met. Negative and guard assertions were not lowered.",
       "positive": [
-        {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; tree and store unchanged"},
-        {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "identical result; still no side effect", "kind": "retry"}
+        {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; a receipt is written; a controlled --then creates only its owned, guarded marker; tracked source unchanged", "superseded_expect": "exit zero; no failure diagnostics; tree and store unchanged"},
+        {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "exit zero again; each valid invocation writes its own receipt; the guarded --then effect is not duplicated", "superseded_expect": "identical result; still no side effect", "kind": "retry"}
       ],
       "negative": [
         {"id": "P3-N1", "given": "a required context item is missing", "expect": "non-zero; diagnostic meets all four actionable_means; no expensive work started"},
@@ -117,7 +128,7 @@
         {"id": "P3-N3", "given": "two independent prerequisites are broken", "expect": "run 1: non-zero, the first failure only, specific and actionable, zero expensive work. Remedy only that one. Run 2: non-zero and now surfaces the second, equally actionable. Remedy it. Run 3: exit zero."},
         {"id": "P3-N4", "given": "context contains a secret-shaped value", "expect": "value never appears in stdout or stderr"},
         {"id": "P3-N5", "held_out": true, "given": "an item that exists and parses but is unusable (owner picks which: unreadable, stale, or for a different SHA)", "expect": "non-zero with an actionable diagnostic; exit zero here fails the feature"},
-        {"id": "P3-N6", "given": "command interrupted mid-run", "expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
+        {"id": "P3-N6", "given": "SIGINT while the --then command runs", "expect": "exit 130 with a result line (harness_failure, check interrupted) and no traceback; the receipt written before --then is retained; the preflight leaves no probe of its own; a guarded rerun exits zero without duplicating its effect. Partial effects of an arbitrary --then are for the caller to reconcile; no exactly-once or no-partial-state claim is made", "superseded_expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
       ]
     }
   ]

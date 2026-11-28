@@ -52,8 +52,30 @@ unprofiled issues are deliberately unchanged.
 | Negative cases | `P1-N1`…`P1-N12`; `P1-N12` held out. |
 
 `independent_check` does not turn an App or agent result into a human review
-and does not waive repository branch protection. Arnab, as the sole human
-decision-maker, reviews and installs either complete profile.
+and does not waive repository branch protection. Arnab authorized a sole-human
+policy for this cohort; the integration owner reviews and installs a complete
+profile under that authority. Neither step is a personal human review of the
+evidence, and none is recorded as one.
+
+### What acceptance of a P1 outcome requires
+
+Current supported contract:
+
+1. The integration owner reviews and installs the profile; the candidate
+   cannot select or weaken it.
+2. The owner retrieves the retained check output from the provider and judges
+   whether it establishes the claim and whether the producer was isolated.
+3. One real, authorized PR passes through the installed gate with a single
+   close, and the source, profile revision, check and App identities match the
+   audit record.
+4. A repeat of the current `verified` request returns the recorded outcome
+   with no second close.
+5. Forged, stale, wrong-source, required-CI and uncertain-close negatives hold
+   at the exact gate source in the scoped real-PostgreSQL service suites.
+
+The earlier map additionally expected those negatives and an interruption to
+be observed on the installed gate itself. That was not done and is not claimed;
+see the corrections at the end of this page.
 
 ### Settled sessions
 
@@ -139,7 +161,7 @@ Contract of record: [developer preflight](../operations/dev-preflight.md).
 | Command | `sh scripts/quality/preflight.sh --out <dir> [--expect-base] [--python] [--verify-receipt] [--profile] [--then '{python}' …]` |
 | Exit codes | 0 pass; 1 `--then` failed; 3 environment unavailable; 4 harness failure; 130 interrupted by SIGINT. |
 | Check order | tools, worktree and base, readable inputs, output directory, project interpreter, PostgreSQL (PG profile), receipt verification. |
-| Expected side effect | A failing preflight starts no `--then` command and writes no receipt. Each passing invocation writes its own receipt. No secret in output. |
+| Expected side effect | A failing preflight starts no `--then` command and writes no receipt. Each passing invocation writes its own receipt, and a controlled `--then` creates only its owned, guarded marker. A retry does not duplicate that guarded effect. No secret in output. |
 | Negative cases | `P3-N1`…`P3-N6`; `P3-N5` held out. |
 | Tier | T3 as a real script process from the source checkout. Not installed-server behaviour. |
 
@@ -204,6 +226,18 @@ Kept so the history is not mistaken for the current contract:
   **The human-approval criterion was not met and is not claimed as met**; no
   human approval was created or represented. `human_approval` remains the
   default for any profile that does not opt out.
+- **Live negative injection was once expected.** Earlier acceptance gates
+  asked for stale and forged negatives and an interruption to be observed on
+  the installed gate. They were exercised in scoped real-PostgreSQL service
+  suites at the gate source instead. The live-injection expectation is
+  **not claimed as satisfied**. The held-out `P1-N12` has no separate
+  owner-chosen receipt; related committed coverage is not a substitute for it.
+- **P3 "no side effect" wording was wrong.** Earlier case text expected a
+  valid run to leave everything unchanged, a retry to be identical, and an
+  interruption to leave no partial state. A valid run writes a receipt, each
+  retry writes a new one, and partial effects of an arbitrary `--then` are the
+  caller's to reconcile. The old wording is kept in the fixture as superseded,
+  not as a criterion that was met.
 - **Terminal lifetime was once required.** Earlier text required both sessions
   to be terminal. The strict resumable-turn form above is the corrected,
   narrower contract.

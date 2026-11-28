@@ -52,16 +52,25 @@ Things to know about this outcome:
 
 - **No human approval.** The profile used `independent_check`. No GitHub
   human approval was created, required or represented, and the earlier
-  human-approval criterion is not claimed as met. Arnab reviewed and installed
-  the profile as the sole human decision-maker.
+  human-approval criterion is not claimed as met. Arnab authorized a
+  sole-human policy for this cohort; the integration owner independently
+  reviewed and installed the profile under that authority. No personal review
+  or installation by Arnab is recorded or implied.
 - **First response not retained.** The first HTTP response to `verified` was
   not kept. The owner reconciled the durable record and the provider state as
   successful before sending the two retries. This is not the designed
   "intent without outcome returns `deferred`" case.
 - **Negatives are not live.** Forged, stale, required-CI and producer controls
   were exercised in the scoped real-PostgreSQL service suites at this source,
-  not by fault injection against the live gate. The held-out `P1-N12` has no
-  separate report here.
+  not by fault injection against the live gate. The earlier expectation of
+  live injection and a live interruption is not claimed as satisfied.
+- **Held-out `P1-N12` not separately reported.** No owner-chosen
+  different-source receipt exists. Committed tests at this source refuse
+  related cases (`test_wrong_repository_source_cannot_close`,
+  `test_mismatched_behavioral_evidence_cannot_close`,
+  `test_stale_verdict_and_unfinished_verifier` in
+  `tests/test_work_queue_github_acceptance.py`); that is source-bound coverage,
+  not the held-out case.
 - **Independent read-only review.** Before acceptance, a separate verifier
   session inspected the check output, all four command logs and their hashes,
   the JUnit counts, the recomputed profile revision, the branch-protection
@@ -96,10 +105,11 @@ call.
 | Case | Owner-reported result |
 | --- | --- |
 | Valid context (`P3-P1`) | exit 0, receipt written, owned marker created by `--then` |
-| Negatives (`P3-N1`, `P3-N2`): seven reported runs spanning malformed, stale, missing, expired, wrong-source, no-git, unwritable and failed-query inputs | each exit 3, naming the check and cause with a non-empty concrete action, same text on stderr; no marker |
+| Negative process cases (`P3-N1`, `P3-N2`), reported in these categories: malformed, stale, missing, expired, wrong-source, no-git, unwritable | each exit 3, naming the check and cause with a non-empty concrete action, same text on stderr; no marker |
+| Failed PostgreSQL query, reported separately | exit 3 with an actionable diagnostic |
 | Sequential failures (`P3-N3`): base, output and interpreter broken together | first failure only on each run, no effects; after the last repair the marker is created |
 | Retry (`P3-P2`) | a new receipt per valid invocation; the guarded marker is not duplicated |
-| Secret (`P3-N4`) | fake secret-shaped DSN not printed; the failed query is actionable |
+| Secret (`P3-N4`) | fake secret-shaped DSN not printed |
 | Held-out (`P3-N5`): wrong source | fails for the intended mismatch |
 | Interruption (`P3-N6`): real SIGINT while `--then` runs | exit 130, `harness_failure`, `interrupted`, no traceback, receipt retained, no effect; two reruns exit 0 with exactly one owned marker |
 
