@@ -195,6 +195,19 @@ class WorkStore:
             raise ValueError("session association conflict")
         return row
 
+    def session_link(self, session_id):
+        """Return the sole durable link that owns a session association."""
+        with self.connection() as con:
+            rows = self.rows(
+                con.execute(
+                    "SELECT * FROM execution_links WHERE workspace_id = ? AND session_id = ?",
+                    [self.workspace_id, session_id],
+                )
+            )
+        if len(rows) > 1:
+            raise ValueError("session association is not unique")
+        return rows[0] if rows else None
+
     def events(self, request_key):
         with self.connection() as con:
             return self.rows(

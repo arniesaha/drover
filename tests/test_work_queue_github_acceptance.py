@@ -17,7 +17,11 @@ from test_work_queue_execution import (  # noqa: F401
 from test_work_queue_github import Response
 
 from drover.server.harness.registry import HarnessRegistry
-from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
+from drover.server.work_queue.config import (
+    GitHubAcceptanceProfile,
+    GitHubExistingSessionBinding,
+    GoalScope,
+)
 from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import identity
@@ -232,21 +236,11 @@ def resumable_existing_pilot(service, monkeypatch, pg_control_path):
     registry.register_host(host_id="fixture", display_name="Fixture", kind="macos")
     live = {}
 
-    def settled(session_id, harness, turn_id):
-        registry.create_session(
-            session_id=session_id,
-            host_id="fixture",
-            harness=harness,
-            command=harness,
-            status="running",
-            mode="structured",
-            repo_owner="example",
-            repo_name="project",
-        )
+    def recorded_turn(session_id, harness, turn_id, seq):
         registry.append_event(
             session_id=session_id,
             event_type="user_input",
-            seq=10,
+            seq=seq,
             payload={"turn_id": turn_id},
         )
         if harness == "codex":
@@ -272,9 +266,22 @@ def resumable_existing_pilot(service, monkeypatch, pg_control_path):
                 },
             }
         registry.append_event(
-            session_id=session_id, event_type="status", seq=11, payload=terminal
+            session_id=session_id, event_type="status", seq=seq + 1, payload=terminal
         )
         registry.update_session_activity(session_id, awaiting="input")
+
+    def settled(session_id, harness, turn_id):
+        registry.create_session(
+            session_id=session_id,
+            host_id="fixture",
+            harness=harness,
+            command=harness,
+            status="running",
+            mode="structured",
+            repo_owner="example",
+            repo_name="project",
+        )
+        recorded_turn(session_id, harness, turn_id, 10)
         live[session_id] = {
             "session_id": session_id,
             "harness": harness,
@@ -295,7 +302,7 @@ def resumable_existing_pilot(service, monkeypatch, pg_control_path):
         )
     )
     service.harness = bridge
-    return client, binding, registry, live, settled
+    return client, binding, registry, live, settled, recorded_turn
 
 
 def pilot_evidence(client, profile):
@@ -399,7 +406,7 @@ def test_verified_accepts_current_strict_resumable_existing_pair(
     service, monkeypatch, pg_control_path
 ):
     """A proven parked turn is distinct from a completed session lifetime."""
-    client, binding, _, _, _ = resumable_existing_pilot(
+    client, binding, _, _, _, _ = resumable_existing_pilot(
         service, monkeypatch, pg_control_path
     )
     bound = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
@@ -416,7 +423,7 @@ def test_verified_accepts_current_strict_resumable_existing_pair(
 def test_verified_rejects_unsafe_resumable_verifier_at_service_boundary(
     service, monkeypatch, pg_control_path, change
 ):
-    client, _, registry, live, _ = resumable_existing_pilot(
+    client, _, registry, live, _, _ = resumable_existing_pilot(
         service, monkeypatch, pg_control_path
     )
     verify = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)[
@@ -465,7 +472,7 @@ def test_running_unbound_verifier_cannot_use_existing_session_exception(
 def test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict(
     service, monkeypatch, pg_control_path
 ):
-    client, old_binding, _, _, settled = resumable_existing_pilot(
+    client, old_binding, _, _, settled, _ = resumable_existing_pilot(
         service, monkeypatch, pg_control_path
     )
     old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
@@ -498,7 +505,7 @@ def test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict(
 def test_existing_pair_with_uncertain_close_cannot_be_replaced(
     service, monkeypatch, pg_control_path
 ):
-    client, _, _, _, settled = resumable_existing_pilot(
+    client, _, _, _, settled, _ = resumable_existing_pilot(
         service, monkeypatch, pg_control_path
     )
     old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
@@ -522,6 +529,105 @@ def test_existing_pair_with_uncertain_close_cannot_be_replaced(
     with pytest.raises(RuntimeError, match="existing execution requires inspection"):
         service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
     assert client.closed == 1
+
+
+def test_existing_turn_rebind_reuses_session_without_unique_association_conflict(
+    service, monkeypatch, pg_control_path
+):
+    """Later successful turns share the retained session without rewriting history."""
+    client, old_binding, _, _, _, recorded_turn = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    recorded_turn("resumable-work", "codex", "later-work-turn", 12)
+    recorded_turn("resumable-verify", "claude-code", "later-verify-turn", 12)
+    profile = independent_profile()
+    replacement = existing_binding(
+        profile,
+        work_session_id=old_binding["work_session_id"],
+        work_turn_id="later-work-turn",
+        verifier_session_id=old_binding["verifier_session_id"],
+        verifier_turn_id="later-verify-turn",
+    )
+    install_existing_binding(service, replacement)
+
+    current = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    repeated = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    assert [(row["id"], row["run_key"]) for row in repeated["links"]] == [
+        (row["id"], row["run_key"]) for row in current["links"]
+    ]
+    assert [row["session_id"] for row in current["links"]] == [None, None]
+    assert {row["id"] for row in old["links"]}.isdisjoint(
+        {row["id"] for row in current["links"]}
+    )
+    assert all(len(service.store.link_events(row["id"])) == 1 for row in old["links"])
+    pilot_evidence(client, profile)
+
+    with pytest.raises(ValueError, match="binding superseded"):
+        independent_verdict(service, old["links"][1])
+    assert independent_verdict(service, current["links"][1]) == {"outcome": "verified"}
+    assert independent_verdict(service, current["links"][1]) == {"outcome": "verified"}
+    assert client.closed == 1
+
+
+def test_existing_turn_rebind_recovers_bind_only_partial_work_link(
+    service, monkeypatch, pg_control_path
+):
+    """Retry the exact persisted state left before a former association collision."""
+    _, old_binding, _, _, _, recorded_turn = resumable_existing_pilot(
+        service, monkeypatch, pg_control_path
+    )
+    old = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    recorded_turn("resumable-work", "codex", "later-work-turn", 12)
+    recorded_turn("resumable-verify", "claude-code", "later-verify-turn", 12)
+    replacement = existing_binding(
+        independent_profile(),
+        work_session_id=old_binding["work_session_id"],
+        work_turn_id="later-work-turn",
+        verifier_session_id=old_binding["verifier_session_id"],
+        verifier_turn_id="later-verify-turn",
+    )
+    install_existing_binding(service, replacement)
+    _, _, ref, _ = service.item("goal", 1)
+    scope = service.config.goals[0]
+    request = identity(
+        "existing-session",
+        replacement["profile_revision"],
+        replacement["source_head"],
+        replacement["work_session_id"],
+        replacement["work_turn_id"],
+    )
+    work_key = identity(service.config.workspace_id, "goal", 1, request, "work")
+    partial = service.store.intent(
+        ACTOR.principal,
+        ref,
+        "goal",
+        work_key,
+        "work",
+        0,
+        scope.goal_label,
+    )
+    service.store.bind_existing_session(
+        ACTOR.principal,
+        ref,
+        identity(work_key, "bind-existing-session"),
+        partial["id"],
+        service._existing_binding_payload(
+            GitHubExistingSessionBinding.model_validate(replacement), role="work"
+        ),
+    )
+    assert partial["session_id"] is None
+    assert len(service.store.link_events(partial["id"])) == 1
+
+    recovered = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    repeated = service.call("bind_existing", {"goal_id": "goal", "number": 1}, ACTOR)
+    assert recovered["links"][0]["id"] == partial["id"]
+    assert recovered["links"][0]["session_id"] is None
+    assert recovered["links"][1]["session_id"] is None
+    assert [(row["id"], row["run_key"]) for row in repeated["links"]] == [
+        (row["id"], row["run_key"]) for row in recovered["links"]
+    ]
+    assert all(len(service.store.link_events(row["id"])) == 1 for row in old["links"])
 
 
 def profile_revision(profile):

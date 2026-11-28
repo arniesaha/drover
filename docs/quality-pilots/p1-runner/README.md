@@ -39,6 +39,13 @@ verify after the configuration changes. This recovery is available only before
 any old pair progress, verification intent/outcome, or uncertain close; those
 states require reconciliation rather than another bind.
 
+When that updated pair reuses the same retained sessions with newer turns, the
+original link keeps the database session association and the newer link carries
+the reviewed session ID in its immutable binding event. A returned null link
+`session_id` in this narrow case is expected; it is not permission to launch,
+attach, or alter a session. Repeat the identical bind request only to recover a
+binding-only partial pair, then use the normal verified request.
+
 ## Structural orchestration verdict - still OPEN
 
 The installed PR1030 continuity decision function was exercised read-only with preserved issue/authority/checkpoint facts:

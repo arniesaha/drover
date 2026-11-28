@@ -669,9 +669,8 @@ class WorkService:
         }
         if not required <= set(binding) or binding["role"] not in {"work", "verify"}:
             raise WorkDenied("stored existing session binding is invalid")
-        if (
-            row["run_role"] != binding["role"]
-            or row["session_id"] != binding["session_id"]
+        if row["run_role"] != binding["role"] or (
+            row["session_id"] is not None and row["session_id"] != binding["session_id"]
         ):
             raise WorkDenied("stored existing session binding is invalid")
         return binding
@@ -686,7 +685,7 @@ class WorkService:
         if not callable(reader):
             return None
         session = reader(binding["session_id"], binding["turn_id"], scope.repo)
-        if session is None or session.session_id != row["session_id"]:
+        if session is None or session.session_id != binding["session_id"]:
             return None
         return session
 
@@ -752,6 +751,37 @@ class WorkService:
             ):
                 return False
         return True
+
+    def _associate_existing_session_reference(self, row, binding):
+        """Associate once, then retain later reviewed turns in binding evidence.
+
+        ``execution_links`` deliberately permits one owner per session.  An
+        existing-session binding already contains the immutable session ID, so
+        a later reviewed turn of the same session keeps its link unassociated
+        rather than rewriting its old owner or weakening that uniqueness rule.
+        """
+        session_id = binding["session_id"]
+        if row["session_id"] == session_id:
+            return row
+        if row["session_id"] is not None:
+            raise WorkDenied("existing session association conflict")
+        prior = self.store.session_link(session_id)
+        if prior is None:
+            return self.store.associate(row["run_key"], session_id)
+        if prior["id"] == row["id"]:
+            raise WorkDenied("existing session association conflict")
+        prior_binding = self._existing_session_binding(prior)
+        required = ("role", "session_id", "profile_revision", "source_head")
+        if (
+            prior_binding is None
+            or prior["goal_id"] != row["goal_id"]
+            or prior["item_number"] != row["item_number"]
+            or prior["provider"] != row["provider"]
+            or prior["repo"] != row["repo"]
+            or any(prior_binding.get(key) != binding.get(key) for key in required)
+        ):
+            raise WorkDenied("existing session association requires inspection")
+        return row
 
     def _acceptance_session_is_settled(self, scope, row, session):
         """Accept a running lifetime only through the strict existing reader."""
@@ -843,7 +873,10 @@ class WorkService:
             work["id"],
             self._existing_binding_payload(binding, role="work"),
         )
-        work = self.store.associate(work_key, work_session.session_id)
+        work = self._associate_existing_session_reference(
+            work,
+            self._existing_binding_payload(binding, role="work"),
+        )
         verify = self.store.intent(
             actor.principal, ref, goal_id, verify_key, "verify", 0, goal_ref
         )
@@ -856,7 +889,12 @@ class WorkService:
                 binding, role="verify", parent_run_key=work_key
             ),
         )
-        verify = self.store.associate(verify_key, verifier_session.session_id)
+        verify = self._associate_existing_session_reference(
+            verify,
+            self._existing_binding_payload(
+                binding, role="verify", parent_run_key=work_key
+            ),
+        )
         return {"links": [work, verify]}
 
     @staticmethod
@@ -1199,7 +1237,9 @@ class WorkService:
             raise ValueError("unsupported update action")
         operation_id = evidence_key if action == "verified" else None
         if action == "verified":
-            if row["run_role"] != "verify" or not row["session_id"]:
+            if row["run_role"] != "verify" or (
+                not row["session_id"] and existing_binding is None
+            ):
                 raise ValueError("separate verification session required")
             acceptance = policy.acceptance
             if not (
