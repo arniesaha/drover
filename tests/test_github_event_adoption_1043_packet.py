@@ -119,7 +119,9 @@ def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
     baseline = tmp_path / "baseline.toml"
     policy_path = ROOT / "src/drover/server/work_queue/policy-v1.json"
     isolated_cwd = tmp_path / "isolated-execution"
+    native_cwd = tmp_path / "native-execution"
     isolated_cwd.mkdir()
+    native_cwd.mkdir()
     baseline.write_text(f"""[work_queue]
 enabled = true
 shadow_mode = false
@@ -163,10 +165,12 @@ continuity_owner_id = "drover:owner/native-owner-canary-848"
 continuity_owner_harness = "codex"
 continuity_owner_model = "gpt-5.6-terra"
 [work_queue.goals.execution_cwds]
-studio = "/owned/checkout"
+studio = {q(str(native_cwd))}
 [work_queue.goals.credential]
 token_env = "DROVER_WORK_QUEUE_GITHUB_TOKEN"
 capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "actions_read"]
+[server]
+metrics_host = "127.0.0.1"
 """)
     projection = tmp_path / "projection.json"
     prepared = subprocess.run(
@@ -228,6 +232,29 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
     assert target["policy_path"] == str(policy_path)
     assert target["execution_estimated_cost"] == 2.5
 
+    overlap = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(PACKET / "prepare-private-config.py"),
+            "--baseline-config",
+            str(baseline),
+            "--native-template-goal",
+            "native-owner-canary-848",
+            "--execution-host",
+            "studio",
+            "--execution-cwd",
+            str(native_cwd),
+            "--profile",
+            str(PACKET / "profile-candidate.json"),
+            "--output",
+            str(tmp_path / "overlap.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert overlap.returncode != 0
+
     def reject_projection(mutator):
         rejected = tmp_path / "rejected-projection.json"
         mutated = json.loads(json.dumps(record))
@@ -273,6 +300,26 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
     )
     assert (
         reject_projection(
+            lambda projection: next(
+                goal
+                for goal in projection["work_queue"]["goals"]
+                if goal["goal_id"] == "github-event-adoption-1043"
+            )["credential"]["capabilities"].append("contents_read")
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: next(
+                goal
+                for goal in projection["work_queue"]["goals"]
+                if goal["goal_id"] == "github-event-adoption-1043"
+            ).update({"execution_max_workers": 2})
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
             lambda projection: projection["work_queue"]["github_webhook"].update(
                 {"batch_size": 17}
             )
@@ -308,6 +355,45 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
         != 0
     )
 
+    bound = json.loads(json.dumps(record))
+    bound_target = next(
+        goal
+        for goal in bound["work_queue"]["goals"]
+        if goal["goal_id"] == "github-event-adoption-1043"
+    )
+    bound_target["github_existing_session_bindings"] = {
+        "1043": {
+            "profile_revision": bound["profile_revision"],
+            "source_head": PIN,
+            "work_session_id": "1043-work",
+            "work_turn_id": "1043-work-turn",
+            "verifier_session_id": "1043-verifier",
+            "verifier_turn_id": "1043-verifier-turn",
+        }
+    }
+    bound_projection = tmp_path / "bound-projection.json"
+    bound_projection.write_text(json.dumps(bound))
+    bound_args = [
+        sys.executable,
+        "-I",
+        str(PACKET / "validate-private-config.py"),
+        "--baseline-config",
+        str(baseline),
+        "--native-template-goal",
+        "native-owner-canary-848",
+        "--execution-host",
+        "studio",
+        "--execution-cwd",
+        str(isolated_cwd),
+        "--projection",
+        str(bound_projection),
+        "--require-binding",
+    ]
+    assert subprocess.run(bound_args, capture_output=True, text=True).returncode == 0
+    bound_target["execution_max_workers"] = 2
+    bound_projection.write_text(json.dumps(bound))
+    assert subprocess.run(bound_args, capture_output=True, text=True).returncode != 0
+
     profile = json.loads((PACKET / "profile-candidate.json").read_text())
     candidate = tmp_path / "candidate.toml"
     candidate.write_text(baseline.read_text() + f"""
@@ -332,6 +418,7 @@ continuity_owner_id = "drover:owner/github-event-adoption-1043"
 continuity_owner_harness = "codex"
 continuity_owner_model = "gpt-5.6-terra"
 integration_serialization_key = "github-event-adoption-1043"
+candidate_source = "github"
 [work_queue.goals.execution_cwds]
 studio = {q(str(isolated_cwd.resolve()))}
 [work_queue.goals.credential]
@@ -368,12 +455,53 @@ amendment_record = {q(profile['amendment_record'])}
     final = subprocess.run(candidate_args, capture_output=True, text=True)
     assert final.returncode == 0, final.stderr
     assert json.loads(final.stdout)["prepared_ingestion"]["batch_size"] == 2
-    candidate.write_text(
-        candidate.read_text().replace("batch_size = 2", "batch_size = 3")
+    candidate_text = candidate.read_text()
+
+    def reject_final(content):
+        candidate.write_text(content)
+        return subprocess.run(candidate_args, capture_output=True, text=True)
+
+    assert (
+        reject_final(
+            candidate_text.replace("batch_size = 2", "batch_size = 3")
+        ).returncode
+        != 0
     )
     assert (
-        subprocess.run(candidate_args, capture_output=True, text=True).returncode != 0
+        reject_final(
+            candidate_text.replace(
+                'candidate_source = "github"', 'candidate_source = "local_file"'
+            )
+        ).returncode
+        != 0
     )
+    assert (
+        reject_final(
+            candidate_text.replace(
+                'execution_max_workers = 1\nbrief_ref = "authorized:goal:native-owner-canary-848"\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+                'execution_max_workers = 2\nbrief_ref = "authorized:goal:native-owner-canary-848"\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+            )
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_final(
+            candidate_text.replace(
+                'capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "actions_read"]\n[work_queue.goals.github_acceptance_profiles."1043"]',
+                'capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "actions_read", "contents_read"]\n[work_queue.goals.github_acceptance_profiles."1043"]',
+            )
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_final(
+            candidate_text.replace(
+                'metrics_host = "127.0.0.1"', 'metrics_host = "0.0.0.0"'
+            )
+        ).returncode
+        != 0
+    )
+    candidate.write_text(candidate_text)
 
 
 def test_1043_workflow_isolates_candidate_proof_from_check_publication():

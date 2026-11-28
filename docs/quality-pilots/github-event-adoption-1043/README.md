@@ -77,7 +77,8 @@ sh scripts/quality/preflight.sh --out "$scratch_root" \
   docs/quality-pilots/github-event-adoption-1043/run-proof.py \
   docs/quality-pilots/github-event-adoption-1043/publish-check.py \
   docs/quality-pilots/github-event-adoption-1043/prepare-private-config.py \
-  docs/quality-pilots/github-event-adoption-1043/validate-private-config.py
+  docs/quality-pilots/github-event-adoption-1043/validate-private-config.py \
+  docs/quality-pilots/github-event-adoption-1043/config_contract.py
 git diff --check
 ```
 
@@ -126,8 +127,9 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
 ```
 
 `$execution_dir` must already exist, must be supplied explicitly, and must not
-be a CWD from the native canary template. The script creates neither that
-directory nor any live configuration. The projection derives the supported
+equal, contain, or be contained by any CWD from the native canary template.
+The script creates neither that directory nor any live configuration. The
+projection derives the supported
 native harness/model and brief from the named native-template goal; it copies
 the existing
 `DROVER_WORK_QUEUE_GITHUB_TOKEN` *reference* and never prints a credential
@@ -150,8 +152,14 @@ There is no WorkQueue API that writes server configuration. The owner must
 apply the validated projection with the normal private configuration installer,
 then run the same validator with `--candidate-config` against the staged final
 TOML before activation, supplying the same template, host, and directory
-arguments. The script rejects a copied or modified P1 goal and the same
-whole-baseline and exact-ingestion checks apply to both projection and TOML.
+arguments. The final installer must change only `work_queue`; the validator
+compares every other normalized configuration value to the baseline. It also
+compares the complete #1043 `GoalScope` model, including defaults and the
+credential capability list. With `--require-binding`, the sole permitted
+target difference is one validated #1043 session-binding map; all other goal
+fields remain exact. The script rejects a copied or modified P1 goal and the
+same whole-baseline and exact-ingestion checks apply to both projection and
+TOML.
 
 The existing P1 A/B sessions cannot become #1043 bindings: the durable
 session-owner rule permits reuse only for the same goal, issue, role, profile

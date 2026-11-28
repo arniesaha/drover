@@ -15,6 +15,8 @@
   "publisher_installed": false,
   "bound_worker_mcp_required_for_live_stages": true,
   "whole_baseline_config_preserved_by_validator": true,
+  "complete_target_goal_model_preserved_by_validator": true,
+  "binding_delta_constrained_by_validator": true,
   "dedicated_execution_directory_required": true,
   "live_transport_verified": false,
   "live_accepted": 0
