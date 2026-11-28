@@ -29,6 +29,7 @@ p.add_argument("--baseline-config", type=pathlib.Path, required=True)
 p.add_argument("--native-template-goal", required=True)
 p.add_argument("--execution-host", required=True)
 p.add_argument("--execution-cwd", type=pathlib.Path, required=True)
+p.add_argument("--brief-ref", type=pathlib.Path, required=True)
 p.add_argument("--profile", type=pathlib.Path, required=True)
 p.add_argument("--output", type=pathlib.Path, required=True)
 a = p.parse_args()
@@ -42,7 +43,12 @@ assert (
 profile = load_profile(a.profile)
 p1 = p1_goal(base)
 goal = expected_goal(
-    base, a.native_template_goal, a.execution_host, a.execution_cwd, profile
+    base,
+    a.native_template_goal,
+    a.execution_host,
+    a.execution_cwd,
+    profile,
+    a.brief_ref,
 )
 ingestion = expected_ingestion(base)
 execution_cwd = a.execution_cwd.resolve()
@@ -62,6 +68,7 @@ record = {
     "prepared_ingestion": ingestion.model_dump(mode="json"),
     "execution_host": a.execution_host,
     "execution_cwd": str(execution_cwd),
+    "brief_ref": goal.brief_ref,
     "work_queue": prepared.model_dump(mode="json"),
     "note": "projection only; no server config, store, session, or credential was changed",
 }

@@ -118,6 +118,7 @@ def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
     q = json.dumps
     baseline = tmp_path / "baseline.toml"
     policy_path = ROOT / "src/drover/server/work_queue/policy-v1.json"
+    brief_path = (PACKET / "owner-held-live-brief.md").resolve()
     isolated_cwd = tmp_path / "isolated-execution"
     native_cwd = tmp_path / "native-execution"
     isolated_cwd.mkdir()
@@ -186,6 +187,8 @@ metrics_host = "127.0.0.1"
             "studio",
             "--execution-cwd",
             str(isolated_cwd),
+            "--brief-ref",
+            str(brief_path),
             "--profile",
             str(PACKET / "profile-candidate.json"),
             "--output",
@@ -212,6 +215,8 @@ metrics_host = "127.0.0.1"
             "studio",
             "--execution-cwd",
             str(isolated_cwd),
+            "--brief-ref",
+            str(brief_path),
             "--projection",
             str(projection),
         ],
@@ -231,6 +236,7 @@ metrics_host = "127.0.0.1"
     assert target["execution_cwds"] == {"studio": str(isolated_cwd.resolve())}
     assert target["policy_path"] == str(policy_path)
     assert target["execution_estimated_cost"] == 2.5
+    assert target["brief_ref"] == str(brief_path)
 
     overlap = subprocess.run(
         [
@@ -245,6 +251,8 @@ metrics_host = "127.0.0.1"
             "studio",
             "--execution-cwd",
             str(native_cwd),
+            "--brief-ref",
+            str(brief_path),
             "--profile",
             str(PACKET / "profile-candidate.json"),
             "--output",
@@ -254,6 +262,32 @@ metrics_host = "127.0.0.1"
         text=True,
     )
     assert overlap.returncode != 0
+    wrong_brief = tmp_path / "wrong-brief.md"
+    wrong_brief.write_text("not the reviewed task contract\n")
+    arbitrary_brief = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(PACKET / "prepare-private-config.py"),
+            "--baseline-config",
+            str(baseline),
+            "--native-template-goal",
+            "native-owner-canary-848",
+            "--execution-host",
+            "studio",
+            "--execution-cwd",
+            str(isolated_cwd),
+            "--brief-ref",
+            str(wrong_brief),
+            "--profile",
+            str(PACKET / "profile-candidate.json"),
+            "--output",
+            str(tmp_path / "arbitrary-brief.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert arbitrary_brief.returncode != 0
 
     def reject_projection(mutator):
         rejected = tmp_path / "rejected-projection.json"
@@ -273,6 +307,8 @@ metrics_host = "127.0.0.1"
                 "studio",
                 "--execution-cwd",
                 str(isolated_cwd),
+                "--brief-ref",
+                str(brief_path),
                 "--projection",
                 str(rejected),
             ],
@@ -385,6 +421,8 @@ metrics_host = "127.0.0.1"
         "studio",
         "--execution-cwd",
         str(isolated_cwd),
+        "--brief-ref",
+        str(brief_path),
         "--projection",
         str(bound_projection),
         "--require-binding",
@@ -413,7 +451,7 @@ execution_enabled = true
 execution_budget = 9.0
 execution_estimated_cost = 2.5
 execution_max_workers = 1
-brief_ref = "authorized:goal:native-owner-canary-848"
+brief_ref = {q(str(brief_path))}
 continuity_owner_id = "drover:owner/github-event-adoption-1043"
 continuity_owner_harness = "codex"
 continuity_owner_model = "gpt-5.6-terra"
@@ -449,6 +487,8 @@ amendment_record = {q(profile['amendment_record'])}
         "studio",
         "--execution-cwd",
         str(isolated_cwd),
+        "--brief-ref",
+        str(brief_path),
         "--candidate-config",
         str(candidate),
     ]
@@ -478,8 +518,16 @@ amendment_record = {q(profile['amendment_record'])}
     assert (
         reject_final(
             candidate_text.replace(
-                'execution_max_workers = 1\nbrief_ref = "authorized:goal:native-owner-canary-848"\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
-                'execution_max_workers = 2\nbrief_ref = "authorized:goal:native-owner-canary-848"\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+                q(str(brief_path)), q("authorized:goal:native-owner-canary-848")
+            )
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_final(
+            candidate_text.replace(
+                f'execution_max_workers = 1\nbrief_ref = {q(str(brief_path))}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+                f'execution_max_workers = 2\nbrief_ref = {q(str(brief_path))}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
             )
         ).returncode
         != 0

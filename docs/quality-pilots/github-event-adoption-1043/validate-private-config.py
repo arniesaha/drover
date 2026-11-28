@@ -32,6 +32,7 @@ p.add_argument("--baseline-config", type=pathlib.Path, required=True)
 p.add_argument("--native-template-goal", required=True)
 p.add_argument("--execution-host", required=True)
 p.add_argument("--execution-cwd", type=pathlib.Path, required=True)
+p.add_argument("--brief-ref", type=pathlib.Path, required=True)
 group = p.add_mutually_exclusive_group(required=True)
 group.add_argument("--projection", type=pathlib.Path)
 group.add_argument("--candidate-config", type=pathlib.Path)
@@ -46,6 +47,7 @@ if a.projection:
     assert record["source"] == PIN and record["profile_revision"] == REVISION
     assert record["execution_host"] == a.execution_host
     assert record["execution_cwd"] == str(a.execution_cwd.resolve())
+    assert record["brief_ref"] == str(a.brief_ref.resolve())
     candidate = WorkQueueConfig.model_validate(record["work_queue"])
 else:
     candidate_config = load_config(a.candidate_config)
@@ -65,6 +67,7 @@ expected = expected_goal(
     a.execution_host,
     a.execution_cwd,
     profile,
+    a.brief_ref,
 )
 expected_ingestion_config = expected_ingestion(baseline)
 assert candidate.github_provider_ingestion.model_dump(

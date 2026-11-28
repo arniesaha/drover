@@ -17,6 +17,7 @@
   "whole_baseline_config_preserved_by_validator": true,
   "complete_target_goal_model_preserved_by_validator": true,
   "binding_delta_constrained_by_validator": true,
+  "task_specific_owner_held_brief_required": true,
   "dedicated_execution_directory_required": true,
   "live_transport_verified": false,
   "live_accepted": 0

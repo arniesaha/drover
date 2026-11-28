@@ -10,6 +10,8 @@ PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
 REVISION = "df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe"
 GOAL = "github-event-adoption-1043"
 ISSUE = "1043"
+PACKET = Path(__file__).resolve().parent
+BRIEF_NAME = "owner-held-live-brief.md"
 EXPECTED_INGESTION = {
     "enabled": True,
     "interval_seconds": 60,
@@ -24,6 +26,25 @@ def load_profile(path: Path) -> GitHubAcceptanceProfile:
     profile = GitHubAcceptanceProfile.model_validate(json.loads(path.read_text()))
     assert profile.revision == REVISION
     return profile
+
+
+def brief_ref(path: Path) -> str:
+    """Return the reviewed, accessible task brief path for the live goal."""
+    expected = (PACKET / BRIEF_NAME).resolve()
+    resolved = path.resolve()
+    assert resolved == expected, "brief must be the reviewed #1043 owner-held brief"
+    assert resolved.is_file(), "brief must be an accessible regular file"
+    manifest = {
+        name: checksum
+        for checksum, name in (
+            line.split(maxsplit=1)
+            for line in (PACKET / "SHA256SUMS").read_text().splitlines()
+            if line.strip()
+        )
+    }
+    assert BRIEF_NAME in manifest, "brief checksum is missing"
+    assert hashlib.sha256(resolved.read_bytes()).hexdigest() == manifest[BRIEF_NAME]
+    return str(resolved)
 
 
 def p1_goal(base):
@@ -55,7 +76,9 @@ def template_and_cwd(base, template_goal_id: str, host: str, cwd: Path):
     return native, resolved_cwd
 
 
-def expected_goal(base, template_goal_id: str, host: str, cwd: Path, profile):
+def expected_goal(
+    base, template_goal_id: str, host: str, cwd: Path, profile, task_brief: Path
+):
     p1 = p1_goal(base)
     native, resolved_cwd = template_and_cwd(base, template_goal_id, host, cwd)
     return GoalScope.model_validate(
@@ -67,7 +90,7 @@ def expected_goal(base, template_goal_id: str, host: str, cwd: Path, profile):
             "credential": p1.credential.model_dump(mode="json"),
             "execution_enabled": native.execution_enabled,
             "execution_cwds": {host: str(resolved_cwd)},
-            "brief_ref": native.brief_ref,
+            "brief_ref": brief_ref(task_brief),
             "execution_budget": native.execution_budget,
             "execution_estimated_cost": native.execution_estimated_cost,
             "execution_max_workers": native.execution_max_workers,

@@ -107,6 +107,7 @@ scratch_root=$(mktemp -d "$HOME/scratch/github-event-adoption-1043.XXXXXX")
 config_before=${DROVER_OWNER_CONFIG:?set the owner-held configuration path}
 execution_host=${DROVER_OWNER_EXECUTION_HOST:?set the existing native harness host id}
 execution_dir=${DROVER_OWNER_EXECUTION_DIR:?set an existing isolated execution directory}
+brief_ref="$repo_root/docs/quality-pilots/github-event-adoption-1043/owner-held-live-brief.md"
 python_bin=${DROVER_TEST_PYTHON:-$(command -v python3)}
 uv_bin=${DROVER_TEST_UV:-$(command -v uv)}
 export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/uv-cache"
@@ -116,6 +117,7 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
   --baseline-config "$config_before" \
   --native-template-goal native-owner-canary-848 \
   --execution-host "$execution_host" --execution-cwd "$execution_dir" \
+  --brief-ref "$brief_ref" \
   --profile "$repo_root/docs/quality-pilots/github-event-adoption-1043/profile-candidate.json" \
   --output "$scratch_root/work-queue-projection.json"
 "$UV_PROJECT_ENVIRONMENT/bin/python" -I \
@@ -123,18 +125,20 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
   --baseline-config "$config_before" \
   --native-template-goal native-owner-canary-848 \
   --execution-host "$execution_host" --execution-cwd "$execution_dir" \
+  --brief-ref "$brief_ref" \
   --projection "$scratch_root/work-queue-projection.json"
 ```
 
 `$execution_dir` must already exist, must be supplied explicitly, and must not
 equal, contain, or be contained by any CWD from the native canary template.
 The script creates neither that directory nor any live configuration. The
-projection derives the supported
-native harness/model and brief from the named native-template goal; it copies
-the existing
+projection derives the supported native harness/model from the named
+native-template goal, but never copies its `brief_ref`: the supplied path must
+be the accessible, checksummed [#1043 owner-held brief](owner-held-live-brief.md).
+The old `authorized:goal:native-owner-canary-848` reference is rejected. It copies the existing
 `DROVER_WORK_QUEUE_GITHUB_TOKEN` *reference* and never prints a credential
 value. It preserves and revalidates the template's policy path, execution
-enablement, budget, estimated cost, worker limit, brief, harness and model. It
+enablement, budget, estimated cost, worker limit, harness and model. It
 preserves `execution.global_max_workers == 2`, uses
 `drover:owner/github-event-adoption-1043`, and a goal-local integration fence.
 Its only #1043 mappings are `github_acceptance_profiles`,
