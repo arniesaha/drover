@@ -917,6 +917,18 @@ class WorkService:
             return None
         return value if isinstance(value, bool) else None
 
+    def _github_event_delivery(self, scope, number, run_key):
+        """Require both installed and launch-signed exact-profile opt-ins."""
+        profile = scope.github_acceptance_profiles.get(str(number))
+        revision = scope.github_event_delivery_profiles.get(str(number))
+        reader = getattr(self.harness, "github_event_delivery", None)
+        if profile is None or revision != profile.revision or not callable(reader):
+            return False
+        try:
+            return reader(run_key, revision) is True
+        except Exception:
+            return False
+
     def _bound_host_verification_report(self, scope, row, run_key, session, actor):
         """Allow only a bound verifier to defer its own terminal acceptance.
 
@@ -924,8 +936,13 @@ class WorkService:
         A verifier's mutable prompt, goal configuration, or host role cannot
         reconstruct that authority after launch.
         """
+        local_delivery = scope.candidate_source == "local_file"
+        github_delivery = self._github_event_delivery(
+            scope, row["item_number"], row["run_key"]
+        )
         if (
-            scope.candidate_source != "local_file"
+            not local_delivery
+            and not github_delivery
             or row["run_role"] != "verify"
             or session is None
             or session.status != "running"
@@ -938,7 +955,14 @@ class WorkService:
             links=self.store.links(goal_id=scope.goal_id, number=row["item_number"]),
             row=row,
         )
-        return parent is not None and self._signed_committed_provenance(parent) is True
+        if parent is None:
+            return False
+        return (
+            local_delivery and self._signed_committed_provenance(parent) is True
+        ) or (
+            github_delivery
+            and self._github_event_delivery(scope, row["item_number"], parent)
+        )
 
     def _verification_criteria(self, provider, ref, item):
         scope = next(
@@ -1001,7 +1025,15 @@ class WorkService:
         """
         with self.lock:
             scope, provider, policy, ref = self.scope(goal_id, number)
-            if scope.candidate_source != "local_file":
+            configured_github_delivery = scope.github_event_delivery_profiles.get(
+                str(number)
+            ) == getattr(
+                scope.github_acceptance_profiles.get(str(number)), "revision", None
+            )
+            if (
+                scope.candidate_source != "local_file"
+                and not configured_github_delivery
+            ):
                 return None
             item = self.checked(scope, policy, provider.get_item(ref))
             work_links = [
@@ -1012,6 +1044,9 @@ class WorkService:
             if not work_links:
                 return None
             row = work_links[-1]
+            github_delivery = self._github_event_delivery(scope, number, row["run_key"])
+            if scope.candidate_source != "local_file" and not github_delivery:
+                return None
             key = identity(row["run_key"], "complete", None)
             events = self.store.events(key)
             if (
@@ -1030,20 +1065,33 @@ class WorkService:
             # Only the immutable hub-signed provenance mode may create a
             # separate verifier. Marker-only runs settle through their bound
             # daemon-attested effect and native owner, never this queue path.
-            if self._signed_committed_provenance(row["run_key"]) is not True:
-                return None
-            artifact = item.get("expected_effect_artifact")
-            terminal_done = getattr(self.harness, "terminal_work_done", None)
-            materialized = getattr(self.harness, "expected_effect_materialized", None)
             if (
-                not isinstance(artifact, str)
-                or not artifact
-                or not callable(terminal_done)
-                or terminal_done(row["run_key"]) is not True
-                or not callable(materialized)
-                or materialized(row["run_key"], artifact) is not True
+                scope.candidate_source == "local_file"
+                and self._signed_committed_provenance(row["run_key"]) is not True
             ):
                 return None
+            terminal_done = getattr(self.harness, "terminal_work_done", None)
+            if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
+                return None
+            if scope.candidate_source == "local_file":
+                artifact = item.get("expected_effect_artifact")
+                materialized = getattr(
+                    self.harness, "expected_effect_materialized", None
+                )
+                if (
+                    not isinstance(artifact, str)
+                    or not artifact
+                    or not callable(materialized)
+                    or materialized(row["run_key"], artifact) is not True
+                ):
+                    return None
+            else:
+                source = self._verification_criteria(provider, ref, item)
+                if (
+                    provider.exact_head_check_state(source["head"], source["branch"])
+                    != "green"
+                ):
+                    return None
             verification = self._launch_verification(
                 provider,
                 policy,
@@ -1074,7 +1122,11 @@ class WorkService:
         """
         with self.lock:
             scope, provider, policy, ref = self.scope(goal_id, number)
-            if scope.candidate_source != "local_file":
+            if scope.candidate_source != "local_file" and not any(
+                self._github_event_delivery(scope, number, row["run_key"])
+                for row in self.store.links(goal_id=goal_id, number=number)
+                if row["run_role"] == "verify"
+            ):
                 return None
             item = self.checked(scope, policy, provider.get_item(ref))
             links = self.store.links(goal_id=goal_id, number=number)
@@ -1092,16 +1144,36 @@ class WorkService:
             ):
                 return None
             parent = self._work_parent(links=links, row=row)
-            if parent is None or self._signed_committed_provenance(parent) is not True:
+            if parent is None:
+                return None
+            github_delivery = self._github_event_delivery(scope, number, row["run_key"])
+            if scope.candidate_source == "local_file":
+                if self._signed_committed_provenance(parent) is not True:
+                    return None
+            elif not (
+                github_delivery and self._github_event_delivery(scope, number, parent)
+            ):
                 return None
             terminal_done = getattr(self.harness, "terminal_work_done", None)
             if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
                 return None
+            criteria = self._verification_criteria(provider, ref, item)
             _, expected = verification_identity(
-                self.config.workspace_id, goal_id, number, parent, item.get("body")
+                self.config.workspace_id, goal_id, number, parent, criteria
             )
             if row["run_key"] != expected:
                 return None
+            if github_delivery:
+                facts = provider.acceptance_facts(
+                    ref, events[0]["provider_operation_id"]
+                )
+                if any(facts.get(key) != value for key, value in criteria.items()):
+                    return None
+                if (
+                    provider.acceptance_facts(ref, events[0]["provider_operation_id"])
+                    != facts
+                ):
+                    return None
             provider.close(ref)
             self.store.event(
                 "control:queue-execution",
@@ -1114,6 +1186,40 @@ class WorkService:
                 link_id=row["id"],
             )
             return {"outcome": "verified"}
+
+    def advance_github_ci(self, repo, pull_number, head):
+        """Continue only an exact, pushed CI rollup through provider rereads."""
+        if not isinstance(repo, str) or not isinstance(pull_number, int):
+            return 0
+        continued = 0
+        with self.lock:
+            for scope in self.config.goals:
+                for number, profile in scope.github_acceptance_profiles.items():
+                    if scope.repo != repo or profile.pull_number != pull_number:
+                        continue
+                    if (
+                        scope.github_event_delivery_profiles.get(number)
+                        != profile.revision
+                    ):
+                        continue
+                    try:
+                        provider, _, ref, item = self.item(scope.goal_id, int(number))
+                        source = self._verification_criteria(provider, ref, item)
+                        if source["head"] != head:
+                            continue
+                        if (
+                            provider.exact_head_check_state(
+                                source["head"], source["branch"]
+                            )
+                            != "green"
+                        ):
+                            continue
+                        self.advance_deferred_completion(scope.goal_id, int(number))
+                        self.advance_deferred_verification(scope.goal_id, int(number))
+                        continued += 1
+                    except (PermissionError, ValueError, WorkDenied):
+                        continue
+        return continued
 
     def update(
         self,
@@ -1183,9 +1289,13 @@ class WorkService:
                 raise ValueError("work session must complete before verification")
             # A bound host may request only its own immutable, signed local
             # candidate verifier. Every other completion stays coordinator-only.
+            github_delivery = self._github_event_delivery(scope, number, run_key)
             bound_host_completion = (
                 scope.candidate_source == "local_file"
                 and self._signed_committed_provenance(run_key) is True
+            ) or github_delivery
+            bound_host_completion = (
+                bound_host_completion
                 and session.status == "running"
                 and not actor.human
                 and actor.host_id == session.host_id
@@ -1208,11 +1318,12 @@ class WorkService:
                 # Only a task-bound local candidate may defer its request. The
                 # terminal queue path will re-check this immutable candidate
                 # effect before it creates the separate verifier.
-                if (
-                    scope.candidate_source != "local_file"
-                    or not isinstance(item.get("expected_effect_artifact"), str)
+                if scope.candidate_source == "local_file" and (
+                    not isinstance(item.get("expected_effect_artifact"), str)
                     or not item["expected_effect_artifact"]
                 ):
+                    raise ValueError("work session must complete before verification")
+                if scope.candidate_source != "local_file" and not github_delivery:
                     raise ValueError("work session must complete before verification")
                 self.store.event(
                     actor.principal,

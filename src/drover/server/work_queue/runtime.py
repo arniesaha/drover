@@ -340,6 +340,23 @@ class HarnessBridge:
             == "m3"
         )
 
+    @staticmethod
+    def _github_event_delivery_revision(scope, role, number):
+        """Return the reviewed revision for one signed GitHub continuation."""
+        if (
+            getattr(scope, "candidate_source", None) != "github"
+            or role not in {"work", "verify"}
+            or isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+        ):
+            return None
+        revision = getattr(scope, "github_event_delivery_profiles", {}).get(str(number))
+        profile = getattr(scope, "github_acceptance_profiles", {}).get(str(number))
+        return (
+            revision if profile is not None and revision == profile.revision else None
+        )
+
     def _work_coordinator_binding(
         self,
         run_key,
@@ -375,6 +392,9 @@ class HarnessBridge:
             scope, role, local_candidate_number
         )
         m2_ack_pending = self._local_candidate_m2_ack_pending(
+            scope, role, local_candidate_number
+        )
+        github_event_delivery_revision = self._github_event_delivery_revision(
             scope, role, local_candidate_number
         )
         if (
@@ -413,6 +433,10 @@ class HarnessBridge:
             if expected_effect_artifact is None:
                 raise WorkDenied("committed provenance requires expected effect")
             binding["committed_provenance"] = True
+        if github_event_delivery_revision is not None:
+            binding["github_event_delivery_profile_revision"] = (
+                github_event_delivery_revision
+            )
         if m2_ack_pending:
             if expected_effect_artifact is None:
                 raise WorkDenied("M2 handoff requires expected effect")
@@ -593,6 +617,42 @@ class HarnessBridge:
             return None
         return self.registry.work_coordinator_committed_provenance(
             session.session_id, "work-" + run_key
+        )
+
+    def github_event_delivery(self, run_key, profile_revision):
+        """Read one signed, exact-profile continuation binding from its link."""
+        session = self.resolve(run_key)
+        service = getattr(self.collector, "work_control", None)
+        if (
+            session is None
+            or session.handoff_mode != "work_coordinator"
+            or service is None
+            or not isinstance(profile_revision, str)
+        ):
+            return False
+        rows = service.store.links(run_key=run_key)
+        if len(rows) != 1:
+            return False
+        raw = rows[0].get("work_coordinator_binding_json")
+        if not isinstance(raw, str):
+            return False
+        try:
+            binding = json.loads(raw)
+            parsed, _ = parse_work_coordinator_continuity(
+                {"work_coordinator_continuity": binding},
+                hub_secret=self.collector.work_coordinator_continuity_secret,
+            )
+        except (
+            FactoryObserverRequestError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return False
+        return bool(
+            parsed is not None
+            and parsed.run_id == "work-" + run_key
+            and parsed.github_event_delivery_profile_revision == profile_revision
         )
 
     def expected_effect_materialized(self, run_key, artifact):
@@ -876,7 +936,11 @@ def start_github_webhook_worker(collector, config, shutdown_event):
     from drover.server.work_queue.github_events import GitHubWebhookWorker
 
     worker = GitHubWebhookWorker(
-        service.store, config.github_webhook, service.github_webhooks, service.providers
+        service.store,
+        config.github_webhook,
+        service.github_webhooks,
+        service.providers,
+        service=service,
     )
     worker.start(shutdown_event=shutdown_event)
     collector.github_webhook_worker = worker

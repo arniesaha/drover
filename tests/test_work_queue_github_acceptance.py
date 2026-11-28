@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import hmac
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from test_work_queue_execution import (  # noqa: F401
     update,
 )
 from test_work_queue_github import Response
+from test_hub_work_items import _register
 
 from drover.server.harness.registry import HarnessRegistry
 from drover.server.work_queue.config import (
@@ -23,8 +25,9 @@ from drover.server.work_queue.config import (
     GoalScope,
 )
 from drover.server.work_queue.github import GitHubProvider
+from drover.server.work_queue.github_events import GitHubWebhookWorker
 from drover.server.work_queue.runtime import HarnessBridge
-from drover.server.work_queue.service import identity
+from drover.server.work_queue.service import WorkActor, identity
 
 SHA = "a" * 40
 CRITERIA = "The selected journey succeeds and its negative control fails."
@@ -178,6 +181,178 @@ def independent_profile():
 
 def independent_verdict(service, verify):
     return update(service, verify, "verified", evidence_key="check-run:7")
+
+
+def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
+    service, monkeypatch
+):
+    """A signed CI rollup advances only the installed GitHub delivery path."""
+    monkeypatch.setenv("TEST_TOKEN", "synthetic")
+    monkeypatch.setenv("TEST_GITHUB_WEBHOOK_SECRET", "not-a-real-secret")
+    profile = independent_profile()
+    config = service.config.goals[0].model_dump()
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["github_event_delivery_profiles"] = {"1": profile_revision(profile)}
+    config.update(
+        execution_enabled=True,
+        execution_cwds={"host": "/configured/checkout"},
+        brief_ref="docs/quality-pilots/github-event.md",
+        continuity_owner_id="drover:owner/goal",
+        continuity_owner_harness="codex",
+    )
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    scope = GoalScope.model_validate(config)
+    webhook = service.config.github_webhook.model_copy(
+        update={"secret_env": "TEST_GITHUB_WEBHOOK_SECRET"}
+    )
+    service.config = service.config.model_copy(
+        update={"goals": [scope], "github_webhook": webhook}
+    )
+    service.github_webhooks.config = webhook
+    client = GitHub()
+    client.overrides["/repos/example/project/issues/1"] = {
+        "number": 1,
+        "state": "open",
+        "body": BODY,
+        "labels": [{"name": "goal:test"}, {"name": "status:queued"}],
+    }
+    service.providers["goal"] = GitHubProvider(
+        service.config.workspace_id, scope, session=client
+    )
+    service.harness.github_event_delivery = lambda run_key, revision: (
+        revision == profile_revision(profile)
+    )
+    service.harness.terminal_work_done = lambda run_key: (
+        service.harness.sessions[run_key].status == "completed"
+    )
+    work = launch(service, "github-event-work")
+    host = WorkActor("credential:host", "worker", host_id="host")
+    assert service.call(
+        "update",
+        {
+            "goal_id": "goal",
+            "number": 1,
+            "run_key": work["run_key"],
+            "action": "complete",
+        },
+        host,
+    ) == {"outcome": "deferred"}
+    service.harness.sessions[work["run_key"]].status = "completed"
+    client.overrides["/repos/example/project/issues/1"]["labels"][-1][
+        "name"
+    ] = "status:review"
+
+    _register(service, session_id="github-event-work-item")
+    item = service.store.hub_items()[0]
+    service.store.patch_hub_item(
+        item["id"], pr="https://github.com/example/project/pull/9"
+    )
+    worker = GitHubWebhookWorker(
+        service.store, webhook, service.github_webhooks, service=service
+    )
+
+    def deliver(delivery, event, payload):
+        body = json.dumps(payload).encode()
+        headers = {
+            "X-GitHub-Delivery": delivery,
+            "X-GitHub-Event": event,
+            "X-Hub-Signature-256": "sha256="
+            + hmac.new(b"not-a-real-secret", body, hashlib.sha256).hexdigest(),
+        }
+        assert service.github_webhooks.accept(headers, body)[0] == 202
+
+    deliver(
+        "github-event-sync",
+        "pull_request",
+        {
+            "action": "synchronize",
+            "number": 9,
+            "repository": {"full_name": "example/project"},
+            "pull_request": {"head": {"ref": "feature", "sha": SHA}},
+        },
+    )
+    deliver(
+        "github-event-stale-ci",
+        "check_suite",
+        {
+            "repository": {"full_name": "example/project"},
+            "check_suite": {
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": "b" * 40,
+                "head_branch": "feature",
+                "pull_requests": [{"number": 9}],
+            },
+        },
+    )
+    assert worker.process_once() == 2
+    assert [row["run_role"] for row in service.store.links()] == ["work"]
+
+    deliver(
+        "github-event-current-ci",
+        "check_suite",
+        {
+            "repository": {"full_name": "example/project"},
+            "check_suite": {
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": SHA,
+                "head_branch": "feature",
+                "pull_requests": [{"number": 9}],
+            },
+        },
+    )
+    assert worker.process_once() == 1
+    links = service.store.links(goal_id="goal", number=1)
+    assert [row["run_role"] for row in links] == ["work", "verify"]
+    verify = links[-1]
+    client.evidence = {
+        "id": 7,
+        "head_sha": SHA,
+        "name": "owner-journey",
+        "app": {"id": 42},
+        "external_id": profile_revision(profile),
+        "status": "completed",
+        "conclusion": "success",
+        "output": {"summary": "journey passed", "text": "negative control failed"},
+    }
+    assert service.call(
+        "update",
+        {
+            "goal_id": "goal",
+            "number": 1,
+            "run_key": verify["run_key"],
+            "action": "verified",
+            "evidence_key": "check-run:7",
+        },
+        host,
+    ) == {"outcome": "deferred"}
+    service.harness.sessions[verify["run_key"]].status = "completed"
+    final_payload = {
+        "repository": {"full_name": "example/project"},
+        "workflow_run": {
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": SHA,
+            "head_branch": "feature",
+            "pull_requests": [{"number": 9}],
+        },
+    }
+    deliver("github-event-verify-ci", "workflow_run", final_payload)
+    assert worker.process_once() == 1
+    assert client.closed == 1
+    assert service.call(
+        "update",
+        {
+            "goal_id": "goal",
+            "number": 1,
+            "run_key": verify["run_key"],
+            "action": "verified",
+            "evidence_key": "check-run:7",
+        },
+        ACTOR,
+    ) == {"outcome": "verified"}
+    assert client.closed == 1
 
 
 def existing_binding(profile, **changes):

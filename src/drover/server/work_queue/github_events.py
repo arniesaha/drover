@@ -104,9 +104,10 @@ class GitHubWebhookReceiver:
 class GitHubWebhookWorker:
     """Process persisted delivery rows with a deliberately small polling loop."""
 
-    def __init__(self, store, config, receiver, providers=None):
+    def __init__(self, store, config, receiver, providers=None, service=None):
         self.store, self.config, self.receiver = store, config, receiver
         self.providers = providers or {}
+        self.service = service
         self._stop = threading.Event()
         self._thread = None
 
@@ -260,6 +261,14 @@ class GitHubWebhookWorker:
                     ),
                 ),
             )
+        if rollup == "ci_green_exact_head":
+            self._continue_exact_ci(item, pr_number, sha)
+
+    def _continue_exact_ci(self, item, pr_number, sha):
+        """Wake only the installed service adapter; provider facts are reread."""
+        advance = getattr(self.service, "advance_github_ci", None)
+        if callable(advance) and isinstance(pr_number, int):
+            advance(item.get("repo"), pr_number, sha)
 
     def _github_check_state(self, item, sha):
         """Prefer the configured read credential; ``None`` means clean fallback."""

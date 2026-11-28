@@ -10,6 +10,7 @@ scoped verification recipe, not a second policy definition.
 | Goal/configuration schema and validation | `src/drover/server/work_queue/config.py` |
 | HTTP and MCP work-operation surface | `docs/design/work-queue-phase-2.md` and `src/drover/server/work_queue/runtime.py` |
 | GitHub pilot profile, provider facts, and owner handoff | `docs/operations/github-acceptance-pilot.md` |
+| Signed GitHub CI delivery continuation | `src/drover/server/work_queue/github_events.py`, `src/drover/server/work_queue/service.py`, and `tests/test_work_queue_github_acceptance.py` |
 | Work/verify/owner and GitHub/local-file stage boundaries | `docs/operations/verified-event-path-boundaries.md` |
 | Queue product rules and planned/default policy | `docs/design/work-queue.md` |
 | Environment profiles and fail-fast diagnostics | `docs/operations/dev-preflight.md` and `scripts/quality/preflight.sh` |

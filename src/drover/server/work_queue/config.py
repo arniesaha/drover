@@ -273,6 +273,10 @@ class GoalScope(Model):
     github_existing_session_bindings: dict[str, GitHubExistingSessionBinding] = Field(
         default_factory=dict
     )
+    # A separate, exact-issue opt-in for the pushed GitHub CI continuation.
+    # Keeping this outside the profile preserves already-installed profile
+    # revisions and makes the execution path an explicit rollout decision.
+    github_event_delivery_profiles: dict[str, str] = Field(default_factory=dict)
     local_candidates_path: str | None = None
     # Per-item worktrees are local-file-only and must be declared in the
     # server configuration; manifest content cannot choose an arbitrary path.
@@ -297,6 +301,7 @@ class GoalScope(Model):
 
     @model_validator(mode="after")
     def valid(self):
+        native_owner = "drover:owner/" + self.goal_id
         if self.github_acceptance_profiles:
             if self.candidate_source != "github" or any(
                 not key.isascii()
@@ -329,6 +334,27 @@ class GoalScope(Model):
                     raise ValueError(
                         "existing session binding profile revision mismatch"
                     )
+        if self.github_event_delivery_profiles:
+            if (
+                self.candidate_source != "github"
+                or self.continuity_owner_id != native_owner
+            ):
+                raise ValueError(
+                    "GitHub event delivery requires GitHub source and its native owner"
+                )
+            for key, revision in self.github_event_delivery_profiles.items():
+                profile = self.github_acceptance_profiles.get(key)
+                if (
+                    not key.isascii()
+                    or not key.isdigit()
+                    or str(int(key)) != key
+                    or int(key) <= 0
+                    or profile is None
+                    or revision != profile.revision
+                ):
+                    raise ValueError(
+                        "GitHub event delivery requires an exact profile revision"
+                    )
         if any(part in {".", ".."} for part in self.repo.split("/")):
             raise ValueError("repository traversal is forbidden")
         if bool(self.goal_label) == bool(self.milestone):
@@ -339,7 +365,6 @@ class GoalScope(Model):
         ):
             raise ValueError("goal label must use the policy goal namespace")
         owner = self.continuity_owner_id
-        native_owner = "drover:owner/" + self.goal_id
         if owner is not None and len(owner) > 191:
             raise ValueError("continuity owner exceeds the control-plane limit")
         if owner is not None and not (

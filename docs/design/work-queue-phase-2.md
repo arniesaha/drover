@@ -100,6 +100,14 @@ caller assertions with provider-resolved PR/head, check-run/output, and the
 installed profile's human-review or independent-check facts; its
 request/response, unavailable, amendment, and idempotency behavior are
 specified in the [pilot contract](../operations/github-acceptance-pilot.md).
+For a separately installed `github_event_delivery_profiles` exact revision,
+the signed GitHub webhook worker may continue a deferred work or verifier
+report only after an exact-head completed CI rollup. `WorkService` re-reads the
+PR source, immutable criteria/profile revision, and required checks through the
+provider before it schedules a verifier or accepts evidence. Webhook fields are
+not acceptance facts. Missing webhook configuration, stale delivery,
+unavailable reads, or failed/pending/skipped required checks leave the durable
+intent pending; the event worker has no provider-write path or model loop.
 Work runs and failed behavioral checks cannot close issues. A failure queues
 revision until the configured attempt budget is exhausted, then blocks and
 writes the generated systemic-review comment. Further launches remain blocked
