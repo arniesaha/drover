@@ -1,0 +1,23 @@
+{
+  "issue": 1043,
+  "parent_issue": 1024,
+  "source": "bde283aa6bd4f97073867930153c8d12e9b8b85e",
+  "pull_number": 1042,
+  "merged_runtime_source": "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc",
+  "profile_revision": "df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe",
+  "review_mode": "independent_check",
+  "behavioral_check": "github-event-adoption-1043-outcome",
+  "app_id": 15368,
+  "proof_test_cases": 4,
+  "owner_held_invalid_result_rejected": true,
+  "p1_reused_as_evidence": false,
+  "profile_installed": false,
+  "publisher_installed": false,
+  "bound_worker_mcp_required_for_live_stages": true,
+  "whole_baseline_config_preserved_by_validator": true,
+  "complete_target_goal_model_preserved_by_validator": true,
+  "binding_delta_constrained_by_validator": true,
+  "dedicated_execution_directory_required": true,
+  "live_transport_verified": false,
+  "live_accepted": 0
+}
