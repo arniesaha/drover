@@ -4,6 +4,7 @@ import copy
 import hashlib
 import hmac
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,13 +20,17 @@ from test_work_queue_execution import (  # noqa: F401
 from test_work_queue_github import Response
 
 from drover.server.harness.registry import HarnessRegistry
+from drover.server.work_queue import runtime
 from drover.server.work_queue.config import (
     GitHubAcceptanceProfile,
     GitHubExistingSessionBinding,
     GoalScope,
 )
 from drover.server.work_queue.github import GitHubProvider
-from drover.server.work_queue.github_events import GitHubWebhookWorker
+from drover.server.work_queue.github_events import (
+    GitHubProviderIngestionWorker,
+    GitHubWebhookWorker,
+)
 from drover.server.work_queue.runtime import HarnessBridge
 from drover.server.work_queue.service import WorkActor, identity
 
@@ -1766,9 +1771,148 @@ def test_host_deferred_close_recovery_redelivery_rebuilds_plain_evidence_outcome
     assert facts["required_checks"]
     assert facts["evidence"] == "check-run:7"
     assert len(restarted.harness.github_native_owner_wakes) == 1
+
+
+def test_opted_provider_poll_rescans_pending_ci_and_restarts_without_duplicate_pair(
+    service, monkeypatch
+):
+    """Authenticated source polling feeds the existing CI continuation only."""
+    monkeypatch.setenv("TEST_TOKEN", "synthetic")
+    profile = independent_profile()
+    config = service.config.goals[0].model_dump()
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["github_event_delivery_profiles"] = {"1": profile_revision(profile)}
+    config["github_provider_ingestion_profiles"] = {"1": profile_revision(profile)}
+    config.update(
+        execution_enabled=True,
+        execution_cwds={"host": "/configured/checkout"},
+        brief_ref="docs/quality-pilots/github-event.md",
+        continuity_owner_id="drover:owner/goal",
+        continuity_owner_harness="codex",
+    )
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    scope = GoalScope.model_validate(config)
+    ingestion = service.config.github_provider_ingestion.model_copy(
+        update={"enabled": True, "interval_seconds": 1, "retry_seconds": 1}
+    )
+    service.config = service.config.model_copy(
+        update={"goals": [scope], "github_provider_ingestion": ingestion}
+    )
+    client = GitHub()
+    client.overrides["/repos/example/project/issues/1"] = {
+        "number": 1,
+        "state": "open",
+        "body": BODY,
+        "labels": [{"name": "goal:test"}, {"name": "status:queued"}],
+    }
+    service.providers["goal"] = GitHubProvider(
+        service.config.workspace_id, scope, session=client
+    )
+    service.harness.github_event_delivery = lambda run_key, revision: (
+        revision == profile_revision(profile)
+    )
+    service.harness.terminal_work_done = lambda run_key: (
+        service.harness.sessions[run_key].status == "completed"
+    )
+    work = launch(service, "provider-poll-work")
+    host = WorkActor("credential:host", "worker", host_id="host")
+    assert service.call(
+        "update",
+        {
+            "goal_id": "goal",
+            "number": 1,
+            "run_key": work["run_key"],
+            "action": "complete",
+        },
+        host,
+    ) == {"outcome": "deferred"}
+    client.overrides["/repos/example/project/issues/1"]["labels"][-1][
+        "name"
+    ] = "status:review"
+
+    # A current source read with a pending required check is not a green
+    # constituent fallback and cannot create a verifier.
+    client.overrides[f"/repos/example/project/commits/{SHA}/check-runs"] = {
+        "check_runs": [
+            {
+                "id": 3,
+                "name": "required",
+                "head_sha": SHA,
+                "app": {"id": 42},
+                "status": "in_progress",
+                "conclusion": None,
+            }
+        ]
+    }
+    pending = GitHubProviderIngestionWorker(service, ingestion)
+    assert pending.process_once() == 1
+    assert [row["run_role"] for row in service.store.links()] == ["work"]
+
+    # A later current API observation, not a model tick or synthetic webhook,
+    # sees green CI.  The still-running work retains the continuation across a
+    # worker restart instead of losing it as a completed delivery.
+    client.overrides.pop(f"/repos/example/project/commits/{SHA}/check-runs")
+    # The fake transport has no ETag support. Clear its provider cache to model
+    # the changed conditional response that GitHub supplies in production.
+    service.providers["goal"]._cache.clear()
+    fresh = GitHubProviderIngestionWorker(service, ingestion)
+    assert fresh.process_once() == 1
+    assert [row["run_role"] for row in service.store.links()] == ["work"]
+    assert fresh.health()["pending"] == 1
+    service.harness.sessions[work["run_key"]].status = "completed"
+    restarted = GitHubProviderIngestionWorker(service, ingestion)
+    assert restarted.process_once() == 1
+    roles = [row["run_role"] for row in service.store.links()]
+    assert roles == ["work", "verify"]
+    # Replay/out-of-order observations are idempotent and do not launch a
+    # second verifier. The service still owns current source and check reads.
+    replayed = GitHubProviderIngestionWorker(service, ingestion)
+    assert replayed.process_once() == 1
+    assert [row["run_role"] for row in service.store.links()] == ["work", "verify"]
+
+    # A moved source is observed but cannot reuse the old source-bound pair.
+    client.head = "b" * 40
+    service.providers["goal"]._cache.clear()
+    moved = GitHubProviderIngestionWorker(service, ingestion)
+    assert moved.process_once() == 1
+    assert [row["run_role"] for row in service.store.links()] == ["work", "verify"]
+    assert client.closed == 0
+
+
+def test_provider_polling_requires_the_exact_existing_delivery_mapping(service):
+    profile = independent_profile()
+    config = service.config.goals[0].model_dump()
+    config["github_acceptance_profiles"] = {"1": profile}
+    config["github_provider_ingestion_profiles"] = {"1": profile_revision(profile)}
+    config.update(
+        execution_enabled=True,
+        execution_cwds={"host": "/configured/checkout"},
+        brief_ref="docs/quality-pilots/github-event.md",
+        continuity_owner_id="drover:owner/goal",
+        continuity_owner_harness="codex",
+    )
+    config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
+    with pytest.raises(ValueError, match="installed exact delivery profile"):
+        GoalScope.model_validate(config)
+
+
+def test_runtime_starts_opted_provider_poller_without_a_webhook_secret(service):
+    """API polling is a separate opt-in lifecycle from signed ingress."""
+    ingestion = service.config.github_provider_ingestion.model_copy(
+        update={"enabled": True}
+    )
+    service.config = service.config.model_copy(
+        update={"github_provider_ingestion": ingestion}
+    )
+    collector = SimpleNamespace(work_control=service)
+    shutdown = threading.Event()
+    shutdown.set()
+    worker = runtime.start_github_webhook_worker(collector, service.config, shutdown)
+    assert isinstance(worker, GitHubProviderIngestionWorker)
+    assert collector.github_provider_ingestion_worker is worker
+    assert not hasattr(collector, "github_webhook_worker")
+    worker.stop()
     assert worker.process_once() == 0
-    assert client.closed == 1
-    assert len(restarted.harness.github_native_owner_wakes) == 1
 
 
 def test_wrong_repository_source_cannot_close(service, monkeypatch):

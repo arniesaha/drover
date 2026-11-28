@@ -3,9 +3,10 @@
 This is an owner-operated adoption and live-acceptance preparation guide for
 the opt-in GitHub event path. It is not an installation record, a substitute
 for a GitHub delivery, or a claim that the path has accepted another outcome.
-It uses the existing signed receiver, provider rereads, and native owner; it
-does not introduce provider polling, an Access bypass, a tunnel, a secret, or
-a scheduler.
+It uses either the existing signed receiver or the separately installed,
+bounded authenticated GitHub API poller, followed by provider rereads and the
+native owner. It does not bypass Access, create a tunnel or secret, or use a
+model scheduler as an acceptance driver.
 
 ## Fixed historical anchors
 
@@ -38,11 +39,27 @@ whose work or verifier is not yet terminal is retried after five seconds and
 re-reads GitHub provider facts. This is recovery polling of a received signed
 push, not GitHub source discovery.
 
-`GitHubProvider` provides bounded authenticated reads but has no configured
-provider-ingestion poller that calls `advance_github_ci`. The only production
-caller of that continuation is the signed delivery worker. A repository-hooks
-API result does not establish whether an installed GitHub App has its own
-subscription, and a token credential cannot be used as a webhook HMAC secret.
+`GitHubProviderIngestionWorker` is a disabled-by-default, **GitHub API
+POLLING** source. When `github_provider_ingestion.enabled` and the exact issue
+appears in `github_provider_ingestion_profiles`, it periodically reads only
+that goal's configured issue/PR/profile through the existing credential and
+calls `advance_github_ci`. The service then rereads the current source and
+required-check rollup before every continuation and native-owner boundary.
+It does not create webhook rows, accept HMAC, or treat a token as a webhook
+secret. It has no durable cursor: restart rescans the small exact allowlist so
+it cannot skip retained pending work. Health reports the source as
+`github_api_polling`, a `none; ... rescanned` cursor, observations, pending,
+rejected, unavailable and last-error counters. Provider conditional reads and
+rate-limit backoff remain in `GitHubProvider`; the poller uses visible
+`interval_seconds`, `batch_size`, `retry_seconds`, and `max_backoff_seconds`.
+
+A signed receiver remains an independently useful pushed-ingress path. Its
+0.25-second local delivery-table loop and five-second continuation retry are
+polling of a received delivery. The provider poller's periodic rereads are a
+separate API polling transport and must be described that way in operations.
+A repository-hooks API result does not establish whether an installed GitHub
+App has its own subscription, and a token credential cannot be used as a
+webhook HMAC secret.
 
 ## Read-only preflight
 
@@ -65,23 +82,60 @@ while performing this preflight.
 
 The private runtime/config reader must then confirm, without exposing values:
 
-1. `github_webhook.secret_env` is a nonempty reference to an already approved
-   secret facility, and the receiver and its worker are running.
-2. The new authorized issue alone appears in both
-   `github_acceptance_profiles` and `github_event_delivery_profiles` at the
-   same reviewed revision.
+1. Choose one installed transport. Signed ingress needs
+   `github_webhook.secret_env` and a reachable approved callback. API polling
+   needs `github_provider_ingestion.enabled: true` and no callback or HMAC.
+   It still uses only the existing read credential and must not expose it.
+2. The new authorized issue alone appears in
+   `github_acceptance_profiles`, `github_event_delivery_profiles`, and, for
+   API polling, `github_provider_ingestion_profiles`, all at the same reviewed
+   revision. The schema rejects a polling entry without the existing exact
+   delivery mapping and native owner.
 3. Its goal has the exact native owner above, the signed parent and verifier
    bindings, and the repository-scoped existing read credential. P1 entries
    remain unchanged.
-4. The configured callback is reachable by the GitHub subscription without an
-   interactive Cloudflare Access login. Do not weaken Access, add a public
-   bypass, or create a tunnel to satisfy this condition.
+4. For signed ingress only, the configured callback is reachable by the
+   GitHub subscription without an interactive Cloudflare Access login. Do not
+   weaken Access, add a public bypass, or create a tunnel to satisfy this
+   condition. API polling has no public callback requirement.
 
-If any condition fails, stop before launching a work session. The smallest
-missing capability is external transport provisioning: an authorized,
-noninteractive signed GitHub-App delivery route plus an existing approved HMAC
-secret reference. It is not a code change and cannot be replaced by the
-existing read token or by fabricated local deliveries.
+If the selected transport's condition fails, stop before launching a work
+session. An unavailable signed route can be replaced only by the reviewed
+opt-in API-polling configuration above; it cannot be replaced by fabricated
+local deliveries. An unavailable credential or a provider rate-limit backoff
+is a fail-closed polling health condition, not evidence of readiness.
+
+For an isolated future task, the owner reviews an exact configuration shape
+like this before the ordinary protected configuration installation. Replace
+every placeholder with the new task's independently reviewed values; do not
+add P1's `1031` entry or copy its closed source.
+
+```yaml
+github_provider_ingestion:
+  enabled: true                 # default is false
+  interval_seconds: 5           # GitHub API POLLING cadence
+  batch_size: 1                 # bounded exact-source scan
+  retry_seconds: 5
+  max_backoff_seconds: 300
+goals:
+  - goal_id: <new-goal>
+    repo: arniesaha/drover
+    continuity_owner_id: drover:owner/<new-goal>
+    github_acceptance_profiles:
+      "<new-issue>": <reviewed-profile>
+    github_event_delivery_profiles:
+      "<new-issue>": <same-reviewed-profile>
+    github_provider_ingestion_profiles:
+      "<new-issue>": <same-reviewed-profile>
+```
+
+Before installation, the owner records the new issue, PR number and exact
+head, immutable profile/criterion revision, behavioral check ID/App/output
+digest, required-check IDs, distinct signed work/verifier run keys and turns,
+and native-owner epoch. After installation, read the worker health and current
+provider facts; a health observation is not an acceptance verdict. Keep this
+record in the owner-held evidence location, never in issue text supplied by a
+candidate.
 
 ## Owner-run live driver after preflight passes
 
@@ -93,9 +147,10 @@ the owner-held evidence record.
 1. Bind or launch only the configured work and independent verifier. Confirm
    their durable signed bindings, distinct identities, terminal successful
    turns, and an idle owner before submitting a verifier result.
-2. Let GitHub deliver an actual exact-head completed CI event. Read the stored
-   delivery, its linked item, and current provider facts; never POST a copied
-   payload as a live substitute.
+2. For signed ingress, let GitHub deliver an actual exact-head completed CI
+   event and read its stored delivery. For API polling, record the configured
+   poller health observation and its provider reads for the exact item. Never
+   POST a copied payload or persist a fixture as a live substitute.
 3. Submit the verifier's bounded evidence. The coordinator must reread the
    current head, required checks, profile/criterion revision, behavioral output
    and producer App before its single close. Confirm the durable `verified`

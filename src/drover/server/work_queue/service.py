@@ -1533,19 +1533,32 @@ class WorkService:
                 return True
         return False
 
-    def advance_github_ci(self, repo, pull_number, head):
+    def advance_github_ci(
+        self, repo, pull_number, head, *, goal_id=None, item_number=None
+    ):
         """Continue or retain one exact pushed CI observation.
 
         ``pending`` deliberately leaves the signed delivery leased for a
         bounded retry.  ``settled`` includes stale, failed, unsupported, and
         already-acknowledged paths; none creates an effect.
         """
-        if not isinstance(repo, str) or not isinstance(pull_number, int):
+        if (
+            not isinstance(repo, str)
+            or not isinstance(pull_number, int)
+            or goal_id is not None
+            and not isinstance(goal_id, str)
+            or item_number is not None
+            and (not isinstance(item_number, int) or item_number <= 0)
+        ):
             return "settled"
         pending = False
         with self.lock:
             for scope in self.config.goals:
+                if goal_id is not None and scope.goal_id != goal_id:
+                    continue
                 for number, profile in scope.github_acceptance_profiles.items():
+                    if item_number is not None and int(number) != item_number:
+                        continue
                     if scope.repo != repo or profile.pull_number != pull_number:
                         continue
                     if (

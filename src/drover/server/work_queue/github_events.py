@@ -6,6 +6,7 @@ import json
 import os
 import re
 import threading
+import time
 
 from .github import ProviderUnavailable
 
@@ -379,3 +380,146 @@ class GitHubWebhookWorker:
                     head_sha=payload.get("after"),
                 ),
             )
+
+
+class GitHubProviderIngestionWorker:
+    """Poll current GitHub source facts for explicitly installed exact items.
+
+    This is authenticated GitHub API polling, not webhook ingestion.  It has
+    no delivery HMAC, no local delivery row, and no second effect ledger: every
+    observation enters :meth:`WorkService.advance_github_ci`, which rereads the
+    provider facts before it can advance a deferred pair or native owner wake.
+    A restart deliberately rescans the bounded configuration instead of
+    advancing a cursor that could skip a retained pending continuation.
+    """
+
+    def __init__(self, service, config, *, clock=time.monotonic):
+        self.service, self.config, self.clock = service, config, clock
+        self._stop = threading.Event()
+        self._thread = None
+        self._due = {}
+        self._failures = {}
+        self._lock = threading.Lock()
+        self._health = {
+            "source": "github_api_polling",
+            "cursor": "none; exact configured sources are rescanned",
+            "observed": 0,
+            "advanced": 0,
+            "pending": 0,
+            "unavailable": 0,
+            "rejected": 0,
+            "last_error": None,
+        }
+
+    def health(self):
+        with self._lock:
+            return dict(self._health)
+
+    def _record(self, key, value=1):
+        with self._lock:
+            self._health[key] = self._health.get(key, 0) + value
+
+    def _error(self, target, error):
+        failures = self._failures.get(target, 0) + 1
+        self._failures[target] = failures
+        delay = min(
+            self.config.max_backoff_seconds,
+            self.config.retry_seconds * (2 ** min(failures - 1, 16)),
+        )
+        self._due[target] = self.clock() + delay
+        with self._lock:
+            self._health["unavailable"] += 1
+            self._health["last_error"] = str(error)[:128]
+
+    def _targets(self):
+        for scope in sorted(self.service.config.goals, key=lambda row: row.goal_id):
+            for raw_number, revision in sorted(
+                scope.github_provider_ingestion_profiles.items(),
+                key=lambda row: int(row[0]),
+            ):
+                profile = scope.github_acceptance_profiles.get(raw_number)
+                if (
+                    profile is None
+                    or revision != profile.revision
+                    or scope.github_event_delivery_profiles.get(raw_number) != revision
+                ):
+                    # Configuration validation prevents this at construction;
+                    # retain fail-closed behavior if a live object is replaced.
+                    continue
+                yield scope, int(raw_number), revision
+
+    def start(self, shutdown_event=None):
+        if self._thread is not None:
+            return
+
+        def run():
+            while not self._stop.is_set() and not (
+                shutdown_event and shutdown_event.is_set()
+            ):
+                self.process_once()
+                self._stop.wait(self.config.interval_seconds)
+
+        self._thread = threading.Thread(
+            target=run, name="github-provider-ingestion", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def process_once(self):
+        """Observe at most one configured batch; provider failure is retryable."""
+        if not self.config.enabled:
+            return 0
+        now = self.clock()
+        targets = [
+            target
+            for target in self._targets()
+            if self._due.get((target[0].goal_id, target[1]), 0) <= now
+        ][: self.config.batch_size]
+        for scope, number, revision in targets:
+            target = (scope.goal_id, number)
+            try:
+                provider, _, ref, item = self.service.item(scope.goal_id, number)
+                source = provider.acceptance_source(
+                    ref, allow_closed=item.get("state") == "closed"
+                )
+                if (
+                    source.get("repo") != scope.repo
+                    or source.get("pull")
+                    != scope.github_acceptance_profiles[str(number)].pull_number
+                    or source.get("profile") != revision
+                    or not _sha(source.get("head"))
+                ):
+                    raise ValueError("provider source outside installed profile")
+                outcome = self.service.advance_github_ci(
+                    scope.repo,
+                    source["pull"],
+                    source["head"],
+                    goal_id=scope.goal_id,
+                    item_number=number,
+                )
+            except ProviderUnavailable as exc:
+                self._error(target, exc)
+                continue
+            except (PermissionError, ValueError, KeyError) as exc:
+                # Invalid labels, changed criteria, wrong source and revoked
+                # scopes are settled failures. They never produce an effect.
+                self._due.pop(target, None)
+                self._failures.pop(target, None)
+                self._record("rejected")
+                with self._lock:
+                    self._health["last_error"] = str(exc)[:128]
+                continue
+            self._record("observed")
+            self._due.pop(target, None)
+            self._failures.pop(target, None)
+            if outcome == "pending":
+                self._due[target] = self.clock() + self.config.retry_seconds
+                self._record("pending")
+            else:
+                self._record("advanced")
+        return len(targets)
