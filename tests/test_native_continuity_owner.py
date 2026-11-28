@@ -196,6 +196,117 @@ def _runner(
     return runner, collector, store, run_id, clock
 
 
+def test_github_owner_receipt_recovers_after_effect_before_ack(tmp_path):
+    """A fenced replay ACKs one completed GitHub receipt without an owner turn."""
+    runner, collector, store, run_id, clock = _runner(
+        tmp_path, event_kind="github_acceptance_verified"
+    )
+    calls = []
+    current_facts = {"available": True}
+
+    def effect(goal_id, continuity_run_id, **kwargs):
+        calls.append((goal_id, continuity_run_id, kwargs))
+        assert kwargs["owner_id"] == "drover:owner/goal-native"
+        # Simulate the provider head/check changing after the durable receipt.
+        # Recovery must reconcile that receipt instead of treating a new read as
+        # authority to repeat the effect.
+        return "github-native-owner:" + "a" * 64 if current_facts["available"] else None
+
+    collector.work_control = SimpleNamespace(github_native_owner_effect=effect)
+    original_acknowledge = runner.continuity.acknowledge
+    failed = {"once": True}
+
+    def crash_after_effect(*args, **kwargs):
+        if failed["once"]:
+            failed["once"] = False
+            raise RuntimeError("injected post-effect pre-ack crash")
+        return original_acknowledge(*args, **kwargs)
+
+    runner.continuity.acknowledge = crash_after_effect
+    assert runner.process_once() == 0
+    status = store.status(run_id)
+    action = status["next_action"]
+    assert action["type"] == "acknowledge_github_acceptance"
+    assert action["action_intent"]["state"] == "complete"
+    assert status["inbox_counts"] == {"delivered": 1}
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE run_id = ?",
+                [run_id],
+            ).fetchone()[0]
+            == 1
+        )
+
+    # The provider facts move after the receipt. The completed receipt remains
+    # the only effect authority, subject to current owner/epoch/integration
+    # fences in action_intent and acknowledge.
+    current_facts["available"] = False
+    epoch = status["owner"]["epoch"]
+    with pytest.raises(KeyError):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch,
+            wake_id="wrong-wake",
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch,
+            wake_id=action["event_id"],
+            action_fingerprint="wrong-fingerprint",
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/not-authorized",
+            owner_epoch=epoch,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch - 1,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    assert store.status(run_id)["inbox_counts"] == {"delivered": 1}
+
+    # Recreate the runner and redeliver the same fenced wake after its normal
+    # backoff. The action intent remains the sole durable effect marker.
+    clock.advance(5)
+    restarted = NativeOwnerRunner(
+        collector,
+        SimpleNamespace(goals=[_scope()]),
+        credential_store=CredentialStore(tmp_path / "credentials.json"),
+        clock=clock,
+        claim_seconds=10,
+    )
+    assert restarted.process_once() == 1
+    assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
+    assert len(calls) == 1  # post-receipt recovery does not reread provider facts
+    with control_plane_connection(runner.path) as con:
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_action_intents WHERE run_id = ?",
+                [run_id],
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            con.execute(
+                "SELECT count(*) FROM continuity_owner_turn_claims WHERE run_id = ?",
+                [run_id],
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_runner_surfaces_signed_deployment_gate_without_owner_turn(tmp_path):
     runner, collector, store, implementation_run, _ = _runner(tmp_path)
     registry = collector.registry

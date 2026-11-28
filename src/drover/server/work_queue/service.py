@@ -917,6 +917,324 @@ class WorkService:
             return None
         return value if isinstance(value, bool) else None
 
+    def _github_event_delivery(self, scope, number, run_key):
+        """Require both installed and launch-signed exact-profile opt-ins."""
+        profile = scope.github_acceptance_profiles.get(str(number))
+        revision = scope.github_event_delivery_profiles.get(str(number))
+        reader = getattr(self.harness, "github_event_delivery", None)
+        if profile is None or revision != profile.revision or not callable(reader):
+            return False
+        try:
+            return reader(run_key, revision) is True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _github_native_owner(scope):
+        owner = "drover:owner/" + scope.goal_id
+        return owner if scope.continuity_owner_id == owner else None
+
+    def _queue_github_native_owner_wake(
+        self, scope, provider, ref, parent, verifier, facts
+    ) -> bool | None:
+        """Append one owner wake from a retained, exact GitHub outcome.
+
+        The Factory run belongs to the signed parent work launch.  It is never
+        reconstructed from issue text, and this method deliberately leaves a
+        missing ledger wake retryable for the signed CI delivery path.
+        """
+        owner = self._github_native_owner(scope)
+        profile = scope.github_acceptance_profiles.get(str(ref.number))
+        if (
+            owner is None
+            or profile is None
+            or scope.github_event_delivery_profiles.get(str(ref.number))
+            != profile.revision
+            or not self._github_event_delivery(scope, ref.number, parent)
+            or not self._github_event_delivery(scope, ref.number, verifier)
+        ):
+            return None
+        try:
+            retained = json.dumps(facts, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return False
+        digest = hashlib.sha256(retained.encode()).hexdigest()
+        writer = getattr(self.harness, "github_native_owner_wake", None)
+        if not callable(writer):
+            return False
+        try:
+            wake = writer(
+                parent,
+                source_event_id=digest,
+                subject=ref.url,
+                summary="GitHub provider verdict "
+                + digest
+                + " is ready for owner ACK.",
+            )
+        except Exception:
+            return False
+        return True if isinstance(wake, str) and wake else False
+
+    def _github_verified_outcome(self, scope, ref, parent):
+        """Return the one verified child and its immutable provider facts."""
+        links = self.store.links(goal_id=scope.goal_id, number=ref.number)
+        children = [
+            row
+            for row in links
+            if row["run_role"] == "verify"
+            and self._work_parent(links=links, row=row) == parent
+        ]
+        if len(children) != 1:
+            return None
+        verifier = children[0]
+        events = self.store.events(identity(verifier["run_key"], "verified", None))
+        outcomes = [
+            event
+            for event in events
+            if event["event_kind"] == "outcome"
+            and event["action_category"] == "verified"
+            and event["outcome"] == "verified"
+        ]
+        if len(outcomes) != 1:
+            return None
+        try:
+            facts = json.loads(outcomes[0]["provider_operation_id"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return verifier, facts
+
+    def advance_github_native_owner(self, scope, provider, ref):
+        """Recreate an unacknowledged native wake from a retained outcome.
+
+        The signed CI worker uses this only as bounded recovery after an
+        already-received push.  It never polls GitHub to discover new work and
+        never turns an outcome into an acknowledgement without the native
+        runner's own effect receipt.
+        """
+        pending = False
+        for row in self.store.links(goal_id=scope.goal_id, number=ref.number):
+            if row["run_role"] != "work":
+                continue
+            verified = self._github_verified_outcome(scope, ref, row["run_key"])
+            if verified is None:
+                continue
+            verifier, facts = verified
+            queued = self._queue_github_native_owner_wake(
+                scope, provider, ref, row["run_key"], verifier["run_key"], facts
+            )
+            pending = pending or queued is False
+        return "pending" if pending else "settled"
+
+    def github_native_owner_effect(
+        self,
+        goal_id,
+        continuity_run_id,
+        *,
+        wake_id,
+        action_fingerprint,
+        owner_id,
+        owner_epoch,
+    ):
+        """Revalidate an exact GitHub verdict before the native owner ACKs it.
+
+        The returned digest is the only artifact a native owner may receipt for
+        this path.  It is derived from two fresh provider reads plus the
+        immutable decision outcome; it cannot be selected by issue text or the
+        owner action.  ``None`` leaves the already-delivered wake retryable.
+        """
+        if (
+            not isinstance(continuity_run_id, str)
+            or not continuity_run_id.startswith("work-")
+            or not isinstance(wake_id, str)
+            or not isinstance(action_fingerprint, str)
+            or not isinstance(owner_epoch, int)
+        ):
+            return None
+        parent = continuity_run_id.removeprefix("work-")
+        with self.lock:
+            scope = next(
+                (
+                    candidate
+                    for candidate in self.config.goals
+                    if candidate.goal_id == goal_id
+                ),
+                None,
+            )
+            owner = self._github_native_owner(scope) if scope is not None else None
+            if owner is None or owner != owner_id:
+                return None
+            rows = self.store.links(run_key=parent)
+            if len(rows) != 1 or rows[0]["run_role"] != "work":
+                return None
+            row = rows[0]
+            if row["goal_id"] != goal_id:
+                return None
+            try:
+                _, provider, _, ref = self.scope(goal_id, row["item_number"])
+            except (KeyError, ValueError):
+                return None
+            profile = scope.github_acceptance_profiles.get(str(ref.number))
+            if (
+                profile is None
+                or scope.github_event_delivery_profiles.get(str(ref.number))
+                != profile.revision
+                or not self._github_event_delivery(scope, ref.number, parent)
+            ):
+                return None
+            verified = self._github_verified_outcome(scope, ref, parent)
+            if verified is None:
+                return None
+            verifier, retained = verified
+            terminal_done = getattr(self.harness, "terminal_work_done", None)
+            if (
+                not callable(terminal_done)
+                or terminal_done(parent) is not True
+                or terminal_done(verifier["run_key"]) is not True
+                or not self._github_event_delivery(
+                    scope, ref.number, verifier["run_key"]
+                )
+            ):
+                return None
+            try:
+                source = provider.acceptance_source(ref, allow_closed=True)
+                evidence = retained["evidence"]
+                current = provider.acceptance_facts(ref, evidence, allow_closed=True)
+                repeated = provider.acceptance_facts(ref, evidence, allow_closed=True)
+                item = provider.get_item(ref)
+            except (KeyError, PermissionError, ValueError):
+                return None
+            if (
+                item.get("state") != "closed"
+                or source
+                != {
+                    key: retained.get(key)
+                    for key in ("profile", "head", "branch", "pull", "repo")
+                }
+                or json.dumps(current, sort_keys=True)
+                != json.dumps(retained, sort_keys=True)
+                or json.dumps(repeated, sort_keys=True)
+                != json.dumps(current, sort_keys=True)
+            ):
+                return None
+            _, expected = verification_identity(
+                self.config.workspace_id, goal_id, ref.number, parent, source
+            )
+            if expected != verifier["run_key"]:
+                return None
+            material = json.dumps(
+                {
+                    "action": action_fingerprint,
+                    "owner": owner,
+                    "run": continuity_run_id,
+                    "wake": wake_id,
+                    "facts": current,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return (
+                "github-native-owner:" + hashlib.sha256(material.encode()).hexdigest()
+            )
+
+    def _recover_observed_github_close(self, scope, provider, ref, row, key):
+        """ACK an observed close only after current provider facts still agree.
+
+        This is the narrow post-effect/pre-outcome recovery fence. It never
+        repeats the close and it is not the native-owner effect/ACK protocol.
+        """
+        profile = scope.github_acceptance_profiles.get(str(ref.number))
+        events = self.store.events(key)
+        if (
+            profile is None
+            or row["run_role"] != "verify"
+            or len(events) != 1
+            or events[0]["event_kind"] != "intent"
+            or events[0]["action_category"] != "verified"
+        ):
+            return None
+        # Older direct verifier retries retain the full provider fact object,
+        # while a host-deferred verifier intentionally retains only its bounded
+        # evidence key. Both shapes need a fresh closed-item read; neither can
+        # turn the intent itself into acceptance proof.
+        retained = None
+        try:
+            candidate = json.loads(events[0]["provider_operation_id"])
+            if isinstance(candidate, dict):
+                retained = candidate
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if retained is None:
+            evidence = events[0]["provider_operation_id"]
+            try:
+                source = provider.acceptance_source(ref, allow_closed=True)
+            except (PermissionError, ValueError):
+                return None
+        else:
+            try:
+                source = {
+                    field: retained[field]
+                    for field in ("profile", "head", "branch", "pull", "repo")
+                }
+                evidence = retained["evidence"]
+            except (KeyError, TypeError, ValueError):
+                return None
+        if (
+            source["profile"] != profile.revision
+            or source["repo"] != ref.repo
+            or source["pull"] != profile.pull_number
+            or not isinstance(evidence, str)
+        ):
+            return None
+        links = self.store.links(goal_id=scope.goal_id, number=ref.number)
+        parent = self._work_parent(links=links, row=row)
+        parent_row = next((link for link in links if link["run_key"] == parent), None)
+        terminal_done = getattr(self.harness, "terminal_work_done", None)
+        if (
+            parent is None
+            or parent_row is None
+            or not callable(terminal_done)
+            or terminal_done(row["run_key"]) is not True
+            or terminal_done(parent) is not True
+            or not self._github_event_delivery(scope, ref.number, row["run_key"])
+            or not self._github_event_delivery(scope, ref.number, parent)
+        ):
+            return None
+        _, expected = verification_identity(
+            self.config.workspace_id, scope.goal_id, ref.number, parent, source
+        )
+        if expected != row["run_key"]:
+            return None
+        item = provider.get_item(ref)
+        if item.get("state") != "closed":
+            return None
+        try:
+            current = provider.acceptance_facts(ref, evidence, allow_closed=True)
+        except (PermissionError, ValueError):
+            return None
+        canonical_current = json.dumps(current, sort_keys=True)
+        if (
+            retained is not None
+            and canonical_current != json.dumps(retained, sort_keys=True)
+        ) or json.dumps(
+            provider.acceptance_facts(ref, evidence, allow_closed=True),
+            sort_keys=True,
+        ) != canonical_current:
+            return None
+        self.store.event(
+            "control:queue-execution",
+            ref,
+            key,
+            "outcome",
+            "verified",
+            outcome="verified",
+            operation_id=json.dumps(current, sort_keys=True),
+            link_id=row["id"],
+        )
+        self._queue_github_native_owner_wake(
+            scope, provider, ref, parent, row["run_key"], current
+        )
+        return {"outcome": "verified"}
+
     def _bound_host_verification_report(self, scope, row, run_key, session, actor):
         """Allow only a bound verifier to defer its own terminal acceptance.
 
@@ -924,8 +1242,13 @@ class WorkService:
         A verifier's mutable prompt, goal configuration, or host role cannot
         reconstruct that authority after launch.
         """
+        local_delivery = scope.candidate_source == "local_file"
+        github_delivery = self._github_event_delivery(
+            scope, row["item_number"], row["run_key"]
+        )
         if (
-            scope.candidate_source != "local_file"
+            not local_delivery
+            and not github_delivery
             or row["run_role"] != "verify"
             or session is None
             or session.status != "running"
@@ -938,7 +1261,14 @@ class WorkService:
             links=self.store.links(goal_id=scope.goal_id, number=row["item_number"]),
             row=row,
         )
-        return parent is not None and self._signed_committed_provenance(parent) is True
+        if parent is None:
+            return False
+        return (
+            local_delivery and self._signed_committed_provenance(parent) is True
+        ) or (
+            github_delivery
+            and self._github_event_delivery(scope, row["item_number"], parent)
+        )
 
     def _verification_criteria(self, provider, ref, item):
         scope = next(
@@ -1001,7 +1331,15 @@ class WorkService:
         """
         with self.lock:
             scope, provider, policy, ref = self.scope(goal_id, number)
-            if scope.candidate_source != "local_file":
+            configured_github_delivery = scope.github_event_delivery_profiles.get(
+                str(number)
+            ) == getattr(
+                scope.github_acceptance_profiles.get(str(number)), "revision", None
+            )
+            if (
+                scope.candidate_source != "local_file"
+                and not configured_github_delivery
+            ):
                 return None
             item = self.checked(scope, policy, provider.get_item(ref))
             work_links = [
@@ -1012,6 +1350,9 @@ class WorkService:
             if not work_links:
                 return None
             row = work_links[-1]
+            github_delivery = self._github_event_delivery(scope, number, row["run_key"])
+            if scope.candidate_source != "local_file" and not github_delivery:
+                return None
             key = identity(row["run_key"], "complete", None)
             events = self.store.events(key)
             if (
@@ -1030,20 +1371,33 @@ class WorkService:
             # Only the immutable hub-signed provenance mode may create a
             # separate verifier. Marker-only runs settle through their bound
             # daemon-attested effect and native owner, never this queue path.
-            if self._signed_committed_provenance(row["run_key"]) is not True:
-                return None
-            artifact = item.get("expected_effect_artifact")
-            terminal_done = getattr(self.harness, "terminal_work_done", None)
-            materialized = getattr(self.harness, "expected_effect_materialized", None)
             if (
-                not isinstance(artifact, str)
-                or not artifact
-                or not callable(terminal_done)
-                or terminal_done(row["run_key"]) is not True
-                or not callable(materialized)
-                or materialized(row["run_key"], artifact) is not True
+                scope.candidate_source == "local_file"
+                and self._signed_committed_provenance(row["run_key"]) is not True
             ):
                 return None
+            terminal_done = getattr(self.harness, "terminal_work_done", None)
+            if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
+                return None
+            if scope.candidate_source == "local_file":
+                artifact = item.get("expected_effect_artifact")
+                materialized = getattr(
+                    self.harness, "expected_effect_materialized", None
+                )
+                if (
+                    not isinstance(artifact, str)
+                    or not artifact
+                    or not callable(materialized)
+                    or materialized(row["run_key"], artifact) is not True
+                ):
+                    return None
+            else:
+                source = self._verification_criteria(provider, ref, item)
+                if (
+                    provider.exact_head_check_state(source["head"], source["branch"])
+                    != "green"
+                ):
+                    return None
             verification = self._launch_verification(
                 provider,
                 policy,
@@ -1074,7 +1428,11 @@ class WorkService:
         """
         with self.lock:
             scope, provider, policy, ref = self.scope(goal_id, number)
-            if scope.candidate_source != "local_file":
+            if scope.candidate_source != "local_file" and not any(
+                self._github_event_delivery(scope, number, row["run_key"])
+                for row in self.store.links(goal_id=goal_id, number=number)
+                if row["run_role"] == "verify"
+            ):
                 return None
             item = self.checked(scope, policy, provider.get_item(ref))
             links = self.store.links(goal_id=goal_id, number=number)
@@ -1092,16 +1450,40 @@ class WorkService:
             ):
                 return None
             parent = self._work_parent(links=links, row=row)
-            if parent is None or self._signed_committed_provenance(parent) is not True:
+            if parent is None:
+                return None
+            github_delivery = self._github_event_delivery(scope, number, row["run_key"])
+            if scope.candidate_source == "local_file":
+                if self._signed_committed_provenance(parent) is not True:
+                    return None
+            elif not (
+                github_delivery and self._github_event_delivery(scope, number, parent)
+            ):
                 return None
             terminal_done = getattr(self.harness, "terminal_work_done", None)
-            if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
+            if (
+                not callable(terminal_done)
+                or terminal_done(row["run_key"]) is not True
+                or (github_delivery and terminal_done(parent) is not True)
+            ):
                 return None
+            criteria = self._verification_criteria(provider, ref, item)
             _, expected = verification_identity(
-                self.config.workspace_id, goal_id, number, parent, item.get("body")
+                self.config.workspace_id, goal_id, number, parent, criteria
             )
             if row["run_key"] != expected:
                 return None
+            if github_delivery:
+                facts = provider.acceptance_facts(
+                    ref, events[0]["provider_operation_id"]
+                )
+                if any(facts.get(key) != value for key, value in criteria.items()):
+                    return None
+                if (
+                    provider.acceptance_facts(ref, events[0]["provider_operation_id"])
+                    != facts
+                ):
+                    return None
             provider.close(ref)
             self.store.event(
                 "control:queue-execution",
@@ -1110,10 +1492,116 @@ class WorkService:
                 "outcome",
                 "verified",
                 outcome="verified",
-                operation_id=events[0]["provider_operation_id"],
+                # The deferred host report's intent retains only its evidence
+                # key. Preserve the full provider-resolved verdict on outcome
+                # so a later native-owner receipt cannot reconstruct facts from
+                # mutable issue text or a caller-supplied label.
+                operation_id=(
+                    json.dumps(facts, sort_keys=True)
+                    if github_delivery
+                    else events[0]["provider_operation_id"]
+                ),
                 link_id=row["id"],
             )
+            if github_delivery:
+                self._queue_github_native_owner_wake(
+                    scope, provider, ref, parent, row["run_key"], facts
+                )
             return {"outcome": "verified"}
+
+    def _github_event_continuation_pending(self, scope, number):
+        """Whether a signed GitHub pair still needs its retained CI delivery.
+
+        This is deliberately derived from append-only work intents and signed
+        launch bindings.  It does not turn a mutable work-item stage or a
+        webhook conclusion into a readiness claim.
+        """
+        for row in self.store.links(goal_id=scope.goal_id, number=number):
+            if row["run_role"] not in {
+                "work",
+                "verify",
+            } or not self._github_event_delivery(scope, number, row["run_key"]):
+                continue
+            action = "complete" if row["run_role"] == "work" else "verified"
+            events = self.store.events(identity(row["run_key"], action, None))
+            if any(event["event_kind"] == "outcome" for event in events):
+                continue
+            # A submitted intent is pending terminal evidence. A separately
+            # launched verifier has no report yet, but must retain the exact
+            # green source observation until it either reports or is rejected.
+            if events or row["run_role"] == "verify":
+                return True
+        return False
+
+    def advance_github_ci(self, repo, pull_number, head):
+        """Continue or retain one exact pushed CI observation.
+
+        ``pending`` deliberately leaves the signed delivery leased for a
+        bounded retry.  ``settled`` includes stale, failed, unsupported, and
+        already-acknowledged paths; none creates an effect.
+        """
+        if not isinstance(repo, str) or not isinstance(pull_number, int):
+            return "settled"
+        pending = False
+        with self.lock:
+            for scope in self.config.goals:
+                for number, profile in scope.github_acceptance_profiles.items():
+                    if scope.repo != repo or profile.pull_number != pull_number:
+                        continue
+                    if (
+                        scope.github_event_delivery_profiles.get(number)
+                        != profile.revision
+                    ):
+                        continue
+                    try:
+                        provider, _, ref, item = self.item(scope.goal_id, int(number))
+                        # The coordinator may already have closed the issue
+                        # when its post-outcome Factory write was unavailable.
+                        # Retain this signed delivery only long enough to
+                        # recreate that idempotent wake; acceptance discovery
+                        # never runs against a closed item.
+                        if item.get("state") == "closed":
+                            # A host-deferred verifier stores a bounded evidence
+                            # key rather than a fact JSON blob. Recover its lone
+                            # intent before attempting the dependent native wake.
+                            # This path only observes a completed close; it never
+                            # calls the provider close operation again.
+                            for row in self.store.links(
+                                goal_id=scope.goal_id, number=ref.number
+                            ):
+                                if row["run_role"] != "verify":
+                                    continue
+                                key = identity(row["run_key"], "verified", None)
+                                self._recover_observed_github_close(
+                                    scope, provider, ref, row, key
+                                )
+                            pending = pending or (
+                                self.advance_github_native_owner(scope, provider, ref)
+                                == "pending"
+                            )
+                            continue
+                        source = self._verification_criteria(provider, ref, item)
+                        if source["head"] != head:
+                            continue
+                        if (
+                            provider.exact_head_check_state(
+                                source["head"], source["branch"]
+                            )
+                            != "green"
+                        ):
+                            continue
+                        self.advance_deferred_completion(scope.goal_id, int(number))
+                        self.advance_deferred_verification(scope.goal_id, int(number))
+                        pending = pending or (
+                            self.advance_github_native_owner(scope, provider, ref)
+                            == "pending"
+                        )
+                        pending = pending or self._github_event_continuation_pending(
+                            scope, int(number)
+                        )
+                    except (PermissionError, ValueError, WorkDenied):
+                        continue
+        return "pending" if pending else "settled"
 
     def update(
         self,
@@ -1164,6 +1652,12 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"]}
         if events:
+            if action == "verified":
+                recovered = self._recover_observed_github_close(
+                    scope, provider, ref, row, key
+                )
+                if recovered is not None:
+                    return recovered
             if action in {"complete", "verified"} and all(
                 event["event_kind"] == "intent" and event["action_category"] == action
                 for event in events
@@ -1183,9 +1677,13 @@ class WorkService:
                 raise ValueError("work session must complete before verification")
             # A bound host may request only its own immutable, signed local
             # candidate verifier. Every other completion stays coordinator-only.
+            github_delivery = self._github_event_delivery(scope, number, run_key)
             bound_host_completion = (
                 scope.candidate_source == "local_file"
                 and self._signed_committed_provenance(run_key) is True
+            ) or github_delivery
+            bound_host_completion = (
+                bound_host_completion
                 and session.status == "running"
                 and not actor.human
                 and actor.host_id == session.host_id
@@ -1208,11 +1706,12 @@ class WorkService:
                 # Only a task-bound local candidate may defer its request. The
                 # terminal queue path will re-check this immutable candidate
                 # effect before it creates the separate verifier.
-                if (
-                    scope.candidate_source != "local_file"
-                    or not isinstance(item.get("expected_effect_artifact"), str)
+                if scope.candidate_source == "local_file" and (
+                    not isinstance(item.get("expected_effect_artifact"), str)
                     or not item["expected_effect_artifact"]
                 ):
+                    raise ValueError("work session must complete before verification")
+                if scope.candidate_source != "local_file" and not github_delivery:
                     raise ValueError("work session must complete before verification")
                 self.store.event(
                     actor.principal,
@@ -1366,6 +1865,18 @@ class WorkService:
             operation_id=operation_id,
             link_id=row["id"],
         )
+        if action == "verified" and scope.candidate_source == "github":
+            parent = self._work_parent(
+                links=self.store.links(goal_id=goal_id, number=number), row=row
+            )
+            try:
+                facts = json.loads(operation_id)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                facts = None
+            if parent is not None and isinstance(facts, dict):
+                self._queue_github_native_owner_wake(
+                    scope, provider, ref, parent, row["run_key"], facts
+                )
         return {"outcome": action}
 
     def _work_parent(self, links, row):

@@ -44,6 +44,9 @@ class WorkCoordinatorContinuity:
     # Only the hub-signed work binding can grant this exact local candidate
     # permission to commit provenance for a separate verifier.
     committed_provenance: bool = False
+    # Exact GitHub profile revision that may use pushed CI continuation. This
+    # is signed at launch and separately checked against installed config.
+    github_event_delivery_profile_revision: str | None = None
     # A hub-signed M2-only receipt handoff; never accepted from task text.
     m2_ack_pending: bool = False
 
@@ -117,6 +120,7 @@ def _parse_work_coordinator_continuity(
     expected_effect_fields = {"expected_effect_artifact"}
     work_item_fields = {"goal_id", "item_number"}
     committed_provenance_fields = {"committed_provenance"}
+    github_event_delivery_fields = {"github_event_delivery_profile_revision"}
     m2_ack_pending_fields = {"m2_ack_pending"}
     if not isinstance(raw, Mapping) or not (
         base_fields
@@ -126,6 +130,7 @@ def _parse_work_coordinator_continuity(
         | expected_effect_fields
         | work_item_fields
         | committed_provenance_fields
+        | github_event_delivery_fields
         | m2_ack_pending_fields
     ):
         raise FactoryObserverRequestError("invalid work coordinator continuity binding")
@@ -160,11 +165,18 @@ def _parse_work_coordinator_continuity(
     goal_id = raw.get("goal_id")
     item_number = raw.get("item_number")
     committed_provenance = raw.get("committed_provenance", False)
+    github_event_delivery_profile_revision = raw.get(
+        "github_event_delivery_profile_revision"
+    )
     m2_ack_pending = raw.get("m2_ack_pending", False)
     if not isinstance(committed_provenance, bool):
         raise FactoryObserverRequestError(
             "work continuity committed provenance is invalid"
         )
+    if github_event_delivery_profile_revision is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", github_event_delivery_profile_revision
+    ):
+        raise FactoryObserverRequestError("GitHub event delivery binding is invalid")
     if not isinstance(m2_ack_pending, bool):
         raise FactoryObserverRequestError("work continuity M2 handoff is invalid")
     if m2_ack_pending and (goal_id is None or item_number is None):
@@ -190,6 +202,12 @@ def _parse_work_coordinator_continuity(
     if committed_provenance and expected_effect_artifact is None:
         raise FactoryObserverRequestError(
             "work continuity committed provenance requires expected effect"
+        )
+    if github_event_delivery_profile_revision is not None and (
+        goal_id is None or item_number is None or scope != "implementation"
+    ):
+        raise FactoryObserverRequestError(
+            "GitHub event delivery requires implementation item binding"
         )
     if (goal_id is None) != (item_number is None):
         raise FactoryObserverRequestError("work continuity item binding is invalid")
@@ -241,6 +259,7 @@ def _parse_work_coordinator_continuity(
             goal_id,
             item_number,
             committed_provenance,
+            github_event_delivery_profile_revision,
             m2_ack_pending,
         ),
         normalized,

@@ -276,12 +276,18 @@ class GitHubProvider:
             return "failed"
         return sorted(resolved) if facts else "green"
 
-    def acceptance_source(self, ref):
-        """Resolve a configured source, never a report URL/SHA or shell command."""
+    def acceptance_source(self, ref, *, allow_closed=False):
+        """Resolve a configured source, never a report URL/SHA or shell command.
+
+        ``allow_closed`` is limited to recovery of an already-recorded close
+        intent; callers still re-resolve criteria, pull head, and checks.
+        """
         self._ref(ref)
         profile = self.scope.github_acceptance_profiles[str(ref.number)]
         item = self.get_item(ref)
-        if item.get("state") != "open":
+        if item.get("state") != "open" and not (
+            allow_closed and item.get("state") == "closed"
+        ):
             raise ValueError("acceptance requires an open issue")
         start, end = "<!-- drover:acceptance -->", "<!-- /drover:acceptance -->"
         body = item.get("body") or ""
@@ -310,8 +316,8 @@ class GitHubProvider:
             "repo": ref.repo,
         }
 
-    def acceptance_facts(self, ref, evidence_key):
-        source = self.acceptance_source(ref)
+    def acceptance_facts(self, ref, evidence_key, *, allow_closed=False):
+        source = self.acceptance_source(ref, allow_closed=allow_closed)
         profile = self.scope.github_acceptance_profiles[str(ref.number)]
         pattern = (
             r"check-run:([1-9][0-9]{0,18}):review:([1-9][0-9]{0,18})"
@@ -356,7 +362,7 @@ class GitHubProvider:
         )
         if not isinstance(checks, list) or not checks:
             raise ValueError("required checks must succeed at current head")
-        if self.acceptance_source(ref) != source:
+        if self.acceptance_source(ref, allow_closed=allow_closed) != source:
             raise ValueError("acceptance source changed during evidence resolution")
         return {
             **source,

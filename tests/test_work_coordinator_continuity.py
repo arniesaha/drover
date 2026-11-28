@@ -84,6 +84,60 @@ def test_bridge_recovery_reconstructs_signed_continuity_and_initializes_ledger(
     assert [event["report"]["kind"] for event in status["events"]] == ["worker_started"]
 
 
+def test_github_native_owner_wake_uses_the_signed_parent_factory_run(tmp_path):
+    """A replay cannot create a second owner wake from a coordinator outcome."""
+    from drover.server.metrics import MetricsCollector
+    from drover.server.work_queue.runtime import HarnessBridge
+
+    path = tmp_path / "control.duckdb"
+    bootstrap_control_plane_store(path)
+    registry = HarnessRegistry(path)
+    session = registry.create_session(
+        session_id="github-parent",
+        host_id="studio",
+        harness="codex",
+        command="codex",
+        status="running",
+        handoff_mode="work_coordinator",
+        source_session_id="work/work-github-parent@0",
+    )
+    store = FactoryObserverContinuity(path)
+    run_id = store.initialize(
+        session_id=session.session_id,
+        objective="Exact GitHub work",
+        checkpoint="launched",
+        authorized_owner_id="drover:owner/goal",
+    )
+    collector = MetricsCollector(
+        duckdb_path=path,
+        incoming_dir=tmp_path / "incoming",
+        summarizer_report={},
+        api_token="hub-secret",
+    )
+    bridge = object.__new__(HarnessBridge)
+    bridge.collector = collector
+    bridge.resolve = lambda key: session if key == "github-parent" else None
+
+    first = bridge.github_native_owner_wake(
+        "github-parent",
+        source_event_id="a" * 64,
+        subject="https://github.com/example/project/issues/1",
+        summary="provider facts digest",
+    )
+    second = bridge.github_native_owner_wake(
+        "github-parent",
+        source_event_id="a" * 64,
+        subject="https://github.com/example/project/issues/1",
+        summary="provider facts digest",
+    )
+
+    assert first == second
+    status = store.status(run_id)
+    assert [event["report"]["kind"] for event in status["events"]] == [
+        "github_acceptance_verified"
+    ]
+
+
 def test_work_coordinator_binding_is_exact_and_projects_start_done_blocked_and_approval(
     tmp_path,
 ):

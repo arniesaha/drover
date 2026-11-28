@@ -49,6 +49,8 @@ class Harness:
         self.sessions = {}
         self.existing_sessions = {}
         self.calls = []
+        self.github_native_owner_wakes = []
+        self.github_native_owner_wake_ids = {}
         self.timeout = False
 
     def resolve(self, key):
@@ -98,6 +100,16 @@ class Harness:
         if self.timeout:
             raise TimeoutError("private remote body must never be reflected")
         return session.session_id
+
+    def github_native_owner_wake(self, run_key, *, source_event_id, subject, summary):
+        if source_event_id in self.github_native_owner_wake_ids:
+            return self.github_native_owner_wake_ids[source_event_id]
+        wake = "wake-" + source_event_id
+        self.github_native_owner_wakes.append(
+            (run_key, source_event_id, subject, summary)
+        )
+        self.github_native_owner_wake_ids[source_event_id] = wake
+        return wake
 
 
 ACTOR = WorkActor("credential:coordinator", "nix")

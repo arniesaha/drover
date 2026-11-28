@@ -1344,6 +1344,77 @@ class NativeOwnerRunner:
             and receipt.get("state") == "complete"
         )
 
+    def _settle_github_acceptance(
+        self, scope, run_id: str, action: dict, epoch: int
+    ) -> bool:
+        """Complete one provider-verified GitHub receipt and its exact ACK.
+
+        A GitHub coordinator close is intentionally not this acknowledgement.
+        The configured native owner re-reads the current trusted provider facts
+        through WorkService immediately before writing the deterministic effect
+        receipt.  A completed receipt is reconciled on replay before ACK, so a
+        crash after the receipt cannot repeat a provider write or lose the wake.
+        """
+        owner_id = self._owner(scope)
+        assert owner_id is not None
+        if action.get("type") != "acknowledge_github_acceptance":
+            return False
+        receipt = action.get("action_intent")
+        try:
+            if isinstance(receipt, dict) and receipt.get("state") == "complete":
+                # Reconcile an exact completed receipt through the continuity
+                # ledger before ACK. action_intent re-applies owner, epoch, and
+                # integration fences; the delivered action fixes wake and
+                # fingerprint. No provider read or effect is repeated here.
+                reconciled = self.continuity.action_intent(
+                    run_id,
+                    owner_id=owner_id,
+                    owner_epoch=epoch,
+                    wake_id=action["event_id"],
+                    action_fingerprint=action["action_id"],
+                )
+                if reconciled.get("state") != "complete":
+                    return False
+            else:
+                service = getattr(self.collector, "work_control", None)
+                effect = getattr(service, "github_native_owner_effect", None)
+                if not callable(effect):
+                    return False
+                try:
+                    artifact = effect(
+                        scope.goal_id,
+                        run_id,
+                        wake_id=action["event_id"],
+                        action_fingerprint=action["action_id"],
+                        owner_id=owner_id,
+                        owner_epoch=epoch,
+                    )
+                except Exception:  # provider or current-fact read remains retryable
+                    return False
+                if not isinstance(artifact, str) or not artifact:
+                    return False
+                # The existing action-intent row is the deterministic effect
+                # marker. Fresh effects always pass current provider checks
+                # above; only a completed exact receipt takes recovery branch.
+                self.continuity.action_intent(
+                    run_id,
+                    owner_id=owner_id,
+                    owner_epoch=epoch,
+                    wake_id=action["event_id"],
+                    action_fingerprint=action["action_id"],
+                    artifact=artifact,
+                )
+            self.continuity.acknowledge(
+                run_id,
+                owner_id=owner_id,
+                owner_epoch=epoch,
+                event_id=action["event_id"],
+                checkpoint="github acceptance receipt acknowledged",
+            )
+        except Exception:  # leave the delivered wake/receipt for fenced replay
+            return False
+        return True
+
     def _process_run(self, scope, run_id: str) -> bool:
         owner_id = self._owner(scope)
         assert owner_id is not None
@@ -1416,6 +1487,10 @@ class NativeOwnerRunner:
         )
         if action is None:
             return False
+        if action.get("type") == "acknowledge_github_acceptance":
+            return self._settle_github_acceptance(
+                scope, run_id, action, lease["owner_epoch"]
+            )
         if session_id is None:
             session_id = self._session(scope)
             if session_id is None:

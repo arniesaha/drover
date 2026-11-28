@@ -100,6 +100,28 @@ caller assertions with provider-resolved PR/head, check-run/output, and the
 installed profile's human-review or independent-check facts; its
 request/response, unavailable, amendment, and idempotency behavior are
 specified in the [pilot contract](../operations/github-acceptance-pilot.md).
+For a separately installed `github_event_delivery_profiles` exact revision,
+the signed GitHub webhook worker may continue a deferred work or verifier
+report only after an exact-head completed CI rollup. `WorkService` re-reads the
+PR source, immutable criteria/profile revision, and required checks through the
+provider before it schedules a verifier or accepts evidence. Webhook fields are
+not acceptance facts. Missing webhook configuration, stale delivery,
+unavailable reads, or failed/pending/skipped required checks leave the durable
+intent pending. An exact green delivery received before the bound turn/report
+settles remains a leased retryable delivery until the signed pair reaches a
+terminal outcome; a restart can reclaim it. Every five-second retained-delivery
+retry re-reads provider facts for that already received signed push; it is
+recovery polling, not provider-ingestion discovery. The signed receiver itself
+has no provider-write endpoint; the bounded continuation may invoke the
+existing coordinator close only after final provider rereads. It has no model
+loop.
+
+When that exact configured close has an installed native owner, the signed
+parent Factory run receives one separate `github_acceptance_verified` wake.
+The native runner re-reads the closed provider source/evidence/checks and both
+terminal bindings before its deterministic action-intent receipt and ACK. This
+does not turn the close outcome into an ACK, create a webhook subscription, or
+prove a live installed outcome.
 Work runs and failed behavioral checks cannot close issues. A failure queues
 revision until the configured attempt budget is exhausted, then blocks and
 writes the generated systemic-review comment. Further launches remain blocked

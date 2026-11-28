@@ -69,6 +69,10 @@ ACTION_TYPES = {
     "worker_needs_approval": "request_approved_gate",
     "ci_red": "correct_ci",
     "ci_green": "review_ci",
+    # This fact is emitted only by the GitHub coordinator after its separate
+    # provider-verified close outcome.  It deliberately creates an owner wake
+    # rather than treating that outcome as an acknowledgement.
+    "github_acceptance_verified": "acknowledge_github_acceptance",
 }
 # An integration reservation covers the whole worker lifecycle. A start/input
 # observation can checkpoint independently, but only a terminal worker report
@@ -1619,7 +1623,10 @@ class FactoryObserverContinuity:
                     # block or discard that exact source event after three
                     # attempts.  Keep its immutable wake/action identity and
                     # surface a durable stalled-delivery record instead.
-                    if action.get("type") == "observe_worker_start":
+                    if action.get("type") in {
+                        "observe_worker_start",
+                        "acknowledge_github_acceptance",
+                    }:
                         prior_escalation = action.get("escalation")
                         if not (
                             isinstance(prior_escalation, dict)
