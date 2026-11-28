@@ -1,0 +1,17 @@
+{
+  "issue": 1043,
+  "parent_issue": 1024,
+  "source": "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc",
+  "pull_number": 1042,
+  "profile_revision": "e126e03963bcb5cf65c1db3d1f017ab9c70c293ce54309874ea030c26d84205b",
+  "review_mode": "independent_check",
+  "behavioral_check": "github-event-adoption-1043-outcome",
+  "app_id": 15368,
+  "proof_test_cases": 4,
+  "owner_held_invalid_result_rejected": true,
+  "p1_reused_as_evidence": false,
+  "profile_installed": false,
+  "publisher_installed": false,
+  "live_transport_verified": false,
+  "live_accepted": 0
+}
