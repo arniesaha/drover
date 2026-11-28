@@ -1152,15 +1152,32 @@ class WorkService:
             or events[0]["action_category"] != "verified"
         ):
             return None
+        # Older direct verifier retries retain the full provider fact object,
+        # while a host-deferred verifier intentionally retains only its bounded
+        # evidence key. Both shapes need a fresh closed-item read; neither can
+        # turn the intent itself into acceptance proof.
+        retained = None
         try:
-            retained = json.loads(events[0]["provider_operation_id"])
-            source = {
-                field: retained[field]
-                for field in ("profile", "head", "branch", "pull", "repo")
-            }
-            evidence = retained["evidence"]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+            candidate = json.loads(events[0]["provider_operation_id"])
+            if isinstance(candidate, dict):
+                retained = candidate
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if retained is None:
+            evidence = events[0]["provider_operation_id"]
+            try:
+                source = provider.acceptance_source(ref, allow_closed=True)
+            except (PermissionError, ValueError):
+                return None
+        else:
+            try:
+                source = {
+                    field: retained[field]
+                    for field in ("profile", "head", "branch", "pull", "repo")
+                }
+                evidence = retained["evidence"]
+            except (KeyError, TypeError, ValueError):
+                return None
         if (
             source["profile"] != profile.revision
             or source["repo"] != ref.repo
@@ -1196,13 +1213,12 @@ class WorkService:
             return None
         canonical_current = json.dumps(current, sort_keys=True)
         if (
-            canonical_current != json.dumps(retained, sort_keys=True)
-            or json.dumps(
-                provider.acceptance_facts(ref, evidence, allow_closed=True),
-                sort_keys=True,
-            )
-            != canonical_current
-        ):
+            retained is not None
+            and canonical_current != json.dumps(retained, sort_keys=True)
+        ) or json.dumps(
+            provider.acceptance_facts(ref, evidence, allow_closed=True),
+            sort_keys=True,
+        ) != canonical_current:
             return None
         self.store.event(
             "control:queue-execution",
@@ -1545,6 +1561,20 @@ class WorkService:
                         # recreate that idempotent wake; acceptance discovery
                         # never runs against a closed item.
                         if item.get("state") == "closed":
+                            # A host-deferred verifier stores a bounded evidence
+                            # key rather than a fact JSON blob. Recover its lone
+                            # intent before attempting the dependent native wake.
+                            # This path only observes a completed close; it never
+                            # calls the provider close operation again.
+                            for row in self.store.links(
+                                goal_id=scope.goal_id, number=ref.number
+                            ):
+                                if row["run_role"] != "verify":
+                                    continue
+                                key = identity(row["run_key"], "verified", None)
+                                self._recover_observed_github_close(
+                                    scope, provider, ref, row, key
+                                )
                             pending = pending or (
                                 self.advance_github_native_owner(scope, provider, ref)
                                 == "pending"

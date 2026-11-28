@@ -145,8 +145,10 @@ resolves required CI, behavioral check, and owner-review facts before it can
 close the issue. A current signed mapping may then create a *separate*
 native-owner receipt wake. The runner re-reads the closed provider facts and
 both terminal bindings before completing its deterministic action receipt and
-ACK; a crash before ACK reuses that receipt. This establishes neither merge,
-deployment, publication, nor a live GitHub result. The portable
+ACK. If it crashes after that immutable receipt and before ACK, replay
+reconciles the exact fenced receipt without another provider read or effect;
+owner, epoch, and integration fencing still apply. This establishes neither
+merge, deployment, publication, nor a live GitHub result. The portable
 API/configuration and remaining owner gates are in the
 [GitHub pilot contract](github-acceptance-pilot.md).
 

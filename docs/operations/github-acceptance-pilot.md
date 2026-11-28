@@ -178,10 +178,13 @@ and already-acknowledged paths are completed without an effect; provider
 unavailability leaves the lease recoverable.
 
 The provider close has a narrower recovery fence: after a verified intent, a
-restart may record the outcome only when the current installed profile, signed
-parent and verifier terminal bindings, current source/head/checks/evidence, and
-closed issue all agree. It does not issue a second close. This coordinator close
-intent/outcome recovery is not a native-owner effect/ACK receipt.
+restart or retained signed CI delivery may record the outcome only when the
+current installed profile, signed parent and verifier terminal bindings, current
+source/head/checks/evidence, and closed issue all agree. Direct retries retain
+the original fact object; host-deferred retries retain only the bounded evidence
+key and reconstruct those current facts from the closed provider item. Neither
+shape issues a second close. This coordinator close intent/outcome recovery is
+not a native-owner effect/ACK receipt.
 
 For an installed exact delivery mapping whose signed parent and verifier
 bindings remain terminal, the coordinator appends a deterministic
@@ -190,10 +193,14 @@ bindings remain terminal, the coordinator appends a deterministic
 head, required checks, behavioral evidence, and both terminal bindings before
 writing its `github-native-owner:<digest>` action-intent receipt and ACKing the
 same wake. A moved head, missing/failed check, revoked mapping, resumed parent,
-or unavailable provider leaves that delivery unacknowledged. A crash after the
-receipt and before ACK reuses the immutable receipt and never repeats a GitHub
-write. The five-second signed-delivery retry may recreate a missing durable
-wake; it remains recovery polling of the received push, never source discovery.
+or unavailable provider leaves that delivery unacknowledged before any receipt.
+A crash after the receipt and before ACK reconciles only the exact completed
+`(wake_id, action_fingerprint)` receipt through the authorized owner, epoch, and
+integration fences; it does not reread provider facts or repeat an effect after
+those facts move. A missing, intent-only, wrong-wake, wrong-fingerprint, or
+unfenced receipt cannot ACK. The five-second signed-delivery retry may recreate
+a missing durable wake; it remains recovery polling of the received push, never
+source discovery.
 
 This receipt bridge is implemented and protecting-tested, but is not installed
 or live-verified. It does not create a webhook secret or subscription, make an
@@ -344,7 +351,8 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
 | Signed exact-head CI survives terminal/report ordering, restart, replay, and constituent/stale controls | [`test_signed_exact_head_ci_continues_opted_github_deferred_pair`](../../tests/test_work_queue_github_acceptance.py), [`tests/test_github_work_item_events.py`](../../tests/test_github_work_item_events.py) |
-| A post-close/pre-outcome crash records an observed close without a second PATCH | [`test_observed_close_after_outcome_write_failure_is_acked_without_reclose`](../../tests/test_work_queue_github_acceptance.py) |
+| A post-close/pre-outcome crash records an observed close without a second PATCH, including a host-deferred evidence key recovered by signed CI redelivery | [`test_observed_close_recovery_requires_current_facts_and_terminal_pair`](../../tests/test_work_queue_github_acceptance.py), [`test_host_deferred_close_recovery_redelivery_rebuilds_plain_evidence_outcome`](../../tests/test_work_queue_github_acceptance.py) |
+| A post-receipt/pre-ACK crash reconciles the exact fenced receipt without a second effect, despite later provider movement | [`test_github_owner_receipt_recovers_after_effect_before_ack`](../../tests/test_native_continuity_owner.py) |
 | Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_exact_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_accepts_only_an_idle_structured_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_rejects_unsafe_resumable_turns`](../../tests/test_work_queue_github_acceptance.py) |
 | A current strict resumable pair may verify, while unsafe, superseded, or uncertain pairs cannot | [`test_verified_accepts_current_strict_resumable_existing_pair`](../../tests/test_work_queue_github_acceptance.py), [`test_verified_rejects_unsafe_resumable_verifier_at_service_boundary`](../../tests/test_work_queue_github_acceptance.py), [`test_running_unbound_verifier_cannot_use_existing_session_exception`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_with_uncertain_close_cannot_be_replaced`](../../tests/test_work_queue_github_acceptance.py) |
 | Later turns may reuse a retained session without relaxing its unique owner or losing a partial bind | [`test_existing_turn_rebind_reuses_session_without_unique_association_conflict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_turn_rebind_recovers_bind_only_partial_work_link`](../../tests/test_work_queue_github_acceptance.py) |

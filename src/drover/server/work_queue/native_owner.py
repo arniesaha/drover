@@ -1359,35 +1359,51 @@ class NativeOwnerRunner:
         assert owner_id is not None
         if action.get("type") != "acknowledge_github_acceptance":
             return False
-        service = getattr(self.collector, "work_control", None)
-        effect = getattr(service, "github_native_owner_effect", None)
-        if not callable(effect):
-            return False
+        receipt = action.get("action_intent")
         try:
-            artifact = effect(
-                scope.goal_id,
-                run_id,
-                wake_id=action["event_id"],
-                action_fingerprint=action["action_id"],
-                owner_id=owner_id,
-                owner_epoch=epoch,
-            )
-        except Exception:  # provider or current-fact read remains retryable
-            return False
-        if not isinstance(artifact, str) or not artifact:
-            return False
-        try:
-            # The existing action-intent row is the deterministic effect marker.
-            # It is immutable per (wake, fingerprint), so a replay after this
-            # call and before acknowledge only reconciles the same receipt.
-            self.continuity.action_intent(
-                run_id,
-                owner_id=owner_id,
-                owner_epoch=epoch,
-                wake_id=action["event_id"],
-                action_fingerprint=action["action_id"],
-                artifact=artifact,
-            )
+            if isinstance(receipt, dict) and receipt.get("state") == "complete":
+                # Reconcile an exact completed receipt through the continuity
+                # ledger before ACK. action_intent re-applies owner, epoch, and
+                # integration fences; the delivered action fixes wake and
+                # fingerprint. No provider read or effect is repeated here.
+                reconciled = self.continuity.action_intent(
+                    run_id,
+                    owner_id=owner_id,
+                    owner_epoch=epoch,
+                    wake_id=action["event_id"],
+                    action_fingerprint=action["action_id"],
+                )
+                if reconciled.get("state") != "complete":
+                    return False
+            else:
+                service = getattr(self.collector, "work_control", None)
+                effect = getattr(service, "github_native_owner_effect", None)
+                if not callable(effect):
+                    return False
+                try:
+                    artifact = effect(
+                        scope.goal_id,
+                        run_id,
+                        wake_id=action["event_id"],
+                        action_fingerprint=action["action_id"],
+                        owner_id=owner_id,
+                        owner_epoch=epoch,
+                    )
+                except Exception:  # provider or current-fact read remains retryable
+                    return False
+                if not isinstance(artifact, str) or not artifact:
+                    return False
+                # The existing action-intent row is the deterministic effect
+                # marker. Fresh effects always pass current provider checks
+                # above; only a completed exact receipt takes recovery branch.
+                self.continuity.action_intent(
+                    run_id,
+                    owner_id=owner_id,
+                    owner_epoch=epoch,
+                    wake_id=action["event_id"],
+                    action_fingerprint=action["action_id"],
+                    artifact=artifact,
+                )
             self.continuity.acknowledge(
                 run_id,
                 owner_id=owner_id,

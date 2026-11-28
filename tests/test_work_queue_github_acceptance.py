@@ -1655,6 +1655,122 @@ def test_observed_close_recovery_requires_current_facts_and_terminal_pair(
     assert outcome["required_checks"]
 
 
+def test_host_deferred_close_recovery_redelivery_rebuilds_plain_evidence_outcome(
+    service, monkeypatch
+):
+    """A signed CI redelivery recovers a host-deferred close without another PATCH."""
+    monkeypatch.setenv("TEST_TOKEN", "synthetic")
+    monkeypatch.setenv("TEST_GITHUB_WEBHOOK_SECRET", "not-a-real-secret")
+    client, verify = ready(service, monkeypatch, independent_profile())
+    profile = service.config.goals[0].github_acceptance_profiles["1"]
+    config = service.config.goals[0].model_dump()
+    config.update(
+        github_event_delivery_profiles={"1": profile.revision},
+        continuity_owner_id="drover:owner/goal",
+        continuity_owner_harness="codex",
+        execution_enabled=True,
+        execution_cwds={"host": "/configured/checkout"},
+        brief_ref="docs/quality-pilots/github-event.md",
+    )
+    scope = GoalScope.model_validate(config)
+    webhook = service.config.github_webhook.model_copy(
+        update={"secret_env": "TEST_GITHUB_WEBHOOK_SECRET"}
+    )
+    service.config = service.config.model_copy(
+        update={"goals": [scope], "github_webhook": webhook}
+    )
+    service.github_webhooks.config = webhook
+    service.harness.github_event_delivery = lambda run_key, revision: (
+        revision == profile.revision
+    )
+    service.harness.terminal_work_done = lambda run_key: (
+        service.harness.sessions[run_key].status == "completed"
+    )
+    service.harness.sessions[verify["run_key"]].status = "running"
+    host = WorkActor("credential:host", "worker", host_id="host")
+    assert service.call(
+        "update",
+        {
+            "goal_id": "goal",
+            "number": 1,
+            "run_key": verify["run_key"],
+            "action": "verified",
+            "evidence_key": "check-run:7",
+        },
+        host,
+    ) == {"outcome": "deferred"}
+    service.harness.sessions[verify["run_key"]].status = "completed"
+    original_event = service.store.event
+
+    def fail_outcome(*args, **kwargs):
+        if len(args) >= 5 and args[3:5] == ("outcome", "verified"):
+            raise RuntimeError("simulated host-deferred outcome write failure")
+        return original_event(*args, **kwargs)
+
+    service.store.event = fail_outcome
+    with pytest.raises(RuntimeError, match="host-deferred"):
+        service.advance_deferred_verification("goal", 1)
+    service.store.event = original_event
+    assert client.closed == 1
+    key = identity(verify["run_key"], "verified", None)
+    assert [event["event_kind"] for event in service.store.events(key)] == ["intent"]
+    assert service.store.events(key)[0]["provider_operation_id"] == "check-run:7"
+
+    _register(service, session_id="host-deferred-recovery-item")
+    item = service.store.hub_items()[0]
+    service.store.patch_hub_item(
+        item["id"], pr="https://github.com/example/project/pull/9"
+    )
+    service.store.append_github_fact(
+        item["id"],
+        kind="pr_synchronize",
+        detail='{"head_sha":"' + SHA + '"}',
+        head_sha=SHA,
+    )
+    from drover.server.work_queue.service import WorkService
+
+    restarted = WorkService(
+        service.config, service.store, service.providers, service.harness
+    )
+    worker = GitHubWebhookWorker(
+        restarted.store,
+        webhook,
+        restarted.github_webhooks,
+        service=restarted,
+        retry_delay_seconds=0,
+    )
+    payload = {
+        "repository": {"full_name": "example/project"},
+        "workflow_run": {
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": SHA,
+            "head_branch": "feature",
+            "pull_requests": [{"number": 9}],
+        },
+    }
+    body = json.dumps(payload).encode()
+    headers = {
+        "X-GitHub-Delivery": "host-deferred-close-recovery",
+        "X-GitHub-Event": "workflow_run",
+        "X-Hub-Signature-256": "sha256="
+        + hmac.new(b"not-a-real-secret", body, hashlib.sha256).hexdigest(),
+    }
+    assert restarted.github_webhooks.accept(headers, body)[0] == 202
+    assert worker.process_once() == 1
+    assert client.closed == 1
+    events = restarted.store.events(key)
+    assert [event["event_kind"] for event in events] == ["intent", "outcome"]
+    facts = json.loads(events[-1]["provider_operation_id"])
+    assert facts["head"] == SHA
+    assert facts["required_checks"]
+    assert facts["evidence"] == "check-run:7"
+    assert len(restarted.harness.github_native_owner_wakes) == 1
+    assert worker.process_once() == 0
+    assert client.closed == 1
+    assert len(restarted.harness.github_native_owner_wakes) == 1
+
+
 def test_wrong_repository_source_cannot_close(service, monkeypatch):
     client, verify = ready(service, monkeypatch)
     client.overrides["/repos/example/project/pulls/9"] = {

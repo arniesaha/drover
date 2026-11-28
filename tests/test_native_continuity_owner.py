@@ -202,11 +202,15 @@ def test_github_owner_receipt_recovers_after_effect_before_ack(tmp_path):
         tmp_path, event_kind="github_acceptance_verified"
     )
     calls = []
+    current_facts = {"available": True}
 
     def effect(goal_id, continuity_run_id, **kwargs):
         calls.append((goal_id, continuity_run_id, kwargs))
         assert kwargs["owner_id"] == "drover:owner/goal-native"
-        return "github-native-owner:" + "a" * 64
+        # Simulate the provider head/check changing after the durable receipt.
+        # Recovery must reconcile that receipt instead of treating a new read as
+        # authority to repeat the effect.
+        return "github-native-owner:" + "a" * 64 if current_facts["available"] else None
 
     collector.work_control = SimpleNamespace(github_native_owner_effect=effect)
     original_acknowledge = runner.continuity.acknowledge
@@ -234,6 +238,45 @@ def test_github_owner_receipt_recovers_after_effect_before_ack(tmp_path):
             == 1
         )
 
+    # The provider facts move after the receipt. The completed receipt remains
+    # the only effect authority, subject to current owner/epoch/integration
+    # fences in action_intent and acknowledge.
+    current_facts["available"] = False
+    epoch = status["owner"]["epoch"]
+    with pytest.raises(KeyError):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch,
+            wake_id="wrong-wake",
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch,
+            wake_id=action["event_id"],
+            action_fingerprint="wrong-fingerprint",
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/not-authorized",
+            owner_epoch=epoch,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    with pytest.raises(ContinuityConflict):
+        runner.continuity.action_intent(
+            run_id,
+            owner_id="drover:owner/goal-native",
+            owner_epoch=epoch - 1,
+            wake_id=action["event_id"],
+            action_fingerprint=action["action_id"],
+        )
+    assert store.status(run_id)["inbox_counts"] == {"delivered": 1}
+
     # Recreate the runner and redeliver the same fenced wake after its normal
     # backoff. The action intent remains the sole durable effect marker.
     clock.advance(5)
@@ -246,7 +289,7 @@ def test_github_owner_receipt_recovers_after_effect_before_ack(tmp_path):
     )
     assert restarted.process_once() == 1
     assert store.status(run_id)["inbox_counts"] == {"acknowledged": 1}
-    assert len(calls) == 2  # two current-fact reads, one durable receipt
+    assert len(calls) == 1  # post-receipt recovery does not reread provider facts
     with control_plane_connection(runner.path) as con:
         assert (
             con.execute(
