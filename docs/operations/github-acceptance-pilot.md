@@ -129,6 +129,18 @@ uncertain close is an inspection-required 409: reconcile the prior effect
 before considering another pair. The old pair is no longer eligible once the
 current binding changes.
 
+`execution_links` retains its normal one-session association invariant. When a
+replacement uses a newer successful turn from the same retained session, the
+old binding-only link remains that session's sole `session_id` owner. The new
+link deliberately leaves that column null and reads the exact session ID only
+from its immutable `bind_existing_session` event. This is not the ordinary
+sessionless-launch recovery path: it is accepted only when the older owner is
+an existing-session link for the same issue, role, profile revision, source
+head, and session ID. A bind-only partial newer work link is therefore safe to
+retry with the same request; the retry completes its verifier link without
+rewriting the old link or event. Any other session owner remains
+inspection-required.
+
 The checked issue must contain exactly one marked section whose trimmed contents
 equal `criteria`:
 
@@ -271,6 +283,7 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_exact_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_accepts_only_an_idle_structured_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_rejects_unsafe_resumable_turns`](../../tests/test_work_queue_github_acceptance.py) |
 | A current strict resumable pair may verify, while unsafe, superseded, or uncertain pairs cannot | [`test_verified_accepts_current_strict_resumable_existing_pair`](../../tests/test_work_queue_github_acceptance.py), [`test_verified_rejects_unsafe_resumable_verifier_at_service_boundary`](../../tests/test_work_queue_github_acceptance.py), [`test_running_unbound_verifier_cannot_use_existing_session_exception`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_with_uncertain_close_cannot_be_replaced`](../../tests/test_work_queue_github_acceptance.py) |
+| Later turns may reuse a retained session without relaxing its unique owner or losing a partial bind | [`test_existing_turn_rebind_reuses_session_without_unique_association_conflict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_turn_rebind_recovers_bind_only_partial_work_link`](../../tests/test_work_queue_github_acceptance.py) |
 | Repeats and a lost close response do not make a second effect | [`test_provider_evidence_and_owner_review_close_once_despite_routine_notes`](../../tests/test_work_queue_github_acceptance.py), [`test_uncertain_close_never_causes_second_effect`](../../tests/test_work_queue_github_acceptance.py) |
 | Existing work queue/local-file behavior stays covered | [`tests/test_work_queue_execution.py`](../../tests/test_work_queue_execution.py), [`tests/test_work_queue_local_candidates.py`](../../tests/test_work_queue_local_candidates.py) |
 

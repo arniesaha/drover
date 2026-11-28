@@ -85,6 +85,12 @@ Only the current installed exact pair can use that resumable exception at
 `verified`; an older pair remains append-only history. A later reviewed pair
 can be bound only when the old pair has no decision event beyond its original
 binding, so an uncertain provider effect always remains inspection-required.
+If the later pair uses newer turns of the same retained sessions, the original
+existing link keeps the database's sole `session_id` association. The newer
+link is deliberately sessionless at the row level but has its immutable binding
+event; it is not a generic unresolved launch and may be retried only under the
+same existing-session scope, source, profile, role, and binding-only-history
+checks.
 
 `update(action="complete")` schedules a separate verify run and leaves the issue
 open in review. For the default path, acceptance requires that run to finish,
