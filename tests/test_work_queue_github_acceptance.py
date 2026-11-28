@@ -354,6 +354,9 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
         host,
     ) == {"outcome": "deferred"}
     service.harness.sessions[verify["run_key"]].status = "completed"
+    # A verifier cannot accept after its parent resumes, even though its own
+    # turn, source, checks, and evidence are still current.
+    service.harness.sessions[work["run_key"]].status = "running"
     final_payload = {
         "repository": {"full_name": "example/project"},
         "workflow_run": {
@@ -366,7 +369,13 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
     }
     deliver("github-event-verify-ci", "workflow_run", final_payload)
     # The retained old CI delivery and this terminal-before-CI delivery may
-    # arrive together. Both replay provider facts, but the close happens once.
+    # arrive together. Neither may close while the parent has resumed.
+    assert worker.process_once() == 2
+    assert client.closed == 0
+
+    service.harness.sessions[work["run_key"]].status = "completed"
+    # The same two retained deliveries now observe a terminal pair and close
+    # once. Their duplicate/out-of-order replay cannot add an effect.
     assert worker.process_once() == 2
     assert client.closed == 1
     assert service.call(
@@ -1484,11 +1493,29 @@ def test_uncertain_close_never_causes_second_effect(service, monkeypatch):
     assert client.closed == 1
 
 
-def test_observed_close_after_outcome_write_failure_is_acked_without_reclose(
+def test_observed_close_recovery_requires_current_facts_and_terminal_pair(
     service, monkeypatch
 ):
-    """A recreated coordinator observes the provider effect before its ACK."""
+    """Post-effect recovery rereads current provider facts before its ACK."""
     client, verify = ready(service, monkeypatch)
+    profile = service.config.goals[0].github_acceptance_profiles["1"]
+    config = service.config.goals[0].model_dump()
+    config.update(
+        github_event_delivery_profiles={"1": profile.revision},
+        continuity_owner_id="drover:owner/goal",
+        continuity_owner_harness="codex",
+        execution_enabled=True,
+        execution_cwds={"host": "/configured/checkout"},
+        brief_ref="docs/quality-pilots/github-event.md",
+    )
+    scope = GoalScope.model_validate(config)
+    service.config = service.config.model_copy(update={"goals": [scope]})
+    service.harness.github_event_delivery = lambda run_key, revision: (
+        revision == profile.revision
+    )
+    service.harness.terminal_work_done = lambda run_key: (
+        service.harness.sessions[run_key].status == "completed"
+    )
     original_event = service.store.event
 
     def fail_outcome(*args, **kwargs):
@@ -1504,19 +1531,52 @@ def test_observed_close_after_outcome_write_failure_is_acked_without_reclose(
     key = identity(verify["run_key"], "verified", None)
     assert [event["event_kind"] for event in service.store.events(key)] == ["intent"]
 
-    # Recreate the service object over the same durable store, as a restart
-    # would. The closed provider item yields an ACK only; it cannot PATCH again.
+    # Recreate the coordinator over the durable store. Head movement, a failed
+    # required check, a resumed parent, and a revoked installed profile each
+    # leave the intent inspection-required and never PATCH a second time.
     from drover.server.work_queue.service import WorkService
 
     recovered = WorkService(
         service.config, service.store, service.providers, service.harness
     )
+    client.head = "b" * 40
+    assert verdict(recovered, verify) == {"outcome": "deferred"}
+    client.head = SHA
+    client.overrides[f"/repos/example/project/commits/{SHA}/check-runs"] = {
+        "check_runs": [
+            {
+                "id": 3,
+                "name": "required",
+                "head_sha": SHA,
+                "app": {"id": 42},
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    }
+    assert verdict(recovered, verify) == {"outcome": "deferred"}
+    client.overrides.pop(f"/repos/example/project/commits/{SHA}/check-runs")
+    parent = next(
+        row
+        for row in service.store.links(goal_id="goal", number=1)
+        if row["run_role"] == "work"
+    )
+    service.harness.sessions[parent["run_key"]].status = "running"
+    assert verdict(recovered, verify) == {"outcome": "deferred"}
+    service.harness.sessions[parent["run_key"]].status = "completed"
+    revoked = scope.model_copy(update={"github_acceptance_profiles": {}})
+    recovered.config = recovered.config.model_copy(update={"goals": [revoked]})
+    assert verdict(recovered, verify) == {"outcome": "deferred"}
+    recovered.config = service.config
+
     assert verdict(recovered, verify) == {"outcome": "verified"}
     assert client.closed == 1
-    assert [event["event_kind"] for event in service.store.events(key)] == [
-        "intent",
-        "outcome",
-    ]
+    events = service.store.events(key)
+    assert [event["event_kind"] for event in events] == ["intent", "outcome"]
+    outcome = json.loads(events[-1]["provider_operation_id"])
+    assert outcome["head"] == SHA
+    assert outcome["evidence"] == "check-run:7:review:8"
+    assert outcome["required_checks"]
 
 
 def test_wrong_repository_source_cannot_close(service, monkeypatch):

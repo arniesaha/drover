@@ -168,18 +168,20 @@ is terminal. A verifier report remains a durable intent until its exact turn is
 terminal and fresh `acceptance_facts` reads agree. If an exact green CI delivery
 arrives first, the existing `github_webhook_deliveries` row remains leased with
 `continuation_pending` and the webhook worker retries that same signed payload
-on its bounded five-second delay. Restart reclaims its expired lease. This is a
-retained readiness observation keyed by the signed delivery plus the
-profile-bound work/verify links, not a new scheduler or a normal queue-provider
-poll. Stale, failed, unsupported, and already-acknowledged paths are completed
-without an effect; provider unavailability leaves the lease recoverable.
+on its bounded five-second delay. Each retained-delivery retry re-reads
+provider source, required checks, and evidence; it is bounded recovery polling
+of an already received signed push, not independent provider ingestion or a
+new scheduler. Restart reclaims its expired lease. Stale, failed, unsupported,
+and already-acknowledged paths are completed without an effect; provider
+unavailability leaves the lease recoverable.
 
 The provider close has a narrower recovery fence: after a verified intent, a
-restart may record the outcome only when GitHub already reports that exact issue
-closed. It does not issue a second close. This coordinator close intent/outcome
-recovery is not a native-owner effect/ACK receipt. Native-owner action-intent,
-effect, and ACK remain the authority for native effects and have not been
-extended to GitHub issue closure.
+restart may record the outcome only when the current installed profile, signed
+parent and verifier terminal bindings, current source/head/checks/evidence, and
+closed issue all agree. It does not issue a second close. This coordinator close
+intent/outcome recovery is not a native-owner effect/ACK receipt. Native-owner
+action-intent, effect, and ACK remain the authority for native effects and have
+not been extended to GitHub issue closure.
 
 This is preparation and code-contract evidence only. A live owner still needs
 the normal protected integration, private installation, signed provider

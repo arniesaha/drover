@@ -930,11 +930,10 @@ class WorkService:
             return False
 
     def _recover_observed_github_close(self, scope, provider, ref, row, key):
-        """Acknowledge an observed close without issuing a second provider write.
+        """ACK an observed close only after current provider facts still agree.
 
-        This handles only the narrow crash window after an already-recorded
-        GitHub acceptance intent. It is not a substitute for the native-owner
-        action/effect/ACK path used for native effects.
+        This is the narrow post-effect/pre-outcome recovery fence. It never
+        repeats the close and it is not the native-owner effect/ACK protocol.
         """
         profile = scope.github_acceptance_profiles.get(str(ref.number))
         events = self.store.events(key)
@@ -947,23 +946,34 @@ class WorkService:
         ):
             return None
         try:
-            facts = json.loads(events[0]["provider_operation_id"])
+            retained = json.loads(events[0]["provider_operation_id"])
             source = {
-                key: facts[key] for key in ("profile", "head", "branch", "pull", "repo")
+                field: retained[field]
+                for field in ("profile", "head", "branch", "pull", "repo")
             }
+            evidence = retained["evidence"]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         if (
             source["profile"] != profile.revision
             or source["repo"] != ref.repo
             or source["pull"] != profile.pull_number
-            or not isinstance(facts.get("evidence"), str)
+            or not isinstance(evidence, str)
         ):
             return None
-        parent = self._work_parent(
-            links=self.store.links(goal_id=scope.goal_id, number=ref.number), row=row
-        )
-        if parent is None:
+        links = self.store.links(goal_id=scope.goal_id, number=ref.number)
+        parent = self._work_parent(links=links, row=row)
+        parent_row = next((link for link in links if link["run_key"] == parent), None)
+        terminal_done = getattr(self.harness, "terminal_work_done", None)
+        if (
+            parent is None
+            or parent_row is None
+            or not callable(terminal_done)
+            or terminal_done(row["run_key"]) is not True
+            or terminal_done(parent) is not True
+            or not self._github_event_delivery(scope, ref.number, row["run_key"])
+            or not self._github_event_delivery(scope, ref.number, parent)
+        ):
             return None
         _, expected = verification_identity(
             self.config.workspace_id, scope.goal_id, ref.number, parent, source
@@ -973,6 +983,20 @@ class WorkService:
         item = provider.get_item(ref)
         if item.get("state") != "closed":
             return None
+        try:
+            current = provider.acceptance_facts(ref, evidence, allow_closed=True)
+        except (PermissionError, ValueError):
+            return None
+        canonical_current = json.dumps(current, sort_keys=True)
+        if (
+            canonical_current != json.dumps(retained, sort_keys=True)
+            or json.dumps(
+                provider.acceptance_facts(ref, evidence, allow_closed=True),
+                sort_keys=True,
+            )
+            != canonical_current
+        ):
+            return None
         self.store.event(
             "control:queue-execution",
             ref,
@@ -980,7 +1004,7 @@ class WorkService:
             "outcome",
             "verified",
             outcome="verified",
-            operation_id=events[0]["provider_operation_id"],
+            operation_id=json.dumps(current, sort_keys=True),
             link_id=row["id"],
         )
         return {"outcome": "verified"}
@@ -1211,7 +1235,11 @@ class WorkService:
             ):
                 return None
             terminal_done = getattr(self.harness, "terminal_work_done", None)
-            if not callable(terminal_done) or terminal_done(row["run_key"]) is not True:
+            if (
+                not callable(terminal_done)
+                or terminal_done(row["run_key"]) is not True
+                or (github_delivery and terminal_done(parent) is not True)
+            ):
                 return None
             criteria = self._verification_criteria(provider, ref, item)
             _, expected = verification_identity(
