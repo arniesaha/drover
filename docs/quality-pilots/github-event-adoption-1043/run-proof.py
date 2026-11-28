@@ -11,7 +11,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
-PIN = "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc"
+PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
 ROOT = pathlib.Path(__file__).resolve().parent
 p = argparse.ArgumentParser()
 p.add_argument("--source", type=pathlib.Path, required=True)

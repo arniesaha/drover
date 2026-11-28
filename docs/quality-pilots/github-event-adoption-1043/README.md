@@ -1,8 +1,10 @@
 # #1043 GitHub event-path adoption packet
 
 This packet prepares a distinct, source-pinned adoption task for PR #1042 at
-`f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc`. It is not an installation
-record, a GitHub delivery, a native-owner acknowledgement, or an accepted
+`bde283aa6bd4f97073867930153c8d12e9b8b85e`, the actual GitHub PR head.
+The installed merged runtime is the distinct merge commit
+`f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc`; equal tree identity does not make
+it an acceptance head. This packet is not an installation record, a GitHub delivery, a native-owner acknowledgement, or an accepted
 outcome. P1 remains accepted historical evidence for #1031 only; its profile,
 producer check, bindings, and closed issue are not reusable proof for #1043.
 The original P2/P3 ledger remains separately not accepted.
@@ -12,7 +14,7 @@ The original P2/P3 ledger remains separately not accepted.
 The proposed profile is [profile-candidate.json](profile-candidate.json):
 `independent_check`, PR #1042, App `15368`, behavioral check
 `github-event-adoption-1043-outcome`, and revision
-`e126e03963bcb5cf65c1db3d1f017ab9c70c293ce54309874ea030c26d84205b`.
+`df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe`.
 The exact issue marker is in [pilot-issue-body.md](pilot-issue-body.md).
 
 The protected-main workflow [github-event-adoption-1043.yml](../../../.github/workflows/github-event-adoption-1043.yml)
@@ -66,7 +68,9 @@ sh scripts/quality/preflight.sh --out "$scratch_root" \
 git diff --check
 ```
 
-The hosted workflow separately verifies the candidate at the pinned source.
+The hosted workflow separately verifies the candidate at the pinned PR head.
+The distinct merged source is runtime provenance only and cannot satisfy an
+acceptance-source, behavioral-check, or required-check head comparison.
 The local receipt validates this packet and its source regressions; neither is
 live acceptance.
 

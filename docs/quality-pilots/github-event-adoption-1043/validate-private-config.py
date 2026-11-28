@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from drover.config import load_config  # noqa: E402
 from drover.server.work_queue.config import WorkQueueConfig  # noqa: E402
 
-PIN = "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc"
-REVISION = "e126e03963bcb5cf65c1db3d1f017ab9c70c293ce54309874ea030c26d84205b"
+PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
+REVISION = "df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe"
 GOAL = "github-event-adoption-1043"
 ISSUE = "1043"
 p = argparse.ArgumentParser()

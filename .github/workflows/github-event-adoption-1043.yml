@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: github-event-adoption-1043-f68653d9
+  group: github-event-adoption-1043-bde283aa
   cancel-in-progress: false
 
 jobs:
@@ -41,9 +41,9 @@ jobs:
         git -C trusted fetch --depth=1 https://github.com/arniesaha/drover.git "$TRUSTED_SHA"
         git -C trusted checkout --detach FETCH_HEAD
         git init candidate
-        git -C candidate fetch --depth=1 https://github.com/arniesaha/drover.git f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc
+        git -C candidate fetch --depth=1 https://github.com/arniesaha/drover.git bde283aa6bd4f97073867930153c8d12e9b8b85e
         git -C candidate checkout --detach FETCH_HEAD
-        test "$(git -C candidate rev-parse HEAD)" = f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc
+        test "$(git -C candidate rev-parse HEAD)" = bde283aa6bd4f97073867930153c8d12e9b8b85e
     - name: Execute fixed credential-free proof
       env:
         DROVER_TEST_POSTGRES_DSN: host=127.0.0.1 port=5432 dbname=postgres user=postgres

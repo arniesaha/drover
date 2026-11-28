@@ -1,9 +1,10 @@
 {
   "issue": 1043,
   "parent_issue": 1024,
-  "source": "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc",
+  "source": "bde283aa6bd4f97073867930153c8d12e9b8b85e",
   "pull_number": 1042,
-  "profile_revision": "e126e03963bcb5cf65c1db3d1f017ab9c70c293ce54309874ea030c26d84205b",
+  "merged_runtime_source": "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc",
+  "profile_revision": "df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe",
   "review_mode": "independent_check",
   "behavioral_check": "github-event-adoption-1043-outcome",
   "app_id": 15368,

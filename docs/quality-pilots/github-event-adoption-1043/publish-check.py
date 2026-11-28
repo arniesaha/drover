@@ -8,7 +8,7 @@ import os
 import pathlib
 import urllib.request
 
-PIN = "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc"
+PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
 REPO = "arniesaha/drover"
 p = argparse.ArgumentParser()
 p.add_argument("--profile", type=pathlib.Path, required=True)

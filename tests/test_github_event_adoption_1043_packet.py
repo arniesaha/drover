@@ -6,11 +6,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from drover.server.work_queue.config import GitHubAcceptanceProfile
+import pytest
+
+from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
+from drover.server.work_queue.github import GitHubProvider
+from drover.server.work_queue.provider import ItemRef
 
 ROOT = Path(__file__).parents[1]
 PACKET = ROOT / "docs/quality-pilots/github-event-adoption-1043"
-PIN = "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc"
+PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
+MERGE_COMMIT = "f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc"
 
 
 def proof(source=PIN):
@@ -54,6 +59,7 @@ def test_1043_publisher_binds_the_new_source_and_rejects_invalid_proof(tmp_path)
     assert publication["profile_revision"] == profile.revision
     assert publication["payload"]["head_sha"] == PIN
     assert publish(tmp_path, proof("0" * 40)).returncode != 0
+    assert publish(tmp_path, proof(MERGE_COMMIT)).returncode != 0
 
 
 def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
@@ -169,3 +175,96 @@ def test_1043_workflow_isolates_candidate_proof_from_check_publication():
     assert PIN in proof_commands and "GITHUB_TOKEN" not in proof_commands
     assert "git -C candidate" not in publish_commands
     assert "candidate/.venv" not in publish_commands
+
+
+class _Response:
+    def __init__(self, data):
+        self.status_code = 200
+        self.headers = {}
+        self.content = json.dumps(data).encode()
+        self._data = data
+
+    def json(self):
+        return json.loads(json.dumps(self._data))
+
+
+class _CurrentHeadTransport:
+    def __init__(self):
+        self.pull_head = PIN
+        self.evidence_head = PIN
+
+    def request(self, _method, url, **_kwargs):
+        path = url.removeprefix("https://api.github.com")
+        evidence = {
+            "id": 77,
+            "name": "github-event-adoption-1043-outcome",
+            "head_sha": self.evidence_head,
+            "app": {"id": 15368},
+            "external_id": GitHubAcceptanceProfile.model_validate(
+                json.loads((PACKET / "profile-candidate.json").read_text())
+            ).revision,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"summary": "bounded result", "text": "retained output"},
+        }
+        routes = {
+            "/repos/arniesaha/drover/pulls/1042": {
+                "head": {"sha": self.pull_head},
+                "base": {"ref": "main", "repo": {"full_name": "arniesaha/drover"}},
+            },
+            "/repos/arniesaha/drover/check-runs/77": evidence,
+            "/repos/arniesaha/drover/branches/main/protection/required_status_checks": {
+                "checks": [{"context": "required-ci", "app_id": 15368}]
+            },
+            f"/repos/arniesaha/drover/commits/{PIN}/check-runs": {
+                "check_runs": [
+                    evidence,
+                    {
+                        "id": 78,
+                        "name": "required-ci",
+                        "head_sha": PIN,
+                        "app": {"id": 15368},
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ]
+            },
+        }
+        return _Response(routes[path])
+
+
+def test_1043_provider_fixture_rejects_merge_commit_or_stale_head(monkeypatch):
+    monkeypatch.setenv("PACKET_GITHUB_TOKEN", "synthetic")
+    profile = json.loads((PACKET / "profile-candidate.json").read_text())
+    scope = GoalScope.model_validate(
+        {
+            "goal_id": "github-event-adoption-1043",
+            "repo": "arniesaha/drover",
+            "goal_label": "goal:github-event-adoption-1043",
+            "credential": {
+                "token_env": "PACKET_GITHUB_TOKEN",
+                "capabilities": ["issues_read", "pulls_read", "checks_read"],
+            },
+            "github_acceptance_profiles": {"1043": profile},
+        }
+    )
+    provider = GitHubProvider("packet", scope, session=_CurrentHeadTransport())
+    ref = ItemRef("packet", "github", "arniesaha/drover", 1043, "")
+    provider.get_item = lambda _ref: {
+        "state": "open",
+        "body": "<!-- drover:acceptance -->\n"
+        + profile["criteria"]
+        + "\n<!-- /drover:acceptance -->",
+    }
+    assert provider.acceptance_facts(ref, "check-run:77")["head"] == PIN
+
+    provider.session.pull_head = MERGE_COMMIT
+    provider._cache.clear()
+    with pytest.raises(ValueError, match="behavioral evidence mismatch"):
+        provider.acceptance_facts(ref, "check-run:77")
+
+    provider.session.pull_head = PIN
+    provider.session.evidence_head = MERGE_COMMIT
+    provider._cache.clear()
+    with pytest.raises(ValueError, match="behavioral evidence mismatch"):
+        provider.acceptance_facts(ref, "check-run:77")
