@@ -205,7 +205,8 @@ source discovery.
 This receipt bridge is implemented and protecting-tested, but is not installed
 or live-verified. It does not create a webhook secret or subscription, make an
 external GitHub write, replace protected integration, or certify an accepted
-pilot outcome.
+pilot outcome. The exact owner preflight, transport limitation, and live-driver
+correlations are in [GitHub event transport adoption](github-event-transport-adoption.md).
 
 This is preparation and code-contract evidence only. A live owner still needs
 the normal protected integration, private installation, signed provider

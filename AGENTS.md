@@ -11,6 +11,7 @@ scoped verification recipe, not a second policy definition.
 | HTTP and MCP work-operation surface | `docs/design/work-queue-phase-2.md` and `src/drover/server/work_queue/runtime.py` |
 | GitHub pilot profile, provider facts, and owner handoff | `docs/operations/github-acceptance-pilot.md` |
 | Signed GitHub CI delivery and native-owner receipt | `src/drover/server/work_queue/github_events.py`, `src/drover/server/work_queue/{runtime,service,native_owner}.py`, `tests/test_work_queue_github_acceptance.py`, and `tests/test_native_continuity_owner.py` |
+| GitHub event transport adoption and live-driver boundaries | `docs/operations/github-event-transport-adoption.md` |
 | Work/verify/owner and GitHub/local-file stage boundaries | `docs/operations/verified-event-path-boundaries.md` |
 | Queue product rules and planned/default policy | `docs/design/work-queue.md` |
 | Environment profiles and fail-fast diagnostics | `docs/operations/dev-preflight.md` and `scripts/quality/preflight.sh` |
