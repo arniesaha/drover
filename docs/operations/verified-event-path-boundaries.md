@@ -6,17 +6,20 @@ reflecting the accepted implementation delivered through #924, #979, and
 subsequent accepted commits (`fddcc986`).
 
 The opt-in [GitHub acceptance pilot](github-acceptance-pilot.md) adds a
-provider-resolved coordinator gate for explicitly configured issues. It does
-not extend the local-file native chain or upgrade historical acceptance proof;
-its installed/live acceptance remains a separate owner verification gate.
+provider-resolved coordinator gate for explicitly configured issues. Its exact
+signed delivery mapping can append a separate native-owner receipt wake after a
+verified close, without upgrading historical proof or treating close as ACK.
+Installation and live delivery remain separate owner verification gates.
 
 ## 1. Automatic Work -> Separate Verification -> Owner Acknowledgement Boundaries
 
-The multi-stage progression from automatic worker execution to separate
-verification and hub-native owner acknowledgement is explicitly scoped to
-**configured `local_file` native-owner canary goals** (e.g., #924/#848 canary
-fixtures). Real GitHub-backed workloads operate under separate coordinator
-boundaries described in Section 2.
+The local-file candidate-effect progression remains scoped to **configured
+`local_file` native-owner canary goals** (e.g., #924/#848 canary fixtures).
+An exact installed GitHub delivery mapping has a narrower terminal bridge:
+after a provider-verified close it appends one `github_acceptance_verified`
+wake to the signed parent Factory run; the same native owner revalidates
+provider facts before its distinct receipt and ACK. Real GitHub deployment,
+merge, and public-release work remains outside this bridge.
 
 ```mermaid
 flowchart TD
@@ -131,18 +134,21 @@ GitHub-backed coordinator workloads:
 | **System of Record** | Local JSON manifest file (`local_candidates_path`) | GitHub Issues in configured repository |
 | **Ingress Path** | `LocalCandidateProvider` validates local schema | `GitHubProvider` REST adapter / webhook receiver |
 | **Launch Bindings** | Hub signs `committed_provenance`, `authority_scope`, `m2_ack_pending` into binding | Work-coordinator binding with goal profile and authorized owner |
-| **Multi-Stage Deferred Verifier** | Proven in canary fixtures (`advance_deferred_completion` & `advance_deferred_verification`) | Scoped to local-file goals; not part of GitHub worker dispatch |
+| **Multi-Stage Deferred Verifier** | Proven in canary fixtures (`advance_deferred_completion` & `advance_deferred_verification`) | Exact signed CI continuation can run the same separate verifier; no generic GitHub scheduler |
 | **Effect Attestation** | Session-relative `local-file:` artifacts verified by `drover-harnessd` | Remote branch commits and PR head SHAs |
-| **Implementation Scope** | Hub-native owner continuity loop (`drover:owner/<goal>`) | Webhook ingestion, timeline facts, CI rollups, guarded draft PRs |
+| **Implementation Scope** | Hub-native owner continuity loop (`drover:owner/<goal>`) | Webhook ingestion, current-fact CI rollups, guarded coordinator close, then an exact native receipt/ACK wake |
 | **Observed Live Evidence** | M1 unattended jobs, M2 restart recovery, M3 committed provenance & overlap | Automatic queue admission and tool/session links proven for #980 and #783; end-to-end owner completion **unproven** |
 
 For an exact configured GitHub issue, the pilot's separate verifier binds to
 the current PR head and reviewed profile revision, then the coordinator
 resolves required CI, behavioral check, and owner-review facts before it can
-close the issue. It is a close gate only: it creates no local-file deferred
-verifier/owner sequence and does not establish merge, deployment, publication,
-or acknowledgement. The portable API/configuration and remaining owner gates
-are in the [GitHub pilot contract](github-acceptance-pilot.md).
+close the issue. A current signed mapping may then create a *separate*
+native-owner receipt wake. The runner re-reads the closed provider facts and
+both terminal bindings before completing its deterministic action receipt and
+ACK; a crash before ACK reuses that receipt. This establishes neither merge,
+deployment, publication, nor a live GitHub result. The portable
+API/configuration and remaining owner gates are in the
+[GitHub pilot contract](github-acceptance-pilot.md).
 
 ### Live Verification Evidence and Limitations on Real GitHub Runs
 

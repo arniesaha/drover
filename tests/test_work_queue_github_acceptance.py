@@ -378,6 +378,81 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
     # once. Their duplicate/out-of-order replay cannot add an effect.
     assert worker.process_once() == 2
     assert client.closed == 1
+    # The coordinator close creates a distinct, durable owner wake from the
+    # exact provider facts; it is not itself an owner acknowledgement.
+    assert len(service.harness.github_native_owner_wakes) == 1
+    parent, fact_digest, subject, summary = service.harness.github_native_owner_wakes[0]
+    assert parent == work["run_key"]
+    assert len(fact_digest) == 64
+    assert subject == "https://github.com/example/project/issues/1"
+    assert fact_digest in summary
+    client.overrides["/repos/example/project/issues/1"]["state"] = "closed"
+    effect = service.github_native_owner_effect(
+        "goal",
+        "work-" + work["run_key"],
+        wake_id="native-wake",
+        action_fingerprint="native-action",
+        owner_id="drover:owner/goal",
+        owner_epoch=1,
+    )
+    assert effect and effect.startswith("github-native-owner:")
+    # A native receipt re-reads the exact source at its own boundary; the
+    # retained coordinator outcome alone cannot certify a moved head/check.
+    client.head = "b" * 40
+    assert (
+        service.github_native_owner_effect(
+            "goal",
+            "work-" + work["run_key"],
+            wake_id="native-wake",
+            action_fingerprint="native-action",
+            owner_id="drover:owner/goal",
+            owner_epoch=1,
+        )
+        is None
+    )
+    client.head = SHA
+    client.overrides[f"/repos/example/project/commits/{SHA}/check-runs"] = {
+        "check_runs": []
+    }
+    assert (
+        service.github_native_owner_effect(
+            "goal",
+            "work-" + work["run_key"],
+            wake_id="native-wake",
+            action_fingerprint="native-action",
+            owner_id="drover:owner/goal",
+            owner_epoch=1,
+        )
+        is None
+    )
+    client.overrides.pop(f"/repos/example/project/commits/{SHA}/check-runs")
+    service.harness.sessions[work["run_key"]].status = "running"
+    assert (
+        service.github_native_owner_effect(
+            "goal",
+            "work-" + work["run_key"],
+            wake_id="native-wake",
+            action_fingerprint="native-action",
+            owner_id="drover:owner/goal",
+            owner_epoch=1,
+        )
+        is None
+    )
+    service.harness.sessions[work["run_key"]].status = "completed"
+    revoked = scope.model_copy(update={"github_event_delivery_profiles": {}})
+    service.config = service.config.model_copy(update={"goals": [revoked]})
+    assert (
+        service.github_native_owner_effect(
+            "goal",
+            "work-" + work["run_key"],
+            wake_id="native-wake",
+            action_fingerprint="native-action",
+            owner_id="drover:owner/goal",
+            owner_epoch=1,
+        )
+        is None
+    )
+    service.config = service.config.model_copy(update={"goals": [scope]})
     assert service.call(
         "update",
         {
@@ -390,6 +465,7 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
         ACTOR,
     ) == {"outcome": "verified"}
     assert client.closed == 1
+    assert len(service.harness.github_native_owner_wakes) == 1
 
 
 def existing_binding(profile, **changes):

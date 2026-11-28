@@ -10,7 +10,7 @@ scoped verification recipe, not a second policy definition.
 | Goal/configuration schema and validation | `src/drover/server/work_queue/config.py` |
 | HTTP and MCP work-operation surface | `docs/design/work-queue-phase-2.md` and `src/drover/server/work_queue/runtime.py` |
 | GitHub pilot profile, provider facts, and owner handoff | `docs/operations/github-acceptance-pilot.md` |
-| Signed GitHub CI delivery continuation | `src/drover/server/work_queue/github_events.py`, `src/drover/server/work_queue/service.py`, and `tests/test_work_queue_github_acceptance.py` |
+| Signed GitHub CI delivery and native-owner receipt | `src/drover/server/work_queue/github_events.py`, `src/drover/server/work_queue/{runtime,service,native_owner}.py`, `tests/test_work_queue_github_acceptance.py`, and `tests/test_native_continuity_owner.py` |
 | Work/verify/owner and GitHub/local-file stage boundaries | `docs/operations/verified-event-path-boundaries.md` |
 | Queue product rules and planned/default policy | `docs/design/work-queue.md` |
 | Environment profiles and fail-fast diagnostics | `docs/operations/dev-preflight.md` and `scripts/quality/preflight.sh` |
@@ -33,14 +33,18 @@ acknowledgement.
 | Verification | Separate verifier plus `WorkService` | verification request and, for the pilot, a provider-fact verdict | candidate-selected criteria/profile or local-file ownership |
 | GitHub pilot acceptance | `GitHubProvider` and coordinator | a close request after current source, evidence, owner review, and required checks agree | producer independence or product quality from a success flag |
 | Owner review | independently authorized owner | reviewed profile, criteria amendment, retained behavioral observations, and source/review trust | automatic installation or live acceptance proof |
-| `local_file` native canary | native owner/continuity path | its signed deferred work -> verify -> acknowledge chain | GitHub pilot acceptance or a general GitHub successor scheduler |
+| `local_file` native canary | native owner/continuity path | its signed deferred work -> verify -> acknowledge chain | GitHub profile authority or a general successor scheduler |
+| GitHub native receipt (exact opt-in) | signed GitHub work binding, provider, and native owner | a separate revalidated receipt and ACK after a verified close | the close itself, historical records, merge/deploy, or a live webhook installation |
 
-The GitHub pilot is exact-issue opt-in. It does not upgrade historical accepted
-records, run arbitrary report URLs or shell instructions, create a new
-scheduler, or make GitHub work automatically follow the local-file native
-chain. The real outcome states remain distinct: work finished, required checks
-passed, owner reviewed behavior, accepted/closed, merged, deployed, and
-acknowledged.
+The GitHub pilot is exact-issue opt-in. Its separately installed delivery map
+can append one native receipt wake only after a provider-verified close; the
+native runner re-reads current facts before recording its deterministic receipt
+and ACK. This is implemented but not installed or live-verified. It does not
+upgrade historical accepted records, run arbitrary report URLs or shell
+instructions, create a new scheduler, or make GitHub work follow the local-file
+candidate-effect chain. The real outcome states remain distinct: work finished,
+required checks passed, owner reviewed behavior, accepted/closed, native
+receipt acknowledged, merged, and deployed.
 
 ## Fresh-session, scoped verification
 
@@ -109,6 +113,8 @@ sh scripts/quality/preflight.sh --out "$scratch_root" \
   tests/test_work_queue_policy.py \
   tests/test_work_queue_local_candidates.py \
   tests/test_github_work_item_events.py \
+  tests/test_native_continuity_owner.py \
+  tests/test_work_coordinator_continuity.py \
   --basetemp="$scratch_root/pytest"
 "$uv_bin" run --locked --extra dev --extra postgres python -m black --check \
   src/drover/server/work_queue/config.py \

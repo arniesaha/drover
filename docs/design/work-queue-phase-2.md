@@ -115,6 +115,13 @@ recovery polling, not provider-ingestion discovery. The signed receiver itself
 has no provider-write endpoint; the bounded continuation may invoke the
 existing coordinator close only after final provider rereads. It has no model
 loop.
+
+When that exact configured close has an installed native owner, the signed
+parent Factory run receives one separate `github_acceptance_verified` wake.
+The native runner re-reads the closed provider source/evidence/checks and both
+terminal bindings before its deterministic action-intent receipt and ACK. This
+does not turn the close outcome into an ACK, create a webhook subscription, or
+prove a live installed outcome.
 Work runs and failed behavioral checks cannot close issues. A failure queues
 revision until the configured attempt budget is exhausted, then blocks and
 writes the generated systemic-review comment. Further launches remain blocked

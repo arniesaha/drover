@@ -13,9 +13,11 @@ checks, behavioral evidence, and that profile's configured verdict mode. It does
 that a worker has finished, a PR has merged, a release has deployed, or a
 continuity owner has acknowledged work. Those are separate states.
 
-The `local_file` canary's signed deferred work -> verify -> acknowledge chain
-remains local-file-only. This pilot neither invokes that chain for GitHub work
-nor upgrades historical GitHub or local-file records with stronger proof. See
+The `local_file` canary's candidate-effect chain remains local-file-only. An
+exact installed GitHub delivery mapping may additionally append one distinct
+native-owner receipt wake after a provider-verified close. It uses the signed
+parent work binding and native runner's existing fenced action-intent/ACK
+ledger; it neither upgrades historical records nor makes close equal ACK. See
 the [stage boundary](verified-event-path-boundaries.md#2-real-github-coordinator-ingress-vs-local-file-proof).
 
 ## Reviewed quality profile
@@ -179,9 +181,24 @@ The provider close has a narrower recovery fence: after a verified intent, a
 restart may record the outcome only when the current installed profile, signed
 parent and verifier terminal bindings, current source/head/checks/evidence, and
 closed issue all agree. It does not issue a second close. This coordinator close
-intent/outcome recovery is not a native-owner effect/ACK receipt. Native-owner
-action-intent, effect, and ACK remain the authority for native effects and have
-not been extended to GitHub issue closure.
+intent/outcome recovery is not a native-owner effect/ACK receipt.
+
+For an installed exact delivery mapping whose signed parent and verifier
+bindings remain terminal, the coordinator appends a deterministic
+`github_acceptance_verified` wake to the parent Factory run. The configured
+`drover:owner/<goal>` runner re-reads the *closed* issue, profile revision, PR
+head, required checks, behavioral evidence, and both terminal bindings before
+writing its `github-native-owner:<digest>` action-intent receipt and ACKing the
+same wake. A moved head, missing/failed check, revoked mapping, resumed parent,
+or unavailable provider leaves that delivery unacknowledged. A crash after the
+receipt and before ACK reuses the immutable receipt and never repeats a GitHub
+write. The five-second signed-delivery retry may recreate a missing durable
+wake; it remains recovery polling of the received push, never source discovery.
+
+This receipt bridge is implemented and protecting-tested, but is not installed
+or live-verified. It does not create a webhook secret or subscription, make an
+external GitHub write, replace protected integration, or certify an accepted
+pilot outcome.
 
 This is preparation and code-contract evidence only. A live owner still needs
 the normal protected integration, private installation, signed provider

@@ -655,6 +655,45 @@ class HarnessBridge:
             and parsed.github_event_delivery_profile_revision == profile_revision
         )
 
+    def github_native_owner_wake(
+        self, run_key, *, source_event_id, subject, summary
+    ) -> str | None:
+        """Durably hand one exact GitHub verdict to its signed native owner.
+
+        The caller has already checked the installed profile and provider
+        verdict.  This boundary only proves that the retained work session owns
+        the matching Factory observer run before it appends the idempotent wake.
+        It neither reads issue text nor treats the coordinator outcome as an
+        acknowledgement.
+        """
+        session = self.resolve(run_key)
+        if session is None or session.handoff_mode != "work_coordinator":
+            return None
+        from drover.server.harness.continuity import FactoryObserverContinuity
+
+        try:
+            continuity = FactoryObserverContinuity(self.collector.duckdb_path)
+            status = continuity.status("work-" + run_key)
+            if status.get("session_id") != session.session_id:
+                return None
+            wake_id = continuity.report(
+                "work-" + run_key,
+                source="github-provider-verdict",
+                source_event_id=source_event_id,
+                subject=subject,
+                sequence=0,
+                kind="github_acceptance_verified",
+                summary=summary,
+            )
+        except Exception:  # unavailable ledger must retain the coordinator retry
+            return None
+        runner = getattr(self.collector, "native_owner_runner", None)
+        if runner is not None:
+            # This is an event kick, not another scheduler.  The runner's
+            # lease/claim fences make an idle sweep racing this call harmless.
+            runner.process_once()
+        return wake_id
+
     def expected_effect_materialized(self, run_key, artifact):
         """Ask the bound daemon whether its exact candidate effect exists.
 
@@ -1038,6 +1077,10 @@ def start_idle_undeclared_worker(
         owner_runner = NativeOwnerRunner(
             collector, config, credential_store=credential_store
         )
+        # GitHub's signed CI continuation can wake this existing runner after
+        # a provider-verified outcome.  The periodic idle sweep remains only
+        # bounded recovery when that immediate kick is unavailable.
+        collector.native_owner_runner = owner_runner
     worker = IdleUndeclaredWorker(
         collector.duckdb_path,
         config.idle_undeclared_seconds,
