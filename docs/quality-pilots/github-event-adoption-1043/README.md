@@ -107,6 +107,7 @@ scratch_root=$(mktemp -d "$HOME/scratch/github-event-adoption-1043.XXXXXX")
 config_before=${DROVER_OWNER_CONFIG:?set the owner-held configuration path}
 execution_host=${DROVER_OWNER_EXECUTION_HOST:?set the existing native harness host id}
 execution_dir=${DROVER_OWNER_EXECUTION_DIR:?set an existing isolated execution directory}
+brief_ref="docs/quality-pilots/github-event-adoption-1043/owner-held-live-brief.md"
 python_bin=${DROVER_TEST_PYTHON:-$(command -v python3)}
 uv_bin=${DROVER_TEST_UV:-$(command -v uv)}
 export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/uv-cache"
@@ -116,6 +117,7 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
   --baseline-config "$config_before" \
   --native-template-goal native-owner-canary-848 \
   --execution-host "$execution_host" --execution-cwd "$execution_dir" \
+  --brief-ref "$brief_ref" \
   --profile "$repo_root/docs/quality-pilots/github-event-adoption-1043/profile-candidate.json" \
   --output "$scratch_root/work-queue-projection.json"
 "$UV_PROJECT_ENVIRONMENT/bin/python" -I \
@@ -123,18 +125,23 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
   --baseline-config "$config_before" \
   --native-template-goal native-owner-canary-848 \
   --execution-host "$execution_host" --execution-cwd "$execution_dir" \
+  --brief-ref "$brief_ref" \
   --projection "$scratch_root/work-queue-projection.json"
 ```
 
-`$execution_dir` must already exist, must be supplied explicitly, and must not
-equal, contain, or be contained by any CWD from the native canary template.
-The script creates neither that directory nor any live configuration. The
-projection derives the supported
-native harness/model and brief from the named native-template goal; it copies
-the existing
+`$execution_dir` must already exist, be a Git checkout whose `HEAD` contains
+the exact committed `$brief_ref` bytes, and must not equal, contain, or be
+contained by any CWD from the native canary template. The script creates
+neither that directory nor any live configuration. The projection derives the
+supported native harness/model from the named native-template goal, but never
+copies its `brief_ref`: the supplied reference must be the reviewed relative
+path to the checksummed [#1043 owner-held brief](owner-held-live-brief.md).
+The old `authorized:goal:native-owner-canary-848` reference, an absolute owner
+checkout path, a missing file, an uncommitted file, and changed bytes are
+rejected. It copies the existing
 `DROVER_WORK_QUEUE_GITHUB_TOKEN` *reference* and never prints a credential
 value. It preserves and revalidates the template's policy path, execution
-enablement, budget, estimated cost, worker limit, brief, harness and model. It
+enablement, budget, estimated cost, worker limit, harness and model. It
 preserves `execution.global_max_workers == 2`, uses
 `drover:owner/github-event-adoption-1043`, and a goal-local integration fence.
 Its only #1043 mappings are `github_acceptance_profiles`,
@@ -160,6 +167,22 @@ target difference is one validated #1043 session-binding map; all other goal
 fields remain exact. The script rejects a copied or modified P1 goal and the
 same whole-baseline and exact-ingestion checks apply to both projection and
 TOML.
+
+Immediately before the owner sends `POST /work/launch`, recheck the same
+execution checkout. This is an owner-held pre-launch check, not a runtime
+resolver or proof that harnessd created the assigned worktree:
+
+```sh
+"$UV_PROJECT_ENVIRONMENT/bin/python" -I \
+  "$repo_root/docs/quality-pilots/github-event-adoption-1043/verify-live-brief.py" \
+  --execution-cwd "$execution_dir" --brief-ref "$brief_ref"
+```
+
+`brief_ref` remains relative so the work agent can read it from its assigned
+worktree. The owner must use a harness source/worktree mechanism that preserves
+the selected committed `HEAD`; a file copied only into the base CWD after that
+commit is not sufficient. The work and verifier prompts must explicitly read
+this relative path from their assigned CWD before using their own MCP updates.
 
 The existing P1 A/B sessions cannot become #1043 bindings: the durable
 session-owner rule permits reuse only for the same goal, issue, role, profile
