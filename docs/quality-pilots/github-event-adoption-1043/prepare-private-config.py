@@ -20,6 +20,8 @@ ISSUE = "1043"
 p = argparse.ArgumentParser()
 p.add_argument("--baseline-config", type=pathlib.Path, required=True)
 p.add_argument("--native-template-goal", required=True)
+p.add_argument("--execution-host", required=True)
+p.add_argument("--execution-cwd", type=pathlib.Path, required=True)
 p.add_argument("--profile", type=pathlib.Path, required=True)
 p.add_argument("--output", type=pathlib.Path, required=True)
 a = p.parse_args()
@@ -44,6 +46,13 @@ native = next(goal for goal in base.goals if goal.goal_id == a.native_template_g
 assert native.continuity_owner_id == "drover:owner/" + native.goal_id
 assert native.execution_enabled and native.execution_cwds and native.brief_ref
 assert native.continuity_owner_harness and native.continuity_owner_model
+execution_cwd = a.execution_cwd.resolve()
+assert execution_cwd.is_dir(), "execution cwd must be an existing isolated directory"
+assert a.execution_host in native.execution_cwds, "execution host is not supported"
+assert all(
+    execution_cwd != pathlib.Path(template_cwd).resolve()
+    for template_cwd in native.execution_cwds.values()
+), "execution cwd must not reuse a native canary directory"
 
 # Copy only validated runtime fields from the owner-selected native template and
 # the existing P1 credential reference. No credential value is read or emitted.
@@ -52,10 +61,14 @@ goal = GoalScope.model_validate(
         "goal_id": GOAL,
         "repo": p1.repo,
         "goal_label": "goal:" + GOAL,
+        "policy_path": native.policy_path,
         "credential": p1.credential.model_dump(mode="json"),
         "execution_enabled": native.execution_enabled,
-        "execution_cwds": native.execution_cwds,
+        "execution_cwds": {a.execution_host: str(execution_cwd)},
         "brief_ref": native.brief_ref,
+        "execution_budget": native.execution_budget,
+        "execution_estimated_cost": native.execution_estimated_cost,
+        "execution_max_workers": native.execution_max_workers,
         "continuity_owner_id": "drover:owner/" + GOAL,
         "continuity_owner_harness": native.continuity_owner_harness,
         "continuity_owner_model": native.continuity_owner_model,
@@ -82,12 +95,21 @@ prepared = base.model_copy(
 )
 # Revalidate the entire private projection before it leaves this process.
 prepared = WorkQueueConfig.model_validate(prepared.model_dump(mode="json"))
+baseline_without_ingestion = base.model_dump(mode="json")
+baseline_ingestion = baseline_without_ingestion.pop("github_provider_ingestion")
 record = {
     "source": PIN,
     "profile_revision": REVISION,
     "p1_goal_digest": hashlib.sha256(
         json.dumps(p1.model_dump(mode="json"), sort_keys=True).encode()
     ).hexdigest(),
+    "baseline_without_ingestion_digest": hashlib.sha256(
+        json.dumps(baseline_without_ingestion, sort_keys=True).encode()
+    ).hexdigest(),
+    "baseline_ingestion": baseline_ingestion,
+    "prepared_ingestion": ingestion.model_dump(mode="json"),
+    "execution_host": a.execution_host,
+    "execution_cwd": str(execution_cwd),
     "work_queue": prepared.model_dump(mode="json"),
     "note": "projection only; no server config, store, session, or credential was changed",
 }

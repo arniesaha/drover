@@ -11,6 +11,7 @@ import pytest
 from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
 from drover.server.work_queue.github import GitHubProvider
 from drover.server.work_queue.provider import ItemRef
+from drover.server.work_queue.worker_mcp import BoundWorkControl
 
 ROOT = Path(__file__).parents[1]
 PACKET = ROOT / "docs/quality-pilots/github-event-adoption-1043"
@@ -62,6 +63,52 @@ def test_1043_publisher_binds_the_new_source_and_rejects_invalid_proof(tmp_path)
     assert publish(tmp_path, proof(MERGE_COMMIT)).returncode != 0
 
 
+def test_1043_live_driver_uses_bound_worker_mcp_for_deferred_stages(monkeypatch):
+    calls = []
+
+    def deferred(_control, operation, arguments):
+        calls.append((operation, arguments))
+        return {"outcome": "deferred"}
+
+    monkeypatch.setattr(BoundWorkControl, "_call", deferred)
+    control = BoundWorkControl(
+        "http://127.0.0.1:8080",
+        "paired-host-bearer",
+        "signed-run-key",
+        "github-event-adoption-1043",
+        1043,
+    )
+    assert control.update("complete") == {"outcome": "deferred"}
+    assert control.update("verified", evidence_key="check-run:77") == {
+        "outcome": "deferred"
+    }
+    complete, verified = calls
+    assert complete == (
+        "update",
+        {
+            "goal_id": "github-event-adoption-1043",
+            "number": 1043,
+            "run_key": "signed-run-key",
+            "action": "complete",
+            "evidence_key": None,
+            "estimated_cost": None,
+        },
+    )
+    assert verified == (
+        "update",
+        {
+            "goal_id": "github-event-adoption-1043",
+            "number": 1043,
+            "run_key": "signed-run-key",
+            "action": "verified",
+            "evidence_key": "check-run:77",
+            "estimated_cost": None,
+            "behavioral_passed": True,
+            "checks_rerun": True,
+        },
+    )
+
+
 def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
     tmp_path,
 ):
@@ -70,10 +117,14 @@ def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
     )
     q = json.dumps
     baseline = tmp_path / "baseline.toml"
+    policy_path = ROOT / "src/drover/server/work_queue/policy-v1.json"
+    isolated_cwd = tmp_path / "isolated-execution"
+    isolated_cwd.mkdir()
     baseline.write_text(f"""[work_queue]
 enabled = true
 shadow_mode = false
 workspace_id = "packet-test"
+principal_roles = {{ owner = "coordinator" }}
 [work_queue.execution]
 global_max_workers = 2
 [[work_queue.goals]]
@@ -102,7 +153,11 @@ verifier_turn_id = "p1-verify-turn"
 goal_id = "native-owner-canary-848"
 repo = "arniesaha/drover"
 goal_label = "goal:native-owner-canary-848"
+policy_path = {q(str(policy_path))}
 execution_enabled = true
+execution_budget = 9.0
+execution_estimated_cost = 2.5
+execution_max_workers = 1
 brief_ref = "authorized:goal:native-owner-canary-848"
 continuity_owner_id = "drover:owner/native-owner-canary-848"
 continuity_owner_harness = "codex"
@@ -123,6 +178,10 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
             str(baseline),
             "--native-template-goal",
             "native-owner-canary-848",
+            "--execution-host",
+            "studio",
+            "--execution-cwd",
+            str(isolated_cwd),
             "--profile",
             str(PACKET / "profile-candidate.json"),
             "--output",
@@ -143,6 +202,12 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
             str(PACKET / "validate-private-config.py"),
             "--baseline-config",
             str(baseline),
+            "--native-template-goal",
+            "native-owner-canary-848",
+            "--execution-host",
+            "studio",
+            "--execution-cwd",
+            str(isolated_cwd),
             "--projection",
             str(projection),
         ],
@@ -153,6 +218,162 @@ capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "act
     report = json.loads(validated.stdout)
     assert report["p1_goal_digest"] == p1_digest
     assert report["p1_unchanged"] and not report["binding_required"]
+    assert report["baseline_unchanged_outside_target_and_ingestion"]
+    target = next(
+        goal
+        for goal in record["work_queue"]["goals"]
+        if goal["goal_id"] == "github-event-adoption-1043"
+    )
+    assert target["execution_cwds"] == {"studio": str(isolated_cwd.resolve())}
+    assert target["policy_path"] == str(policy_path)
+    assert target["execution_estimated_cost"] == 2.5
+
+    def reject_projection(mutator):
+        rejected = tmp_path / "rejected-projection.json"
+        mutated = json.loads(json.dumps(record))
+        mutator(mutated)
+        rejected.write_text(json.dumps(mutated))
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(PACKET / "validate-private-config.py"),
+                "--baseline-config",
+                str(baseline),
+                "--native-template-goal",
+                "native-owner-canary-848",
+                "--execution-host",
+                "studio",
+                "--execution-cwd",
+                str(isolated_cwd),
+                "--projection",
+                str(rejected),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    assert (
+        reject_projection(
+            lambda projection: projection["work_queue"]["principal_roles"].update(
+                {"owner": "agent"}
+            )
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: next(
+                goal
+                for goal in projection["work_queue"]["goals"]
+                if goal["goal_id"] == "quality-cohort-1024"
+            )["credential"]["capabilities"].append("contents_read")
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: projection["work_queue"]["github_webhook"].update(
+                {"batch_size": 17}
+            )
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: next(
+                goal
+                for goal in projection["work_queue"]["goals"]
+                if goal["goal_id"] == "native-owner-canary-848"
+            ).update({"brief_ref": "changed:unrelated-goal"})
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: projection["work_queue"][
+                "github_provider_ingestion"
+            ].update({"retry_seconds": 120})
+        ).returncode
+        != 0
+    )
+    assert (
+        reject_projection(
+            lambda projection: next(
+                goal
+                for goal in projection["work_queue"]["goals"]
+                if goal["goal_id"] == "github-event-adoption-1043"
+            ).update({"execution_estimated_cost": 99.0})
+        ).returncode
+        != 0
+    )
+
+    profile = json.loads((PACKET / "profile-candidate.json").read_text())
+    candidate = tmp_path / "candidate.toml"
+    candidate.write_text(baseline.read_text() + f"""
+[work_queue.github_provider_ingestion]
+enabled = true
+interval_seconds = 60
+batch_size = 2
+retry_seconds = 60
+max_backoff_seconds = 300
+settled_seconds = 300
+[[work_queue.goals]]
+goal_id = "github-event-adoption-1043"
+repo = "arniesaha/drover"
+goal_label = "goal:github-event-adoption-1043"
+policy_path = {q(str(policy_path))}
+execution_enabled = true
+execution_budget = 9.0
+execution_estimated_cost = 2.5
+execution_max_workers = 1
+brief_ref = "authorized:goal:native-owner-canary-848"
+continuity_owner_id = "drover:owner/github-event-adoption-1043"
+continuity_owner_harness = "codex"
+continuity_owner_model = "gpt-5.6-terra"
+integration_serialization_key = "github-event-adoption-1043"
+[work_queue.goals.execution_cwds]
+studio = {q(str(isolated_cwd.resolve()))}
+[work_queue.goals.credential]
+token_env = "DROVER_WORK_QUEUE_GITHUB_TOKEN"
+capabilities = ["issues_read", "issues_write", "pulls_read", "checks_read", "actions_read"]
+[work_queue.goals.github_acceptance_profiles."1043"]
+pull_number = {profile['pull_number']}
+criteria = {q(profile['criteria'])}
+instructions = {q(profile['instructions'])}
+behavioral_check = {q(profile['behavioral_check'])}
+app_id = {profile['app_id']}
+review_mode = {q(profile['review_mode'])}
+amendment_record = {q(profile['amendment_record'])}
+[work_queue.goals.github_event_delivery_profiles]
+"1043" = "{GitHubAcceptanceProfile.model_validate(profile).revision}"
+[work_queue.goals.github_provider_ingestion_profiles]
+"1043" = "{GitHubAcceptanceProfile.model_validate(profile).revision}"
+""")
+    candidate_args = [
+        sys.executable,
+        "-I",
+        str(PACKET / "validate-private-config.py"),
+        "--baseline-config",
+        str(baseline),
+        "--native-template-goal",
+        "native-owner-canary-848",
+        "--execution-host",
+        "studio",
+        "--execution-cwd",
+        str(isolated_cwd),
+        "--candidate-config",
+        str(candidate),
+    ]
+    final = subprocess.run(candidate_args, capture_output=True, text=True)
+    assert final.returncode == 0, final.stderr
+    assert json.loads(final.stdout)["prepared_ingestion"]["batch_size"] == 2
+    candidate.write_text(
+        candidate.read_text().replace("batch_size = 2", "batch_size = 3")
+    )
+    assert (
+        subprocess.run(candidate_args, capture_output=True, text=True).returncode != 0
+    )
 
 
 def test_1043_workflow_isolates_candidate_proof_from_check_publication():

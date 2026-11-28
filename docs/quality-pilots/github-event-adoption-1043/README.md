@@ -4,8 +4,9 @@ This packet prepares a distinct, source-pinned adoption task for PR #1042 at
 `bde283aa6bd4f97073867930153c8d12e9b8b85e`, the actual GitHub PR head.
 The installed merged runtime is the distinct merge commit
 `f68653d9be5adbe8eed1ba53a832d5ebb55d7dbc`; equal tree identity does not make
-it an acceptance head. This packet is not an installation record, a GitHub delivery, a native-owner acknowledgement, or an accepted
-outcome. P1 remains accepted historical evidence for #1031 only; its profile,
+it an acceptance head. This packet is not an installation record, a GitHub
+delivery, a native-owner acknowledgement, or an accepted outcome. P1 remains
+accepted historical evidence for #1031 only; its profile,
 producer check, bindings, and closed issue are not reusable proof for #1043.
 The original P2/P3 ledger remains separately not accepted.
 
@@ -38,6 +39,18 @@ test. `publish-check.py` rejects a changed source, count, command shape, or
 invalid-result observation before it can use its token. These are source-level
 proof boundaries. They do not establish a live GitHub API-polling observation,
 a configured profile, a close, a native effect, or an ACK.
+
+The App `15368` check identity does **not** establish workflow identity. A
+repository writer with `checks: write` through that shared App could create a
+matching check; protected-main producer placement is a reviewed convention,
+not an enforcement mechanism in GitHub or this profile. Publisher reruns are
+also deliberately fail-closed: they compare the complete retained output,
+including interpreter and log hashes, and inspect only the first 100 matching
+head check runs. A changed rerun, an older matching check outside that page, or
+an ambiguous match requires owner inspection rather than a new publication.
+The hosted proof's `postgres:17` service tag is floating rather than
+digest-pinned; this packet makes no measurement or reproducibility claim about
+future image contents.
 
 ## Fresh-session local verification
 
@@ -91,6 +104,8 @@ service, a store, or a harness:
 repo_root=$(git rev-parse --show-toplevel)
 scratch_root=$(mktemp -d "$HOME/scratch/github-event-adoption-1043.XXXXXX")
 config_before=${DROVER_OWNER_CONFIG:?set the owner-held configuration path}
+execution_host=${DROVER_OWNER_EXECUTION_HOST:?set the existing native harness host id}
+execution_dir=${DROVER_OWNER_EXECUTION_DIR:?set an existing isolated execution directory}
 python_bin=${DROVER_TEST_PYTHON:-$(command -v python3)}
 uv_bin=${DROVER_TEST_UV:-$(command -v uv)}
 export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/uv-cache"
@@ -99,28 +114,44 @@ export UV_PROJECT_ENVIRONMENT="$scratch_root/venv" UV_CACHE_DIR="$scratch_root/u
   "$repo_root/docs/quality-pilots/github-event-adoption-1043/prepare-private-config.py" \
   --baseline-config "$config_before" \
   --native-template-goal native-owner-canary-848 \
+  --execution-host "$execution_host" --execution-cwd "$execution_dir" \
   --profile "$repo_root/docs/quality-pilots/github-event-adoption-1043/profile-candidate.json" \
   --output "$scratch_root/work-queue-projection.json"
 "$UV_PROJECT_ENVIRONMENT/bin/python" -I \
   "$repo_root/docs/quality-pilots/github-event-adoption-1043/validate-private-config.py" \
   --baseline-config "$config_before" \
+  --native-template-goal native-owner-canary-848 \
+  --execution-host "$execution_host" --execution-cwd "$execution_dir" \
   --projection "$scratch_root/work-queue-projection.json"
 ```
 
-The projection derives the live supported native harness/model, execution CWD
-and brief from the named native-template goal; it copies the existing
+`$execution_dir` must already exist, must be supplied explicitly, and must not
+be a CWD from the native canary template. The script creates neither that
+directory nor any live configuration. The projection derives the supported
+native harness/model and brief from the named native-template goal; it copies
+the existing
 `DROVER_WORK_QUEUE_GITHUB_TOKEN` *reference* and never prints a credential
-value. It preserves `execution.global_max_workers == 2`, uses
+value. It preserves and revalidates the template's policy path, execution
+enablement, budget, estimated cost, worker limit, brief, harness and model. It
+preserves `execution.global_max_workers == 2`, uses
 `drover:owner/github-event-adoption-1043`, and a goal-local integration fence.
 Its only #1043 mappings are `github_acceptance_profiles`,
 `github_event_delivery_profiles`, and `github_provider_ingestion_profiles`, all
 at the revision above. It turns polling on with batch two and cadence/retry 60
 seconds. It validates that the entire P1 goal's canonical digest did not change.
+It also removes only the newly prepared #1043 goal and the ingestion block from
+the candidate before comparing the entire remaining work queue to the baseline;
+principal roles, every unrelated goal, capability, hook, and authority change
+therefore fail validation. The candidate ingestion block must be exactly
+enabled with batch two, 60-second interval/retry, 300-second maximum backoff,
+and 300-second settled delay.
 
 There is no WorkQueue API that writes server configuration. The owner must
 apply the validated projection with the normal private configuration installer,
 then run the same validator with `--candidate-config` against the staged final
-TOML before activation. The script rejects a copied or modified P1 goal.
+TOML before activation, supplying the same template, host, and directory
+arguments. The script rejects a copied or modified P1 goal and the same
+whole-baseline and exact-ingestion checks apply to both projection and TOML.
 
 The existing P1 A/B sessions cannot become #1043 bindings: the durable
 session-owner rule permits reuse only for the same goal, issue, role, profile
@@ -136,27 +167,42 @@ merged-source checks, compatible private install with rollback/health proof,
 and the separate proof/publisher outcome. They are not commands executed by
 this packet.
 
-1. Read the exact PR #1042 head, required check IDs/conclusions, published
-   behavioral check ID/App/external ID/output digest, current profile revision,
-   and poller health. Any unavailable, stale, wrong-source, failed, skipped or
-   missing fact stops the task. A poller observation is not a verdict.
+1. Read, before launch, the merged PR #1042 record (actual PR head
+   `bde283…`, distinct merged runtime `f68653…`), the installed profile
+   revision and issue acceptance marker, and the protected-main required-check
+   rules and exact current check IDs/conclusions. Read the issue labels and
+   stop unless the exact `goal:github-event-adoption-1043` and `status:review`
+   labels are present. Then read the published behavioral check ID/App/external
+   ID/output digest and poller health. Any unavailable, stale, wrong-source,
+   failed, skipped or missing fact stops the task. A poller observation is not
+   a verdict.
 2. With #1043 at `status:review`, create the distinct work using the supported
    coordinator request: `POST /work/launch` with
    `{"goal_id":"github-event-adoption-1043","number":1043,"request_key":"owner-recorded-unique-key","estimated_cost":1}`.
    Preserve the returned work run key and its signed turn/session provenance.
-   Complete it only after its actual terminal success using `POST /work/update`
-   with its returned `run_key`, `action:"complete"`, and the normal authorized
-   worker identity. The service re-reads current provider facts; it will defer
-   while CI is pending.
+   While that bound work agent's structured turn is still running, the agent
+   itself must use its stdio MCP tool
+   `drover_work_update(action="complete")`. It carries the signed run key and
+   returns a deferred intent; it does not launch the verifier itself. The owner
+   observes the result and stops if a coordinator sends the completion update
+   or if the work turn has already ended. `advance_deferred_completion` later
+   requires the terminal work turn and current exact-head required CI before
+   scheduling the distinct verifier.
 3. Let installed API polling observe the exact configured item; do not POST a
    copied webhook payload and do not use a cron tick as a stage driver. Record
    the poller health counters, source/profile/head, required-check rollup, and
    resulting verifier run key. Confirm the verifier is distinct and terminal.
-4. Submit `POST /work/update` for that verifier with
-   `action:"verified"` and `evidence_key:"check-run:<published-id>"`.
-   The request supplies no success flags. Confirm current source and evidence
-   are reread, then retain the verified intent/outcome, one close, native wake,
-   owner epoch, action receipt/fingerprint and ACK correlations.
+4. While the distinct bound verifier's structured turn is still running, that
+   verifier itself must use its stdio MCP tool
+   `drover_work_update(action="verified", evidence_key="check-run:<published-id>")`.
+   The bound MCP proxy also carries its fixed legacy compatibility booleans;
+   this GitHub pilot does not use them as acceptance proof. The request returns
+   a deferred intent. The owner observes only and stops if a coordinator
+   submits verification or the verifier turn has already ended.
+   `advance_deferred_verification` subsequently requires both terminal turns,
+   current source and evidence before it can retain the verified outcome, one
+   close, native wake, owner epoch, action receipt/fingerprint and ACK
+   correlations.
 5. Replay the real provider observation and repeat the exact verified request.
    Expect no second work/verifier pair, close, wake, receipt or ACK. For the
    owner-approved isolated crash exercise, stop only after the native receipt

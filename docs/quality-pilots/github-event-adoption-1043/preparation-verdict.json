@@ -13,6 +13,9 @@
   "p1_reused_as_evidence": false,
   "profile_installed": false,
   "publisher_installed": false,
+  "bound_worker_mcp_required_for_live_stages": true,
+  "whole_baseline_config_preserved_by_validator": true,
+  "dedicated_execution_directory_required": true,
   "live_transport_verified": false,
   "live_accepted": 0
 }
