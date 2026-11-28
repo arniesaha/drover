@@ -420,16 +420,27 @@ class GitHubProviderIngestionWorker:
             self._health[key] = self._health.get(key, 0) + value
 
     def _error(self, target, error):
+        config = self._config()
         failures = self._failures.get(target, 0) + 1
         self._failures[target] = failures
         delay = min(
-            self.config.max_backoff_seconds,
-            self.config.retry_seconds * (2 ** min(failures - 1, 16)),
+            config.max_backoff_seconds,
+            config.retry_seconds * (2 ** min(failures - 1, 16)),
         )
         self._due[target] = self.clock() + delay
         with self._lock:
             self._health["unavailable"] += 1
             self._health["last_error"] = str(error)[:128]
+
+    def _iteration_error(self, error):
+        """Expose a recoverable scan failure without converting it to success."""
+        with self._lock:
+            self._health["unavailable"] += 1
+            self._health["last_error"] = str(error)[:128]
+
+    def _config(self):
+        """Read the current validated config so a reload can disable polling."""
+        return getattr(self.service.config, "github_provider_ingestion", self.config)
 
     def _targets(self):
         for scope in sorted(self.service.config.goals, key=lambda row: row.goal_id):
@@ -456,8 +467,13 @@ class GitHubProviderIngestionWorker:
             while not self._stop.is_set() and not (
                 shutdown_event and shutdown_event.is_set()
             ):
-                self.process_once()
-                self._stop.wait(self.config.interval_seconds)
+                try:
+                    self.process_once()
+                except Exception as exc:
+                    # Do not catch BaseException: process termination signals
+                    # must retain their ordinary lifecycle semantics.
+                    self._iteration_error(exc)
+                self._stop.wait(self._config().interval_seconds)
 
         self._thread = threading.Thread(
             target=run, name="github-provider-ingestion", daemon=True
@@ -472,14 +488,15 @@ class GitHubProviderIngestionWorker:
 
     def process_once(self):
         """Observe at most one configured batch; provider failure is retryable."""
-        if not self.config.enabled:
+        config = self._config()
+        if not config.enabled:
             return 0
         now = self.clock()
         targets = [
             target
             for target in self._targets()
             if self._due.get((target[0].goal_id, target[1]), 0) <= now
-        ][: self.config.batch_size]
+        ][: config.batch_size]
         for scope, number, revision in targets:
             target = (scope.goal_id, number)
             try:
@@ -514,12 +531,21 @@ class GitHubProviderIngestionWorker:
                 with self._lock:
                     self._health["last_error"] = str(exc)[:128]
                 continue
+            except Exception as exc:
+                # Store, native-owner and unexpected provider failures must
+                # never stop later independent targets. They retain a bounded
+                # retry and do not imply an accepted provider observation.
+                self._error(target, exc)
+                continue
             self._record("observed")
             self._due.pop(target, None)
             self._failures.pop(target, None)
             if outcome == "pending":
-                self._due[target] = self.clock() + self.config.retry_seconds
+                self._due[target] = self.clock() + config.retry_seconds
                 self._record("pending")
             else:
+                # Avoid repeatedly reading an already-settled/ACKed target at
+                # the normal cadence. Restart still performs one safe rescan.
+                self._due[target] = self.clock() + config.settled_seconds
                 self._record("advanced")
         return len(targets)

@@ -546,10 +546,13 @@ class GitHubProviderIngestionConfig(Model):
     """Explicit, bounded authenticated API polling for opted-in GitHub items."""
 
     enabled: bool = False
-    interval_seconds: int = Field(default=5, ge=1, le=3600)
+    # This is intentionally a low-rate repair/adoption reader, never a
+    # replacement for pushed ingress or a task-stage driver.
+    interval_seconds: int = Field(default=60, ge=60, le=3600)
     batch_size: int = Field(default=8, ge=1, le=100)
-    retry_seconds: int = Field(default=5, ge=1, le=3600)
+    retry_seconds: int = Field(default=60, ge=60, le=3600)
     max_backoff_seconds: int = Field(default=300, ge=1, le=3600)
+    settled_seconds: int = Field(default=300, ge=60, le=3600)
 
     @model_validator(mode="after")
     def valid(self):

@@ -51,7 +51,21 @@ it cannot skip retained pending work. Health reports the source as
 `github_api_polling`, a `none; ... rescanned` cursor, observations, pending,
 rejected, unavailable and last-error counters. Provider conditional reads and
 rate-limit backoff remain in `GitHubProvider`; the poller uses visible
-`interval_seconds`, `batch_size`, `retry_seconds`, and `max_backoff_seconds`.
+`interval_seconds` and `retry_seconds` have a schema minimum of 60 seconds;
+`batch_size`, `max_backoff_seconds`, and `settled_seconds` are also explicit.
+Settled targets are deferred for `settled_seconds` (five minutes by default),
+while pending and unexpected failures retain bounded retry/backoff.
+
+The process reads the current validated `service.config.github_provider_ingestion`
+on every pass. A configuration reload that sets `enabled: false` stops scans
+without treating a target as settled; the lifecycle-owned thread remains until
+normal service shutdown. There is no durable polling cursor or cross-process
+poll lock. One worker processes its bounded batch serially, and separately
+installed service processes can reread the same source. Existing provider and
+native receipt fences protect continuation effects, but no live rate, cache, or
+concurrency measurement has been performed. GitHubProvider's conditional-read
+and rate-limit behavior is reused; a live rate-limit response remains an
+unavailable observation, never readiness proof.
 
 A signed receiver remains an independently useful pushed-ingress path. Its
 0.25-second local delivery-table loop and five-second continuation retry are
@@ -113,10 +127,11 @@ add P1's `1031` entry or copy its closed source.
 ```yaml
 github_provider_ingestion:
   enabled: true                 # default is false
-  interval_seconds: 5           # GitHub API POLLING cadence
+  interval_seconds: 60          # GitHub API POLLING cadence (minimum)
   batch_size: 1                 # bounded exact-source scan
-  retry_seconds: 5
+  retry_seconds: 60
   max_backoff_seconds: 300
+  settled_seconds: 300          # slow reread of ACKed/settled targets
 goals:
   - goal_id: <new-goal>
     repo: arniesaha/drover

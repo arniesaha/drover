@@ -44,7 +44,9 @@ and ACK. An additionally installed `github_provider_ingestion_profiles` map
 can use disabled-by-default authenticated **GitHub API polling** to rescan the
 same exact delivery mapping; it never accepts a webhook, uses a token as HMAC,
 or replaces the provider re-read at the effect boundary. It is implemented but
-not installed or live-verified. It does not
+not installed or live-verified. Its configured cadence and retry are at least
+60 seconds; reload can disable scans without converting retained work to an
+outcome. It does not
 upgrade historical accepted records, run arbitrary report URLs or shell
 instructions, create a new scheduler, or make GitHub work follow the local-file
 candidate-effect chain. The real outcome states remain distinct: work finished,

@@ -1771,6 +1771,9 @@ def test_host_deferred_close_recovery_redelivery_rebuilds_plain_evidence_outcome
     assert facts["required_checks"]
     assert facts["evidence"] == "check-run:7"
     assert len(restarted.harness.github_native_owner_wakes) == 1
+    assert worker.process_once() == 0
+    assert client.closed == 1
+    assert len(restarted.harness.github_native_owner_wakes) == 1
 
 
 def test_opted_provider_poll_rescans_pending_ci_and_restarts_without_duplicate_pair(
@@ -1793,7 +1796,7 @@ def test_opted_provider_poll_rescans_pending_ci_and_restarts_without_duplicate_p
     config["credential"]["capabilities"] += ["pulls_read", "checks_read"]
     scope = GoalScope.model_validate(config)
     ingestion = service.config.github_provider_ingestion.model_copy(
-        update={"enabled": True, "interval_seconds": 1, "retry_seconds": 1}
+        update={"enabled": True, "interval_seconds": 60, "retry_seconds": 60}
     )
     service.config = service.config.model_copy(
         update={"goals": [scope], "github_provider_ingestion": ingestion}
@@ -1913,6 +1916,88 @@ def test_runtime_starts_opted_provider_poller_without_a_webhook_secret(service):
     assert not hasattr(collector, "github_webhook_worker")
     worker.stop()
     assert worker.process_once() == 0
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("store interrupted"), TimeoutError("provider timeout")]
+)
+def test_provider_poller_isolates_target_failures_and_keeps_its_thread_alive(
+    failure,
+):
+    """A failed exact target backs off without starving another configured item."""
+    now = [0]
+    failed = [True]
+    first_attempt = threading.Event()
+    profile = SimpleNamespace(revision="r" * 64, pull_number=9)
+    scopes = [
+        SimpleNamespace(
+            goal_id="a-failed",
+            repo="example/project",
+            github_provider_ingestion_profiles={"1": profile.revision},
+            github_acceptance_profiles={"1": profile},
+            github_event_delivery_profiles={"1": profile.revision},
+        ),
+        SimpleNamespace(
+            goal_id="b-ready",
+            repo="example/project",
+            github_provider_ingestion_profiles={"1": profile.revision},
+            github_acceptance_profiles={"1": profile},
+            github_event_delivery_profiles={"1": profile.revision},
+        ),
+    ]
+    config = SimpleNamespace(
+        enabled=True,
+        interval_seconds=60,
+        batch_size=2,
+        retry_seconds=60,
+        max_backoff_seconds=300,
+        settled_seconds=300,
+    )
+    provider = SimpleNamespace(
+        acceptance_source=lambda _ref, **_kw: {
+            "repo": "example/project",
+            "pull": 9,
+            "profile": profile.revision,
+            "head": SHA,
+        }
+    )
+    advanced = []
+
+    class PollService:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                goals=scopes, github_provider_ingestion=config
+            )
+
+        def item(self, goal_id, _number):
+            if goal_id == "a-failed" and failed[0]:
+                first_attempt.set()
+                raise failure
+            return provider, None, SimpleNamespace(), {"state": "open"}
+
+        def advance_github_ci(self, _repo, _pull, _head, **kwargs):
+            advanced.append(kwargs["goal_id"])
+            return "settled"
+
+    service = PollService()
+    worker = GitHubProviderIngestionWorker(service, config, clock=lambda: now[0])
+    assert worker.process_once() == 2
+    assert advanced == ["b-ready"]
+    assert worker.health()["unavailable"] == 1
+    assert str(failure) in worker.health()["last_error"]
+
+    # A normal thread iteration remains alive after the same recoverable
+    # exception. Advancing the bounded backoff then resumes the retained item.
+    first_attempt.clear()
+    threaded = GitHubProviderIngestionWorker(service, config, clock=lambda: now[0])
+    threaded.start()
+    assert first_attempt.wait(timeout=2)
+    assert threaded._thread is not None and threaded._thread.is_alive()
+    threaded.stop()
+    failed[0] = False
+    now[0] = 60
+    assert worker.process_once() == 1
+    assert advanced[-1] == "a-failed"
 
 
 def test_wrong_repository_source_cannot_close(service, monkeypatch):
