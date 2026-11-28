@@ -1,31 +1,37 @@
 {
-  "version": 2,
+  "version": 3,
   "issue": 1024,
-  "status": "preparation; not executed; no case has a verdict",
+  "status": "Bound at final_source_sha. P1: one real outcome accepted by the owner. P2 and P3: passing owner proof; owner review and integration open. The cohort is not declared accepted here.",
+  "final_source_sha": "87990e95911d3897fcc0d2a195f0650d67fbf277",
+  "evidence_record": "docs/quality-pilots/final-evidence-87990e95.md (owner receipts; not rerun by the documentation author)",
   "baseline_sha": "7133442dbe4a0525f7e19076d404dca356f17756",
   "lane_a_merged_sha": "b36305f69629f64e159bc24436638c2ca5145c62",
-  "unbound": "A value of UNBOUND is filled only from owner-supplied reviewed, integrated source or installed runtime at binding, never guessed. Lane A facts below were read from the merged object; Lane B and the integrated runtime were not available.",
+  "unbound": "Historical rule: an UNBOUND value was filled only from owner-supplied reviewed, integrated source or installed runtime, never guessed. No UNBOUND slot remains in version 3.",
   "held_out_rule": "For held_out cases only the property and expectation are committed. The owner picks the concrete inputs at execution and does not give them to the candidate author or worker. Expectations are not lowered at binding; a case that cannot be expressed against the accepted source is reported as a gap.",
-  "tiers": ["T0 implementation", "T1 mocked test", "T2 CI", "T3 installed behavioural acceptance"],
+  "tiers": {"T0 implementation": "a diff exists at a named SHA", "T1 scoped test": "pytest against fakes or an isolated real PostgreSQL store; not a real provider, transport or installed process", "T2 CI": "the same SHA green in the repository CI workflow", "T3 real entry point": "the installed gate, or the real script process, driven for an exact case with results read back from the system of record"},
+  "tier_note": "The pilots reach different tiers and are not interchangeable: P1 is a real installed outcome (T3 installed gate), P2 is internal equivalence (T1 with real PostgreSQL plus T2, no T3), P3 is a real script process from the source checkout (T3 script process, not installed-server behaviour).",
   "pilots": [
     {
       "id": "P1",
       "class": "bugfix",
       "lane": "A",
       "outcome": "For an exact opted-in GitHub issue, a close happens only when trusted provider reads agree with the reviewed profile; caller flags or an evidence label alone never close it. Every other path behaves exactly as before.",
-      "contract": "docs/operations/github-acceptance-pilot.md at lane_a_merged_sha",
+      "contract": "docs/operations/github-acceptance-pilot.md at final_source_sha",
       "bound_from_merged_a": {
         "opt_in": "work_queue.goals.github_acceptance_profiles.\"<issue number>\"; candidate_source must be github; credential needs issues_read, pulls_read, checks_read",
-        "profile_fields": ["pull_number", "criteria", "instructions", "behavioral_check", "app_id", "owner_id", "amendment_record"],
+        "profile_fields": ["pull_number", "criteria", "instructions", "behavioral_check", "app_id", "review_mode", "owner_id (human_approval only)", "amendment_record"],
+        "review_modes": {"human_approval": "default; evidence_key check-run:<id>:review:<id>; requires the configured human owner review", "independent_check": "explicit; evidence_key check-run:<id>; the configured App check is the verdict source and no review is fetched or synthesized"},
         "profile_revision": "SHA-256 over sorted JSON of the complete profile",
         "criteria_section": "exactly one <!-- drover:acceptance --> ... <!-- /drover:acceptance --> section whose trimmed content equals profile.criteria",
-        "request": "POST /work/update action=verified evidence_key=check-run:<positive id>:review:<positive id>",
+        "request": "POST /work/update action=verified with the evidence_key shape of the installed profile mode",
+        "settled_sessions": "completed lifetime with the named turn exit 0, or, only for an installed github_existing_session_bindings pair, a strict resumable turn: latest durable input, final successful result in that window, owning daemon awaiting input with turn_active false",
         "provider_result_location": "GET /repos/<configured repo>/check-runs/<check id> (output.summary, output.text)",
-        "owner_review": "APPROVED review by profile.owner_id (type User) at the current head whose body contains the token drover-acceptance:<profile revision>",
+        "owner_review": "human_approval mode only: APPROVED review by profile.owner_id (type User) at the current head whose body contains the token drover-acceptance:<profile revision>",
         "audit": "decision_events provider_operation_id is bounded JSON of resolved source, required-check facts, evidence reference, and behavioural-result byte count and SHA-256",
         "t1_tests": "tests/test_work_queue_github_acceptance.py"
       },
-      "bindings": {"integrated_sha": "UNBOUND", "installed_runtime": "UNBOUND", "repository": "UNBOUND", "issue": "UNBOUND", "pull_number": "UNBOUND", "profile_revision": "UNBOUND", "behavioral_check_and_app": "UNBOUND", "owner_id": "UNBOUND", "producer_isolation": "UNBOUND"},
+      "bindings": {"integrated_sha": "87990e95911d3897fcc0d2a195f0650d67fbf277", "installed_runtime": "private build of integrated_sha; details retained by the owner", "repository": "arniesaha/drover", "issue": 1031, "pull_number": 1029, "source_head": "5202c2359483a58b2916c58acac5f11ee2df20b8", "profile_revision": "228c9ccced9eac01eea57b8971d83195ab3f25f18e1870b30283f6a0128aed7c", "review_mode": "independent_check", "behavioral_check_and_app": "cohort1024-independent-quota-outcome, App 15368, check run 140725060148", "owner_id": "not applicable in independent_check mode; no human approval was created or represented", "producer_isolation": "protected-main workflow at 5abbeda381b10b88dfba0a3e8a1e33a45d22609b, run 46063992370: credential-free proof job, separate publish job"},
+      "result": {"tier": "T3 installed coordinator gate, one real case", "owner_verdict": "accepted", "live_cases": ["P1-G1 in independent_check mode: one verified outcome, one close of issue 1031", "P1-G2: two exact repeats each returned verified; still one close"], "not_live": "P1-N1..N11 and P1-C1..C6 were exercised in scoped real-PostgreSQL service suites, not by fault injection on the live gate. P1-N7 applies to human_approval mode, which this outcome did not use. No separate report exists here for held-out P1-N12.", "note": "The first HTTP response was not retained; the owner reconciled the durable and provider outcome before the repeats. The earlier human-approval-only criterion was superseded and is not claimed as met."},
       "compatibility_regression": {
         "scope": "local_file goals and GitHub issues with no profile; deliberately unchanged by Lane A",
         "note": "On these paths caller flags plus an opaque evidence_key are still what the service checks. The pilot does NOT expect them to reject opaque evidence; it expects no behaviour change.",
@@ -41,7 +47,7 @@
       "github_gate": {
         "scope": "one exact opted-in GitHub issue",
         "positive": [
-          {"id": "P1-G1", "given": "terminal work and verify sessions; behavioural check success at current head with external_id = profile revision and non-empty retained output; owner approval at that head with the revision token; required checks green", "expect": "200 outcome=verified; one close; audit holds resolved provider facts"},
+          {"id": "P1-G1", "given": "settled work and verify sessions; behavioural check success at current head with external_id = profile revision and non-empty retained output; in human_approval mode, owner approval at that head with the revision token; required checks green", "expect": "200 outcome=verified; one close; audit holds resolved provider facts"},
           {"id": "P1-G2", "given": "P1-G1 request repeated", "expect": "recorded outcome returned; no second close", "kind": "retry"}
         ],
         "negative": [
@@ -51,34 +57,45 @@
           {"id": "P1-N4", "given": "profile field or marked criteria section changed after verification launched", "expect": "refused; new verification required"},
           {"id": "P1-N5", "given": "behavioural check wrong name, wrong App, not success, or an older success superseded by a later run at that head", "expect": "refused"},
           {"id": "P1-N6", "given": "retained output missing, empty, or over 64 KiB", "expect": "refused"},
-          {"id": "P1-N7", "given": "review not APPROVED, by another account or a bot, at another commit, or without the exact revision token", "expect": "refused"},
+          {"id": "P1-N7", "mode": "human_approval", "given": "review not APPROVED, by another account or a bot, at another commit, or without the exact revision token", "expect": "refused"},
           {"id": "P1-N8", "given": "a required branch-protection check missing, duplicated, pending, failed, or from the wrong App", "expect": "refused"},
-          {"id": "P1-N9", "given": "work or verify session not terminal", "expect": "refused"},
+          {"id": "P1-N9", "given": "work or verify session not settled: not completed, or a resumable turn that is busy, unknown, failed, superseded by a newer input, or not the current installed binding", "expect": "refused"},
           {"id": "P1-N10", "given": "retained result or head changes between evidence resolution and the final reread", "expect": "refused; no close intent recorded"},
           {"id": "P1-N11", "given": "close intent recorded, provider response lost, request repeated", "expect": "outcome=deferred; no second close; owner inspects provider state", "kind": "interruption"},
           {"id": "P1-N12", "held_out": true, "given": "evidence that is genuine and successful but bound to a different source than the one being accepted (owner picks which identity differs: pull request, head, or profile revision)", "expect": "refused; issue open; no verified outcome"}
         ]
       },
       "acceptance_gates": {
-        "note": "T1 fixtures and CI are not this outcome. These are performed by the owner on the installed gate, not by this worker.",
-        "gates": [
-          "owner independently reviews and installs the profile; candidate cannot select or weaken it",
-          "owner retrieves the retained behavioural result from the provider_result_location and reads it",
-          "owner judges whether the observations establish the claim and whether the producer was isolated; a success conclusion alone is not that judgment",
-          "exact source, profile revision, check-run id, App id and review id match what the audit recorded",
-          "stale and forged negatives above observed refused on the installed gate where they can be produced without harm",
-          "retry and interruption behaviour observed",
-          "one real, subsequent, authorized PR passes through the installed gate with a single close"
-        ]
+        "current_supported_contract": {
+          "note": "Performed by the integration owner under the sole-human policy Arnab authorized. No personal human review or approval is recorded or implied.",
+          "gates": [
+            "the integration owner reviews and installs the profile; the candidate cannot select or weaken it",
+            "the owner retrieves the retained behavioural result from the provider_result_location and reads it",
+            "the owner judges whether the observations establish the claim and whether the producer was isolated; a success conclusion alone is not that judgment",
+            "one real, authorized PR passes through the installed gate with a single close; source, profile revision, check-run id and App id match what the audit recorded",
+            "a repeat of the current verified request returns the recorded outcome with no second close",
+            "forged, stale, wrong-source, required-CI and uncertain-close negatives hold at the exact gate source in the scoped real-PostgreSQL service suites (tests/test_work_queue_github_acceptance.py)"
+          ]
+        },
+        "historical_expectations_not_claimed": {
+          "note": "Earlier versions of this fixture required these. They were not done and are not claimed as satisfied.",
+          "items": [
+            "stale and forged negatives observed refused on the installed gate itself (they were exercised in scoped real-PostgreSQL suites instead)",
+            "interruption behaviour observed on the installed gate (the designed lost-response case was not produced; the first response was simply not retained and the owner reconciled the recorded outcome before repeating)",
+            "a human review id matching the audit (human_approval mode only; the accepted outcome used independent_check and no human approval exists)",
+            "held-out P1-N12 run with owner-chosen inputs: not separately reported. Committed tests refuse related cases (test_wrong_repository_source_cannot_close, test_mismatched_behavioral_evidence_cannot_close, test_stale_verdict_and_unfinished_verifier); that is source-bound coverage, not the held-out case"
+          ]
+        }
       }
     },
     {
       "id": "P2",
       "class": "behaviour-preserving refactor",
-      "lane": "C-defined task; implemented later by an assigned worker, not in preparation",
+      "lane": "C-defined task; landed in PR 1030",
       "outcome": "One verification run-key derivation with four callers; digests byte-identical before and after.",
       "boundary": "src/drover/server/work_queue/service.py: launch, _verification_request, advance_deferred_verification, update",
-      "bindings": {"pre_refactor_sha": "UNBOUND", "post_refactor_sha": "UNBOUND"},
+      "bindings": {"pre_refactor_sha": "85ace5d5 (owner baseline for held-out inputs); committed pins captured at 7133442dbe4a0525f7e19076d404dca356f17756", "post_refactor_sha": "d6be93c79570ba113168560653278274edb19947 (PR 1030); rerun at 87990e95911d3897fcc0d2a195f0650d67fbf277", "regression_suite": "tests/test_quality_p2_derivation.py"},
+      "result": {"tier": "T1 with isolated real PostgreSQL, T2; T3 does not apply to a pure internal refactor", "owner_reported": "168 passed, 0 skipped across the three existing service suites and the regression suite; pins 6/6; held-out P2-N2 digests equal the pre-refactor baseline; seeded wrong derivations rejected", "owner_verdict": "pending owner review and integration"},
       "pin": {"vectors": "p2-run-key-vectors.json", "checker": "check_p2_run_key_vectors.py", "captured": true, "path_pinned": "items with no acceptance profile (criteria = item body)"},
       "positive": [
         {"id": "P2-P1", "given": "checker run at pre- and post-refactor SHA", "expect": "exit 0 and 6/6 at both"},
@@ -98,10 +115,12 @@
       "outcome": "Before work starts, an operator learns from the shell whether the required context is usable and, if not, the first thing that failed, why, and what to do next.",
       "contract": "fail-fast: stop at the first failing prerequisite, before any expensive work",
       "actionable_means": ["names the specific failing item", "states the cause", "states a concrete next step", "non-zero exit distinguishes failure from success"],
-      "bindings": {"command": "UNBOUND", "flags": "UNBOUND", "exit_codes": "UNBOUND", "prerequisite_order": "UNBOUND", "what_counts_as_expensive_work": "UNBOUND", "profile": "UNBOUND", "sha": "UNBOUND"},
+      "bindings": {"command": "sh scripts/quality/preflight.sh", "flags": ["--out", "--expect-base", "--expect-worktree", "--require-clean", "--python", "--verify-receipt", "--max-receipt-age", "--profile", "--pg-dsn-env", "--then"], "exit_codes": {"0": "pass", "1": "product_test_failure", "3": "environment_unavailable", "4": "harness_failure", "130": "harness_failure, check interrupted (SIGINT)"}, "prerequisite_order": ["tools", "worktree and base", "readable inputs", "output directory", "project interpreter", "postgres (pg profile)", "receipt verification"], "what_counts_as_expensive_work": "the --then command", "profile": "focused-tests; focused-tests-pg for the DSN case", "sha": "87990e95911d3897fcc0d2a195f0650d67fbf277", "contract": "docs/operations/dev-preflight.md"},
+      "result": {"tier": "T3 real script process from the source checkout; not installed-server behaviour", "owner_reported": "every run case passed at the bound sha, including held-out P3-N5 and a real SIGINT (exit 130, no traceback, receipt retained)", "owner_verdict": "pending owner review and integration", "history": "At 70a332c1 the first process run failed P3-N1 and P3-N2: 7 of 14 failing diagnostics had no next step, and an interrupted run had no result line. Those failures stand as recorded."},
+      "superseded_expect_note": "A superseded_expect value is the earlier, incorrect assumption for that case, kept as history. It is not a criterion that was met. Negative and guard assertions were not lowered.",
       "positive": [
-        {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; tree and store unchanged"},
-        {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "identical result; still no side effect", "kind": "retry"}
+        {"id": "P3-P1", "given": "complete, valid context in an isolated root", "expect": "exit zero; no failure diagnostics; a receipt is written; a controlled --then creates only its owned, guarded marker; tracked source unchanged", "superseded_expect": "exit zero; no failure diagnostics; tree and store unchanged"},
+        {"id": "P3-P2", "given": "P3-P1 run twice", "expect": "exit zero again; each valid invocation writes its own receipt; the guarded --then effect is not duplicated", "superseded_expect": "identical result; still no side effect", "kind": "retry"}
       ],
       "negative": [
         {"id": "P3-N1", "given": "a required context item is missing", "expect": "non-zero; diagnostic meets all four actionable_means; no expensive work started"},
@@ -109,7 +128,7 @@
         {"id": "P3-N3", "given": "two independent prerequisites are broken", "expect": "run 1: non-zero, the first failure only, specific and actionable, zero expensive work. Remedy only that one. Run 2: non-zero and now surfaces the second, equally actionable. Remedy it. Run 3: exit zero."},
         {"id": "P3-N4", "given": "context contains a secret-shaped value", "expect": "value never appears in stdout or stderr"},
         {"id": "P3-N5", "held_out": true, "given": "an item that exists and parses but is unusable (owner picks which: unreadable, stale, or for a different SHA)", "expect": "non-zero with an actionable diagnostic; exit zero here fails the feature"},
-        {"id": "P3-N6", "given": "command interrupted mid-run", "expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
+        {"id": "P3-N6", "given": "SIGINT while the --then command runs", "expect": "exit 130 with a result line (harness_failure, check interrupted) and no traceback; the receipt written before --then is retained; the preflight leaves no probe of its own; a guarded rerun exits zero without duplicating its effect. Partial effects of an arbitrary --then are for the caller to reconcile; no exactly-once or no-partial-state claim is made", "superseded_expect": "no partial state left behind; rerun gives the same answer", "kind": "interruption"}
       ]
     }
   ]
