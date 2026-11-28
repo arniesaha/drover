@@ -1,20 +1,20 @@
-# Quality pilots: feature → proof map (Lane C, issue #1024)
+# Quality pilots: feature → proof map (issue #1024, Lane C)
 
-**Status on this branch: P1 not run. P2 refactor candidate implemented and
-checked as described below, not yet owner-accepted. P3 is recorded
-separately and is not replayed here. Lane C is not accepted.**
+Three task classes, one pilot each: a bug fix (P1), a behaviour-preserving
+refactor (P2) and a user-visible feature (P3). This page is the contract and
+case map. What was actually run, by whom and at which source, is in
+[final evidence at `87990e95`](final-evidence-87990e95.md).
 
-Preparation originated at `7133442d` and is integrated with Lane A
-(`b36305f6`) and the reviewed Lane B preflight increment. The canonical
-cold-start recipe is in root `AGENTS.md`; the preflight contract is in
-[`dev-preflight.md`](../operations/dev-preflight.md). Runtime profile and
-execution slots stay `UNBOUND` until the [binding gate](#binding-gate).
-Source integration and baseline pins are not executed pilot outcomes.
+**Status at `87990e95911d3897fcc0d2a195f0650d67fbf277`:**
+
+- P1: one real outcome accepted by the owner through the installed gate.
+- P2 and P3: the owner reports passing proof at this source; owner review and
+  integration of this documentation are still open.
+- The cohort is **not** declared accepted here, and issue #1024 stays open.
 
 Case definitions:
 [`tests/fixtures/quality-pilots/scenarios.json`](../../tests/fixtures/quality-pilots/scenarios.json).
-They are data. No runner, score or service is added. The one executable piece
-is the P2 pin.
+They are data. No runner, score or service is added.
 
 ## Evidence tiers
 
@@ -24,218 +24,196 @@ higher one, and agreement between models or reviewers is not evidence.
 | Tier | Meaning | Does not prove |
 | --- | --- | --- |
 | T0 implementation | A diff exists at a named SHA | That it works |
-| T1 mocked test | Scoped `pytest` with fakes (stub provider, harness, HTTP session) | Real provider, transport, store or process boundary |
+| T1 scoped test | `pytest` against fakes or an isolated real PostgreSQL store | Real provider, transport or installed process |
 | T2 CI | The same SHA green in `.github/workflows/ci.yml` | Installed behaviour |
-| T3 installed behavioural acceptance | The installed artifact driven through its real entry point, with results read back from the real system of record | Anything outside the exact case run |
+| T3 real entry point | The installed gate, or the real script process, driven for an exact case with results read back from the system of record | Anything outside the exact case run |
 
-## P1 · Bug fix (Lane A): acceptance cannot be forged
+The three pilots reach different tiers on purpose: P1 is a real installed
+outcome, P2 is an internal-equivalence proof with no rollout tier, and P3 is a
+real script process from the source checkout. They are not interchangeable.
 
-Lane A hardens **only exact opted-in GitHub issues**. `local_file` goals and
-GitHub issues without a profile are deliberately unchanged. P1 therefore has
-two parts with opposite expectations, and they must not be mixed.
+## P1 · Bug fix: acceptance cannot be forged
 
-Contract of record: [GitHub acceptance pilot](../operations/github-acceptance-pilot.md),
-introduced at `b36305f6`.
+Contract of record:
+[GitHub acceptance pilot](../operations/github-acceptance-pilot.md). The gate
+hardens **only exact opted-in GitHub issues**; `local_file` goals and
+unprofiled issues are deliberately unchanged.
 
-### P1a · GitHub gate (the fix)
+### P1a · GitHub gate
 
 | | |
 | --- | --- |
-| Observable outcome | For an issue with a reviewed profile, a close happens only when trusted provider reads agree with that profile. Caller `behavioral_passed` / `checks_rerun` values grant nothing; an evidence label alone closes nothing. |
-| Approved criterion / profile | The issue's entry in `work_queue.goals.github_acceptance_profiles`, installed by an independent owner: `pull_number`, `criteria`, `instructions`, `behavioral_check`, `app_id`, `owner_id`, `amendment_record`. Its revision is SHA-256 over the whole profile. The issue body must carry exactly one `<!-- drover:acceptance -->` section equal to `criteria`. Actual profile values: `UNBOUND`. |
-| Source / build / context | Integrated SHA, installed runtime, repository, issue, PR, producer App: `UNBOUND`. |
-| Request | `POST /work/update`, `action=verified`, `evidence_key=check-run:<id>:review:<id>`, after the separate verification session is terminal. |
-| What the gate resolves | Current PR head; behavioural check with the configured name and App, success, at that head, `external_id` equal to the profile revision, still the latest run, non-empty output within 64 KiB; `APPROVED` review by the configured human owner at that head carrying `drover-acceptance:<revision>`; required branch-protection checks green; everything reread before the close intent. |
-| Expected side effect | Positive: `200 {"outcome":"verified"}`, one close, audit row holding resolved source, check facts, evidence reference and result byte count/digest. Negative: issue stays open, no `verified` outcome. Lost close response then repeat: `deferred`, no second close. |
-| Negative cases | `P1-N1`…`P1-N12` (forged flags and label, unresolvable evidence, stale head, changed profile or criteria, wrong or superseded check, missing or oversized output, wrong review, required CI, unfinished sessions, change at the final boundary, uncertain close); `P1-N12` held out. |
-| T1 | `tests/test_work_queue_github_acceptance.py` at `b36305f6`, run with Lane A's own recipe in its `AGENTS.md`. Fixtures prove the code contract only. |
+| Observable outcome | For an issue with an installed profile, a close happens only when trusted provider reads agree with that profile. Caller `behavioral_passed` / `checks_rerun` values grant nothing; an evidence label alone closes nothing. |
+| Profile | The issue's entry in `work_queue.goals.github_acceptance_profiles`: `pull_number`, `criteria`, `instructions`, `behavioral_check`, `app_id`, `review_mode`, `owner_id` (human mode only), `amendment_record`. Its revision is SHA-256 over the complete profile. The issue body carries exactly one `<!-- drover:acceptance -->` section equal to `criteria`. |
+| Two verdict modes | `human_approval` (the default): the configured human owner's `APPROVED` review at the current head carrying `drover-acceptance:<revision>`; evidence key `check-run:<id>:review:<id>`. `independent_check` (explicit): the configured App check is the verdict source and no review is fetched or synthesized; evidence key `check-run:<id>`. The installed profile selects the mode; a caller cannot. |
+| Both modes resolve | Current PR head; the behavioural check with the configured name and App, success, at that head, `external_id` equal to the profile revision, still the latest run, non-empty output within 64 KiB; required branch-protection checks green; everything reread before the close intent. |
+| Request | `POST /work/update`, `action=verified`. |
+| Expected side effect | Positive: `200 {"outcome":"verified"}`, one close, audit row holding resolved source, check facts, evidence reference and result byte count and digest. Negative: issue stays open, no `verified` outcome. Repeat after an outcome: the recorded outcome, no second close. Repeat after an intent with no outcome: `deferred`. |
+| Negative cases | `P1-N1`…`P1-N12`; `P1-N12` held out. |
 
-**Acceptance gates (T3, owner-performed; not satisfied by any test):**
+`independent_check` does not turn an App or agent result into a human review
+and does not waive repository branch protection. Arnab, as the sole human
+decision-maker, reviews and installs either complete profile.
 
-1. The owner independently reviews and installs the profile.
-2. The owner retrieves the retained result from
-   `GET /repos/<repo>/check-runs/<check-id>` and reads `output.summary` and
-   `output.text`.
-3. The owner judges whether those observations establish the claim and
-   whether the producer was isolated. A success conclusion is not that
-   judgment, and the gate does not automate it.
-4. Source head, profile revision, check-run, App and review identities match
-   the audit row.
-5. Stale and forged negatives, retry and interruption are observed on the
-   installed gate where they can be produced without harm.
-6. One real, subsequent, authorized PR goes through the installed gate with a
-   single close.
+### Settled sessions
 
-This worker closes no live issue and mutates no service. It can prepare and,
-after binding, run isolated cases and read back owner-supplied evidence.
+Acceptance needs a settled work session and a separate settled verifier
+session. Two forms qualify:
+
+- **Completed lifetime.** A queue-created or retained session with status
+  `completed` and the named turn's correlated successful exit. This is the
+  ordinary path and is unchanged.
+- **Strict resumable turn.** Only for a retained pair named by an installed
+  `github_existing_session_bindings` entry. A structured session may remain
+  `running` between turns when all of these hold: the named input is the
+  latest durable input; its terminal result is final in that window (Codex:
+  correlated `exited: 0`; Claude Code: the complete success result with zero
+  queued turns); no later input, error or status follows; and the owning
+  daemon reports the same session `awaiting: input` with `turn_active: false`.
+  `awaiting: input` or `turn_complete` alone never qualifies, and a queue link
+  without such a binding still needs `completed`.
+
+### Binding history and idempotency limits
+
+`POST /work/bind_existing` carries only the goal and issue; installed
+configuration selects the pair. It launches nothing and a repeat returns the
+same links. Known limits, all fail-closed:
+
+- A superseded pair stays as append-only history and cannot reach a verdict
+  once the installed binding changes.
+- A new pair may replace an old one only while every existing link holds
+  nothing but its single binding event. Any progress, verification intent or
+  outcome, or uncertain close requires inspection instead.
+- A later turn of an already-bound session is referenced through the binding
+  event; the link's session column stays empty and the one-owner-per-session
+  rule is not relaxed. This needs the same issue, role, profile revision and
+  source head.
+- The verifier link's identity derives from the work link and the source. A
+  change to the verifier turn alone cannot be rebound; work and verifier turns
+  must change together.
+- Neither bound session may receive further input between the final bind and
+  `verified`.
+- A daemon that does not report `turn_active` cannot satisfy the resumable
+  form.
 
 ### P1b · Compatibility regression (must not change)
 
 | | |
 | --- | --- |
 | Scope | `local_file` goals and unprofiled GitHub issues. |
-| Expectation | Identical to baseline. On these paths caller flags plus an opaque `evidence_key` are still what the service checks. The pilot does **not** expect them to reject opaque evidence; that would contradict Lane A's preserved compatibility. This is a stated limit of the fix, not a pass. |
-| Cases | `P1-C1`…`P1-C6`, including that a `local_file` goal cannot declare an acceptance profile. |
-| Commands | `tests/test_work_queue_execution.py`, `tests/test_work_queue_worker_mcp.py`, `tests/test_work_queue_local_candidates.py` (T1). |
+| Expectation | Identical to baseline: caller flags plus an opaque `evidence_key` are still what the service checks there. This is a stated limit of the fix, not a pass. |
+| Cases | `P1-C1`…`P1-C6`. |
 | Boundary | The signed deferred work → verify → acknowledge chain stays `local_file`-only. The GitHub gate is a close gate; it creates no acknowledgement and proves no merge or deploy. |
 
-## P2 · Behaviour-preserving refactor: verification run-key derivation
+## P2 · Behaviour-preserving refactor: verification identity
 
-Chosen boundary: the verification request/run-key derivation, written out four
-times in `service.py` (`launch`, `_verification_request`,
-`advance_deferred_verification`, `update`), at baseline and still at
-`b36305f6`. It is the smallest known duplicated boundary in the acceptance
-path and is what makes a criteria change invalidate a verification. The
-refactor is "one derivation, four callers"; see the candidate below.
+Boundary: the verification request/run-key derivation, formerly written out in
+four places in `src/drover/server/work_queue/service.py` (`launch`,
+`_verification_request`, `advance_deferred_verification`, `update`). It is
+what makes a criteria change invalidate a verification. Landed in PR #1030
+(`d6be93c7`) as one pure `verification_identity(...)` with four callers; each
+caller still resolves its own criteria in the same place and order.
 
 | | |
 | --- | --- |
 | Observable outcome | Identical inputs give byte-identical request and verify run keys before and after. |
-| Approved criterion | Equivalence, not review opinion: pinned digests match exactly and existing suites stay green with no test expectation edited. |
-| Characterization pin | [`p2-run-key-vectors.json`](../../tests/fixtures/quality-pilots/p2-run-key-vectors.json): six vectors captured from the real source at `7133442d` (changed, null and non-ASCII body; other item; other parent). |
-| Command | See [Running the checker](#running-the-checker). Exit 0 match, 1 mismatch, 2 pinned entry point missing or reshaped. |
-| Expected side effect | None. The diff touches only the derivation sites. |
+| Criterion | Equivalence, not review opinion: pinned digests match exactly and existing suites stay green with no expectation edited. |
+| Pin | [`p2-run-key-vectors.json`](../../tests/fixtures/quality-pilots/p2-run-key-vectors.json): six vectors captured from pre-refactor source at `7133442d`. |
+| Behavioural regression | [`tests/test_quality_p2_derivation.py`](../../tests/test_quality_p2_derivation.py) drives the real service on unprofiled, profiled and deferred `local_file` paths against an independently written digest, and seeds wrong derivations that must change a named behaviour. |
 | Negative cases | `P2-N1`…`P2-N4`; `P2-N2` held out. |
-| Owner verdict | Nix. T3 does not apply to a pure internal refactor; the verdict says so. |
+| Tier | T1 with a real isolated PostgreSQL store, plus T2. T3 does not apply to a pure internal refactor. |
 
-Limits of the pin:
+Limits: the six pins cover items with no acceptance profile; the profiled path
+and the other call sites rest on the suites. `launch` also stores every run
+key with its own role-generic expression, a fifth site left untouched; the
+helper's verify key must equal it and acceptance refuses if it does not.
 
-- It pins `identity()` and `WorkService._verification_request` for items with
-  no acceptance profile (criteria = item body). The profiled GitHub path and
-  the other three call sites are covered only by existing suites (T1).
-- During preparation it returned 6/6 on baseline, exit 1 against an in-memory
-  mutant that drops the criteria body, and 6/6 against `b36305f6`'s
-  `service.py` loaded in memory over baseline sibling modules. The last is an
-  indication, not a run of the integrated tree. None of this is a pilot result.
+## P3 · User-visible feature: preflight gives actionable diagnostics
 
-### P2 refactor candidate (not yet owner-accepted)
-
-Implemented on top of `9ab079fd` as candidate `990d7e34`: one pure
-`verification_identity(workspace_id, goal_id, number, parent_run_key, criteria)`
-in `service.py`, called by the four sites. Each caller still resolves its own
-criteria in the same place and order, so no authority check or provider read
-moved; `_verification_request` keeps its signature.
-
-What was actually run at `990d7e34`:
-
-- Six pins: 6/6. A derivation that drops the criteria fails them (1/6, exit 1).
-- The AGENTS isolated-PostgreSQL recipe with the `focused-tests-pg` preflight
-  (own role, data directory under the run's scratch root, port 5432
-  forbidden, clean tree): 17 passed, 0 skipped, 0 failed; the disposable
-  cluster was stopped by the recipe's own trap. The 17 are the 9 tests in
-  [`tests/test_quality_p2_derivation.py`](../../tests/test_quality_p2_derivation.py)
-  and 8 existing cases:
-  `test_work_queue_execution.py::test_separate_success_and_changed_criteria`,
-  `test_work_queue_github_acceptance.py::test_provider_evidence_and_owner_review_close_once_despite_routine_notes`
-  and `::test_stale_verdict_and_unfinished_verifier` (parametrized),
-  `test_work_queue_local_candidates.py::test_bound_verifier_reports_then_queue_accepts_only_its_terminal_turn`.
-- The new tests drive the real service on the unprofiled, profiled-GitHub and
-  deferred `local_file` paths and compare stored keys and decisions with an
-  independently written digest. Four seeded wrong derivations, across five
-  control tests, each change a named behaviour (for example, dropping criteria lets a changed-criteria
-  item be accepted).
-
-History, kept because it happened: the first run, at checkpoint `a5fa2c47`,
-was 15 passed, 2 failed. Both failures were wrong predictions inside the new
-negative control about *which* behaviour a wrong derivation breaks; the
-refactor and every real-derivation expectation were unchanged by the fix.
-
-Limits:
-
-- `launch` also stores every run key (work or verify) with its own
-  role-generic expression. That is a fifth, deliberately untouched site; the
-  helper's verify run key must equal it, and acceptance refuses if it does not.
-- The three existing suites were not run in full at this candidate, only the
-  cases named above. No CI run. `P2-N2` (owner-held fresh inputs) and the
-  owner's profile/all-caller baselines are the owner's to compare.
-
-## P3 · User-visible feature (Lane B): preflight CLI gives actionable context diagnostics
+Contract of record: [developer preflight](../operations/dev-preflight.md).
 
 | | |
 | --- | --- |
 | Observable outcome | Before work starts, the operator learns from the shell whether the required context is usable and, if not, the first thing that failed, why, and what to do next. |
-| Approved contract | Fail-fast: stop at the first failing prerequisite before any expensive work. "Actionable" is checked per diagnostic: it names the failing item, states the cause, states a concrete next step, and exits non-zero. |
-| Source / build / context | Accepted B source at the owner-supplied SHA. T3 uses the installed entry point as a real process, not an in-process `CliRunner` call. One throwaway root per case. |
-| Commands / paths | Command, flags, exit codes, prerequisite order, what counts as expensive work, message text: all `UNBOUND`. Existing surfaces named "preflight" (`drover lake preflight`, cutover `release-preflight`, `credentials issue-preflight`) are different features. |
-| Expected side effect | None: tree and store identical before and after. No secret in output. |
+| Contract | Fail-fast: stop at the first failing prerequisite before the `--then` command. Every failure names the check, states the cause and carries a non-empty concrete action. |
+| Command | `sh scripts/quality/preflight.sh --out <dir> [--expect-base] [--python] [--verify-receipt] [--profile] [--then '{python}' …]` |
+| Exit codes | 0 pass; 1 `--then` failed; 3 environment unavailable; 4 harness failure; 130 interrupted by SIGINT. |
+| Check order | tools, worktree and base, readable inputs, output directory, project interpreter, PostgreSQL (PG profile), receipt verification. |
+| Expected side effect | A failing preflight starts no `--then` command and writes no receipt. Each passing invocation writes its own receipt. No secret in output. |
 | Negative cases | `P3-N1`…`P3-N6`; `P3-N5` held out. |
-| Owner verdict | Nix, per diagnostic, with tier. |
+| Tier | T3 as a real script process from the source checkout. Not installed-server behaviour. |
 
-`P3-N3` (two broken prerequisites) follows the fail-fast contract: the first
-run reports the first failure only, with zero expensive work; after only that
-one is remedied, the rerun surfaces the second; after both, exit zero.
-Aggregate reporting of all failures in one run is not required and not
-expected. The bar per diagnostic is unchanged.
+`P3-N3` follows fail-fast: one failure per run, in order, each surfaced after
+only the previous one is repaired. Aggregate reporting is not expected.
+
+The preflight is not an exactly-once wrapper for arbitrary commands. A retried
+or interrupted `--then` is the caller's to guard and reconcile; the receipt
+certifies the environment only.
+
+Other surfaces named "preflight" (`drover lake preflight`, cutover
+`release-preflight`, `credentials issue-preflight`) are different features.
 
 ## Held-out cases
 
-Each class has one case marked `held_out`. Because this repository is visible
-to candidates, only its property and expectation are committed; the owner
-chooses the concrete inputs at execution. Expectations are not lowered at
-binding. A case that cannot be expressed against the accepted source is
-reported as a gap, not dropped.
+Each class has one case marked `held_out`. Only its property and expectation
+are committed; the owner chooses the concrete inputs and runs it. Expectations
+are not lowered at binding.
 
-## Running the checker
+## Reproducing the checks
 
-Supported context: Python ≥ 3.11 (`requires-python`), `uv` with the committed
-lock. It needs only the base project, no extras. Proven during preparation
-with CPython 3.14.7 and uv 0.13.6:
+Supported context: Python ≥ 3.11 and `uv` with the committed lock.
 
 ```sh
-uv run --locked --python <python3> python tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+# P2 pins (base project only): exit 0 match, 1 mismatch, 2 entry point reshaped
+uv run --locked python tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
+
+# Links in these pages
+uv run --locked python scripts/check_markdown_links.py docs/quality-pilots/README.md \
+  docs/quality-pilots/final-evidence-87990e95.md
 ```
 
-Format checks on the checker use the project's pinned tools and need the `dev`
-extra:
+The PostgreSQL-backed suites (P1 service controls and the P2 regression) run
+through the isolated recipe in root `AGENTS.md`, "Fresh-session, scoped
+verification". It creates its own disposable cluster under a new directory in
+`~/scratch`, runs the `focused-tests-pg` preflight, and stops only that
+cluster. The P3 recipe is in the preflight contract linked above.
 
-```sh
-uv run --locked --python <python3> --extra dev black --check tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
-uv run --locked --python <python3> --extra dev isort --check-only tests/fixtures/quality-pilots/check_p2_run_key_vectors.py
-uv run --locked --python <python3> python scripts/check_markdown_links.py docs/quality-pilots/README.md
-```
+## Boundaries and exclusions
 
-The T1 suites named above need `--extra dev`; Lane A's GitHub acceptance suite
-additionally follows the Postgres recipe in its `AGENTS.md`.
-
-## Evidence storage
-
-Two different things:
-
-- **Worker-authorized paths.** A Lane C worker writes only
-  `docs/quality-pilots/` and `tests/fixtures/quality-pilots/`. During
-  preparation a worker write outside the worktree, to a scratch directory, was
-  denied by the harness; no scratch write path is granted or assumed here.
-- **Owner-managed evidence.** Run evidence (command, exit status, SHA,
-  retrieved provider results, before/after state) is kept by the owner in a
-  location the owner chooses, outside the repository and never in `/tmp`. A
-  worker without such a grant returns its observations in its report for the
-  owner to retain.
-
-## Boundaries
-
-- Automatic work → separate verification → native acknowledgement is proven
-  only for configured `local_file` canary goals
-  ([`verified-event-path-boundaries.md`](../operations/verified-event-path-boundaries.md)).
-- The pilot manufactures no owner acknowledgement, performs no demo close of a
-  live GitHub issue, and touches no production state.
-- iOS physical-device acceptance and public-release gates
+- Three pilot cases are not a statistical reliability result and say nothing
+  general about autonomy.
+- The observation window is execution to the current checkpoint only. No
+  longitudinal or regression-over-time claim is made, and no timing, token or
+  intervention metric is reported.
+- Physical-device iOS, APNs, Reduce Motion and public-release gates
   ([`public-release-readiness.md`](../design/public-release-readiness.md)) are
-  separate. Nothing here counts toward them.
+  excluded. Nothing here counts toward them.
+- Native acknowledgement remains proven only for configured `local_file`
+  canary goals
+  ([`verified-event-path-boundaries.md`](../operations/verified-event-path-boundaries.md)).
 - No generic confidence score. A verdict is per case: pass, fail or not run.
 
-## Binding gate
+## Corrections to earlier versions of this page
 
-Execution waits for the owner to supply: reviewed, integrated A and B source
-with the exact current SHA; the installed profile and its revision; and an
-isolated root.
+Kept so the history is not mistaken for the current contract:
 
-Then, in the same Lane C session:
-
-1. Fill every `UNBOUND` slot from the accepted source or installed runtime,
-   not from this document.
-2. Re-run the P2 checker at the pre-refactor SHA before any refactor starts.
-3. Run the isolated cases, including `retry` and `interruption`, and read back
-   the real criteria and provider evidence for P1a.
-4. Report the denominator (cases defined / bound / run / passed / failed /
-   not run), which P1a gates the owner performed, and the limits of what was
-   exercised.
+- **Human approval was once the only verdict path.** Earlier text required an
+  `APPROVED` review by a configured human owner for every P1 acceptance and
+  listed that as an acceptance gate. That requirement was superseded by the
+  explicit `independent_check` mode. The accepted P1 outcome used that mode.
+  **The human-approval criterion was not met and is not claimed as met**; no
+  human approval was created or represented. `human_approval` remains the
+  default for any profile that does not opt out.
+- **Terminal lifetime was once required.** Earlier text required both sessions
+  to be terminal. The strict resumable-turn form above is the corrected,
+  narrower contract.
+- **`UNBOUND` slots.** Earlier versions left P1 and P3 bindings unbound and
+  stated that no pilot had run. Those slots are now bound in the fixture.
+- **P3 history.** The first process run, at `70a332c1`, failed two cases
+  because seven diagnostics had no next step, and an interrupted run produced
+  a traceback with no result line. Those failures stand as recorded; later
+  repairs do not turn them into passes.
+- **P2 history.** The first run of the new negative control predicted the
+  wrong broken behaviour for two seeded derivations (15 passed, 2 failed). The
+  control was corrected; the refactor and real-derivation expectations were
+  not changed.
