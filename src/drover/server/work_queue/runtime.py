@@ -968,21 +968,32 @@ def start_work_item_event_worker(collector, config, shutdown_event):
 
 
 def start_github_webhook_worker(collector, config, shutdown_event):
-    """Start post-ack GitHub processing only after a work service is available."""
+    """Start optional signed delivery and authenticated API-ingestion workers."""
     service = getattr(collector, "work_control", None)
-    if service is None or not config.github_webhook.secret_env:
+    if service is None:
         return None
-    from drover.server.work_queue.github_events import GitHubWebhookWorker
+    worker = None
+    if config.github_webhook.secret_env:
+        from drover.server.work_queue.github_events import GitHubWebhookWorker
 
-    worker = GitHubWebhookWorker(
-        service.store,
-        config.github_webhook,
-        service.github_webhooks,
-        service.providers,
-        service=service,
-    )
-    worker.start(shutdown_event=shutdown_event)
-    collector.github_webhook_worker = worker
+        worker = GitHubWebhookWorker(
+            service.store,
+            config.github_webhook,
+            service.github_webhooks,
+            service.providers,
+            service=service,
+        )
+        worker.start(shutdown_event=shutdown_event)
+        collector.github_webhook_worker = worker
+    if config.github_provider_ingestion.enabled:
+        from drover.server.work_queue.github_events import GitHubProviderIngestionWorker
+
+        ingestion = GitHubProviderIngestionWorker(
+            service, config.github_provider_ingestion
+        )
+        ingestion.start(shutdown_event=shutdown_event)
+        collector.github_provider_ingestion_worker = ingestion
+        return ingestion
     return worker
 
 

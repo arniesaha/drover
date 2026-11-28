@@ -277,6 +277,10 @@ class GoalScope(Model):
     # Keeping this outside the profile preserves already-installed profile
     # revisions and makes the execution path an explicit rollout decision.
     github_event_delivery_profiles: dict[str, str] = Field(default_factory=dict)
+    # A separate exact-issue opt-in for authenticated GitHub API polling.  It
+    # observes the current source and hands it to the same revalidating CI
+    # continuation as a signed delivery; it is never a webhook substitute.
+    github_provider_ingestion_profiles: dict[str, str] = Field(default_factory=dict)
     local_candidates_path: str | None = None
     # Per-item worktrees are local-file-only and must be declared in the
     # server configuration; manifest content cannot choose an arbitrary path.
@@ -354,6 +358,28 @@ class GoalScope(Model):
                 ):
                     raise ValueError(
                         "GitHub event delivery requires an exact profile revision"
+                    )
+        if self.github_provider_ingestion_profiles:
+            if (
+                self.candidate_source != "github"
+                or self.continuity_owner_id != native_owner
+            ):
+                raise ValueError(
+                    "GitHub provider ingestion requires GitHub source and its native owner"
+                )
+            for key, revision in self.github_provider_ingestion_profiles.items():
+                profile = self.github_acceptance_profiles.get(key)
+                if (
+                    not key.isascii()
+                    or not key.isdigit()
+                    or str(int(key)) != key
+                    or int(key) <= 0
+                    or profile is None
+                    or revision != profile.revision
+                    or self.github_event_delivery_profiles.get(key) != revision
+                ):
+                    raise ValueError(
+                        "GitHub provider ingestion requires an installed exact delivery profile"
                     )
         if any(part in {".", ".."} for part in self.repo.split("/")):
             raise ValueError("repository traversal is forbidden")
@@ -516,6 +542,25 @@ class GitHubWebhookConfig(Model):
         return self
 
 
+class GitHubProviderIngestionConfig(Model):
+    """Explicit, bounded authenticated API polling for opted-in GitHub items."""
+
+    enabled: bool = False
+    # This is intentionally a low-rate repair/adoption reader, never a
+    # replacement for pushed ingress or a task-stage driver.
+    interval_seconds: int = Field(default=60, ge=60, le=3600)
+    batch_size: int = Field(default=8, ge=1, le=100)
+    retry_seconds: int = Field(default=60, ge=60, le=3600)
+    max_backoff_seconds: int = Field(default=300, ge=1, le=3600)
+    settled_seconds: int = Field(default=300, ge=60, le=3600)
+
+    @model_validator(mode="after")
+    def valid(self):
+        if self.max_backoff_seconds < self.retry_seconds:
+            raise ValueError("github provider ingestion max_backoff must cover retry")
+        return self
+
+
 class WorkItemRulesConfig(Model):
     enabled: bool = False
     dry_run: bool = False
@@ -553,6 +598,9 @@ class WorkQueueConfig(Model):
     principal_roles: dict[str, str] = Field(default_factory=dict)
     work_item_events: WorkItemEventsConfig = Field(default_factory=WorkItemEventsConfig)
     github_webhook: GitHubWebhookConfig = Field(default_factory=GitHubWebhookConfig)
+    github_provider_ingestion: GitHubProviderIngestionConfig = Field(
+        default_factory=GitHubProviderIngestionConfig
+    )
     rules: WorkItemRulesConfig = Field(default_factory=WorkItemRulesConfig)
     github_approvals: GitHubApprovalConfig = Field(default_factory=GitHubApprovalConfig)
     audited_delegation: AuditedDelegationConfig = Field(
