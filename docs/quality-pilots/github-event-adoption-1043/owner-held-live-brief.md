@@ -11,12 +11,15 @@ is not a webhook and the bootstrap cron is repair only.
 
 ## Bound work and verification turns
 
-The bound work agent may perform only the authorized #1043 implementation and
-focused checks. While its signed structured turn is still running, it must call
-its own `drover_work_update(action="complete")` MCP tool. The coordinator must
-not submit that operation for it. The deferred completion stays pending until
-that exact successful work turn terminates and current provider facts and
-required checks permit continuation.
+The bound work deliverable is read-only evidence: inspect the already merged
+PR1042 source, run the profile's named focused regressions, and retain their
+exit, JUnit, and log-hash observations. Do not edit source, create commits,
+push, launch another task, or perform out-of-scope work. While its signed
+structured turn is still running, the work agent must call its own
+`drover_work_update(action="complete")` MCP tool. The coordinator must not
+submit that operation for it. The deferred completion stays pending until that
+exact successful work turn terminates and current provider facts and required
+checks permit continuation.
 
 The verifier must be a distinct bound session and turn. It independently reads
 current provider source, required checks, and the retained behavioral check

@@ -118,11 +118,33 @@ def test_1043_private_projection_keeps_p1_unchanged_and_requires_fresh_binding(
     q = json.dumps
     baseline = tmp_path / "baseline.toml"
     policy_path = ROOT / "src/drover/server/work_queue/policy-v1.json"
-    brief_path = (PACKET / "owner-held-live-brief.md").resolve()
+    brief_ref = (
+        "docs/quality-pilots/github-event-adoption-1043/owner-held-live-brief.md"
+    )
     isolated_cwd = tmp_path / "isolated-execution"
     native_cwd = tmp_path / "native-execution"
     isolated_cwd.mkdir()
     native_cwd.mkdir()
+    execution_brief = isolated_cwd / brief_ref
+    execution_brief.parent.mkdir(parents=True)
+    execution_brief.write_bytes((PACKET / "owner-held-live-brief.md").read_bytes())
+    for command in (
+        ["git", "init", "-q", str(isolated_cwd)],
+        ["git", "-C", str(isolated_cwd), "add", brief_ref],
+        [
+            "git",
+            "-C",
+            str(isolated_cwd),
+            "-c",
+            "user.name=packet",
+            "-c",
+            "user.email=packet@example.invalid",
+            "commit",
+            "-qm",
+            "add owner-held brief",
+        ],
+    ):
+        subprocess.run(command, check=True)
     baseline.write_text(f"""[work_queue]
 enabled = true
 shadow_mode = false
@@ -188,7 +210,7 @@ metrics_host = "127.0.0.1"
             "--execution-cwd",
             str(isolated_cwd),
             "--brief-ref",
-            str(brief_path),
+            brief_ref,
             "--profile",
             str(PACKET / "profile-candidate.json"),
             "--output",
@@ -198,6 +220,24 @@ metrics_host = "127.0.0.1"
         text=True,
     )
     assert prepared.returncode == 0, prepared.stderr
+    live_brief_args = [
+        sys.executable,
+        "-I",
+        str(PACKET / "verify-live-brief.py"),
+        "--execution-cwd",
+        str(isolated_cwd),
+        "--brief-ref",
+        brief_ref,
+    ]
+    assert (
+        subprocess.run(live_brief_args, capture_output=True, text=True).returncode == 0
+    )
+    original_brief = execution_brief.read_bytes()
+    execution_brief.write_text("tampered\n")
+    assert (
+        subprocess.run(live_brief_args, capture_output=True, text=True).returncode != 0
+    )
+    execution_brief.write_bytes(original_brief)
     record = json.loads(projection.read_text())
     p1_digest = hashlib.sha256(
         json.dumps(record["work_queue"]["goals"][0], sort_keys=True).encode()
@@ -216,7 +256,7 @@ metrics_host = "127.0.0.1"
             "--execution-cwd",
             str(isolated_cwd),
             "--brief-ref",
-            str(brief_path),
+            brief_ref,
             "--projection",
             str(projection),
         ],
@@ -236,7 +276,7 @@ metrics_host = "127.0.0.1"
     assert target["execution_cwds"] == {"studio": str(isolated_cwd.resolve())}
     assert target["policy_path"] == str(policy_path)
     assert target["execution_estimated_cost"] == 2.5
-    assert target["brief_ref"] == str(brief_path)
+    assert target["brief_ref"] == brief_ref
 
     overlap = subprocess.run(
         [
@@ -252,7 +292,7 @@ metrics_host = "127.0.0.1"
             "--execution-cwd",
             str(native_cwd),
             "--brief-ref",
-            str(brief_path),
+            brief_ref,
             "--profile",
             str(PACKET / "profile-candidate.json"),
             "--output",
@@ -308,7 +348,7 @@ metrics_host = "127.0.0.1"
                 "--execution-cwd",
                 str(isolated_cwd),
                 "--brief-ref",
-                str(brief_path),
+                brief_ref,
                 "--projection",
                 str(rejected),
             ],
@@ -422,7 +462,7 @@ metrics_host = "127.0.0.1"
         "--execution-cwd",
         str(isolated_cwd),
         "--brief-ref",
-        str(brief_path),
+        brief_ref,
         "--projection",
         str(bound_projection),
         "--require-binding",
@@ -451,7 +491,7 @@ execution_enabled = true
 execution_budget = 9.0
 execution_estimated_cost = 2.5
 execution_max_workers = 1
-brief_ref = {q(str(brief_path))}
+brief_ref = {q(brief_ref)}
 continuity_owner_id = "drover:owner/github-event-adoption-1043"
 continuity_owner_harness = "codex"
 continuity_owner_model = "gpt-5.6-terra"
@@ -488,7 +528,7 @@ amendment_record = {q(profile['amendment_record'])}
         "--execution-cwd",
         str(isolated_cwd),
         "--brief-ref",
-        str(brief_path),
+        brief_ref,
         "--candidate-config",
         str(candidate),
     ]
@@ -518,7 +558,7 @@ amendment_record = {q(profile['amendment_record'])}
     assert (
         reject_final(
             candidate_text.replace(
-                q(str(brief_path)), q("authorized:goal:native-owner-canary-848")
+                q(brief_ref), q("authorized:goal:native-owner-canary-848")
             )
         ).returncode
         != 0
@@ -526,8 +566,8 @@ amendment_record = {q(profile['amendment_record'])}
     assert (
         reject_final(
             candidate_text.replace(
-                f'execution_max_workers = 1\nbrief_ref = {q(str(brief_path))}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
-                f'execution_max_workers = 2\nbrief_ref = {q(str(brief_path))}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+                f'execution_max_workers = 1\nbrief_ref = {q(brief_ref)}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
+                f'execution_max_workers = 2\nbrief_ref = {q(brief_ref)}\ncontinuity_owner_id = "drover:owner/github-event-adoption-1043"',
             )
         ).returncode
         != 0

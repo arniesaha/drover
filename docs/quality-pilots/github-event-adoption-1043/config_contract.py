@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 from drover.server.work_queue.config import GitHubAcceptanceProfile, GoalScope
@@ -10,8 +11,8 @@ PIN = "bde283aa6bd4f97073867930153c8d12e9b8b85e"
 REVISION = "df895b4aafeb94a8d356cbcd9dfc277642e67989dc5ce9202a07f96544c95cfe"
 GOAL = "github-event-adoption-1043"
 ISSUE = "1043"
-PACKET = Path(__file__).resolve().parent
-BRIEF_NAME = "owner-held-live-brief.md"
+BRIEF_REF = "docs/quality-pilots/github-event-adoption-1043/owner-held-live-brief.md"
+BRIEF_SHA256 = "a40707d4df58dee1230b1d27a4f2a498142ec26de52051e71b87d24a77531b3c"
 EXPECTED_INGESTION = {
     "enabled": True,
     "interval_seconds": 60,
@@ -28,23 +29,31 @@ def load_profile(path: Path) -> GitHubAcceptanceProfile:
     return profile
 
 
-def brief_ref(path: Path) -> str:
-    """Return the reviewed, accessible task brief path for the live goal."""
-    expected = (PACKET / BRIEF_NAME).resolve()
-    resolved = path.resolve()
-    assert resolved == expected, "brief must be the reviewed #1043 owner-held brief"
-    assert resolved.is_file(), "brief must be an accessible regular file"
-    manifest = {
-        name: checksum
-        for checksum, name in (
-            line.split(maxsplit=1)
-            for line in (PACKET / "SHA256SUMS").read_text().splitlines()
-            if line.strip()
-        )
-    }
-    assert BRIEF_NAME in manifest, "brief checksum is missing"
-    assert hashlib.sha256(resolved.read_bytes()).hexdigest() == manifest[BRIEF_NAME]
-    return str(resolved)
+def brief_ref(execution_cwd: Path, reference: str) -> str:
+    """Validate the committed brief that an assigned worktree must consume."""
+    assert reference == BRIEF_REF, "brief must use the reviewed relative #1043 path"
+    cwd = execution_cwd.resolve()
+    path = (cwd / reference).resolve()
+    assert (
+        path.is_relative_to(cwd) and path.is_file()
+    ), "brief is unavailable in execution cwd"
+    assert (
+        hashlib.sha256(path.read_bytes()).hexdigest() == BRIEF_SHA256
+    ), "brief digest changed"
+    try:
+        committed = subprocess.run(
+            ["git", "-C", str(cwd), "show", f"HEAD:{reference}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AssertionError(
+            "brief must be present in execution checkout HEAD"
+        ) from exc
+    assert (
+        hashlib.sha256(committed).hexdigest() == BRIEF_SHA256
+    ), "execution checkout HEAD does not contain the reviewed brief"
+    return reference
 
 
 def p1_goal(base):
@@ -77,7 +86,7 @@ def template_and_cwd(base, template_goal_id: str, host: str, cwd: Path):
 
 
 def expected_goal(
-    base, template_goal_id: str, host: str, cwd: Path, profile, task_brief: Path
+    base, template_goal_id: str, host: str, cwd: Path, profile, task_brief: str
 ):
     p1 = p1_goal(base)
     native, resolved_cwd = template_and_cwd(base, template_goal_id, host, cwd)
@@ -90,7 +99,7 @@ def expected_goal(
             "credential": p1.credential.model_dump(mode="json"),
             "execution_enabled": native.execution_enabled,
             "execution_cwds": {host: str(resolved_cwd)},
-            "brief_ref": brief_ref(task_brief),
+            "brief_ref": brief_ref(resolved_cwd, task_brief),
             "execution_budget": native.execution_budget,
             "execution_estimated_cost": native.execution_estimated_cost,
             "execution_max_workers": native.execution_max_workers,
