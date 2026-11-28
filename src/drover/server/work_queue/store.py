@@ -914,6 +914,18 @@ class WorkStore:
                 [error, row["delivery_id"], row["attempts"]],
             )
 
+    def retry_github_webhook(self, row, *, delay_seconds, error="continuation_pending"):
+        """Keep one signed delivery durable while its bound pair is unfinished."""
+        if not isinstance(delay_seconds, (int, float)) or delay_seconds < 0:
+            raise ValueError("invalid GitHub webhook retry delay")
+        with self.connection() as con:
+            con.execute(
+                """UPDATE github_webhook_deliveries SET lease_until = now() +
+                   (? * interval '1 second'), last_error = ? WHERE delivery_id = ?
+                   AND state = 'leased' AND attempts = ?""",
+                [delay_seconds, error, row["delivery_id"], row["attempts"]],
+            )
+
     def find_github_item(self, *, repo, pr_number=None, branch=None):
         if not repo or (pr_number is None and not branch):
             return None

@@ -929,6 +929,62 @@ class WorkService:
         except Exception:
             return False
 
+    def _recover_observed_github_close(self, scope, provider, ref, row, key):
+        """Acknowledge an observed close without issuing a second provider write.
+
+        This handles only the narrow crash window after an already-recorded
+        GitHub acceptance intent. It is not a substitute for the native-owner
+        action/effect/ACK path used for native effects.
+        """
+        profile = scope.github_acceptance_profiles.get(str(ref.number))
+        events = self.store.events(key)
+        if (
+            profile is None
+            or row["run_role"] != "verify"
+            or len(events) != 1
+            or events[0]["event_kind"] != "intent"
+            or events[0]["action_category"] != "verified"
+        ):
+            return None
+        try:
+            facts = json.loads(events[0]["provider_operation_id"])
+            source = {
+                key: facts[key] for key in ("profile", "head", "branch", "pull", "repo")
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            source["profile"] != profile.revision
+            or source["repo"] != ref.repo
+            or source["pull"] != profile.pull_number
+            or not isinstance(facts.get("evidence"), str)
+        ):
+            return None
+        parent = self._work_parent(
+            links=self.store.links(goal_id=scope.goal_id, number=ref.number), row=row
+        )
+        if parent is None:
+            return None
+        _, expected = verification_identity(
+            self.config.workspace_id, scope.goal_id, ref.number, parent, source
+        )
+        if expected != row["run_key"]:
+            return None
+        item = provider.get_item(ref)
+        if item.get("state") != "closed":
+            return None
+        self.store.event(
+            "control:queue-execution",
+            ref,
+            key,
+            "outcome",
+            "verified",
+            outcome="verified",
+            operation_id=events[0]["provider_operation_id"],
+            link_id=row["id"],
+        )
+        return {"outcome": "verified"}
+
     def _bound_host_verification_report(self, scope, row, run_key, session, actor):
         """Allow only a bound verifier to defer its own terminal acceptance.
 
@@ -1187,11 +1243,40 @@ class WorkService:
             )
             return {"outcome": "verified"}
 
+    def _github_event_continuation_pending(self, scope, number):
+        """Whether a signed GitHub pair still needs its retained CI delivery.
+
+        This is deliberately derived from append-only work intents and signed
+        launch bindings.  It does not turn a mutable work-item stage or a
+        webhook conclusion into a readiness claim.
+        """
+        for row in self.store.links(goal_id=scope.goal_id, number=number):
+            if row["run_role"] not in {
+                "work",
+                "verify",
+            } or not self._github_event_delivery(scope, number, row["run_key"]):
+                continue
+            action = "complete" if row["run_role"] == "work" else "verified"
+            events = self.store.events(identity(row["run_key"], action, None))
+            if any(event["event_kind"] == "outcome" for event in events):
+                continue
+            # A submitted intent is pending terminal evidence. A separately
+            # launched verifier has no report yet, but must retain the exact
+            # green source observation until it either reports or is rejected.
+            if events or row["run_role"] == "verify":
+                return True
+        return False
+
     def advance_github_ci(self, repo, pull_number, head):
-        """Continue only an exact, pushed CI rollup through provider rereads."""
+        """Continue or retain one exact pushed CI observation.
+
+        ``pending`` deliberately leaves the signed delivery leased for a
+        bounded retry.  ``settled`` includes stale, failed, unsupported, and
+        already-acknowledged paths; none creates an effect.
+        """
         if not isinstance(repo, str) or not isinstance(pull_number, int):
-            return 0
-        continued = 0
+            return "settled"
+        pending = False
         with self.lock:
             for scope in self.config.goals:
                 for number, profile in scope.github_acceptance_profiles.items():
@@ -1216,10 +1301,12 @@ class WorkService:
                             continue
                         self.advance_deferred_completion(scope.goal_id, int(number))
                         self.advance_deferred_verification(scope.goal_id, int(number))
-                        continued += 1
+                        pending = pending or self._github_event_continuation_pending(
+                            scope, int(number)
+                        )
                     except (PermissionError, ValueError, WorkDenied):
                         continue
-        return continued
+        return "pending" if pending else "settled"
 
     def update(
         self,
@@ -1270,6 +1357,12 @@ class WorkService:
         if any(e["event_kind"] == "outcome" for e in events):
             return {"outcome": events[-1]["outcome"]}
         if events:
+            if action == "verified":
+                recovered = self._recover_observed_github_close(
+                    scope, provider, ref, row, key
+                )
+                if recovered is not None:
+                    return recovered
             if action in {"complete", "verified"} and all(
                 event["event_kind"] == "intent" and event["action_category"] == action
                 for event in events

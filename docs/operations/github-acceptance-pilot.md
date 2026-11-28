@@ -165,17 +165,27 @@ work item. A constituent `check_run` never creates a rollup by itself.
 
 The continuation only schedules a separate verifier after its bound work turn
 is terminal. A verifier report remains a durable intent until its exact turn is
-terminal and a subsequent exact-head CI rollup causes fresh `acceptance_facts`
-reads; the existing intent/outcome fence then makes the close retry-safe. The
-webhook worker is a short durable-delivery retry loop, not provider polling or
-a model-execution loop. If no webhook secret is already configured, this path
-is unavailable; it does not create a secret, webhook, or fallback poller.
+terminal and fresh `acceptance_facts` reads agree. If an exact green CI delivery
+arrives first, the existing `github_webhook_deliveries` row remains leased with
+`continuation_pending` and the webhook worker retries that same signed payload
+on its bounded five-second delay. Restart reclaims its expired lease. This is a
+retained readiness observation keyed by the signed delivery plus the
+profile-bound work/verify links, not a new scheduler or a normal queue-provider
+poll. Stale, failed, unsupported, and already-acknowledged paths are completed
+without an effect; provider unavailability leaves the lease recoverable.
+
+The provider close has a narrower recovery fence: after a verified intent, a
+restart may record the outcome only when GitHub already reports that exact issue
+closed. It does not issue a second close. This coordinator close intent/outcome
+recovery is not a native-owner effect/ACK receipt. Native-owner action-intent,
+effect, and ACK remain the authority for native effects and have not been
+extended to GitHub issue closure.
 
 This is preparation and code-contract evidence only. A live owner still needs
 the normal protected integration, private installation, signed provider
-delivery, and retained provider evidence. Native-owner action-intent/ACK
-receipts remain the authority for native effects; this GitHub close continues
-to use the coordinator's existing provider intent/outcome fence.
+delivery, and retained provider evidence. If no webhook secret is already
+configured, this path is unavailable; it does not create a secret, webhook, or
+fallback poller.
 
 ```html
 <!-- drover:acceptance -->
@@ -314,7 +324,8 @@ does not retry, relaunch, merge, deploy, or re-run the producer automatically.
 | A changed retained result cannot replace the reviewed observation | [`test_changed_behavioral_result_at_final_boundary_cannot_close`](../../tests/test_work_queue_github_acceptance.py) |
 | A separate owner review is revision/head bound | [`test_owner_review_is_independent_and_revision_bound`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit independent-check mode removes no other provider binding | [`test_explicit_independent_check_profile_does_not_require_human_review`](../../tests/test_work_queue_github_acceptance.py), [`test_independent_check_mode_still_requires_configured_producer`](../../tests/test_work_queue_github_acceptance.py), [`test_human_review_mode_rejects_check_only_evidence`](../../tests/test_work_queue_github_acceptance.py) |
-| Signed exact-head CI, not a stale or constituent delivery, continues the explicit GitHub path | [`test_signed_exact_head_ci_continues_opted_github_deferred_pair`](../../tests/test_work_queue_github_acceptance.py), [`tests/test_github_work_item_events.py`](../../tests/test_github_work_item_events.py) |
+| Signed exact-head CI survives terminal/report ordering, restart, replay, and constituent/stale controls | [`test_signed_exact_head_ci_continues_opted_github_deferred_pair`](../../tests/test_work_queue_github_acceptance.py), [`tests/test_github_work_item_events.py`](../../tests/test_github_work_item_events.py) |
+| A post-close/pre-outcome crash records an observed close without a second PATCH | [`test_observed_close_after_outcome_write_failure_is_acked_without_reclose`](../../tests/test_work_queue_github_acceptance.py) |
 | Explicit existing-session reuse is terminal, scoped, separate, and idempotent | [`test_existing_completed_sessions_bind_once_without_relaunch`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_terminal_persisted_sessions`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_requires_exact_persisted_terminal_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_accepts_only_an_idle_structured_turn`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_session_reader_rejects_unsafe_resumable_turns`](../../tests/test_work_queue_github_acceptance.py) |
 | A current strict resumable pair may verify, while unsafe, superseded, or uncertain pairs cannot | [`test_verified_accepts_current_strict_resumable_existing_pair`](../../tests/test_work_queue_github_acceptance.py), [`test_verified_rejects_unsafe_resumable_verifier_at_service_boundary`](../../tests/test_work_queue_github_acceptance.py), [`test_running_unbound_verifier_cannot_use_existing_session_exception`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_replacement_keeps_old_links_and_rejects_them_at_verdict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_pair_with_uncertain_close_cannot_be_replaced`](../../tests/test_work_queue_github_acceptance.py) |
 | Later turns may reuse a retained session without relaxing its unique owner or losing a partial bind | [`test_existing_turn_rebind_reuses_session_without_unique_association_conflict`](../../tests/test_work_queue_github_acceptance.py), [`test_existing_turn_rebind_recovers_bind_only_partial_work_link`](../../tests/test_work_queue_github_acceptance.py) |

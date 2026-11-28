@@ -48,6 +48,7 @@ class GitHub:
         self.body = BODY
         self.head = SHA
         self.closed = 0
+        self.state = "open"
         self.reads = []
         self.evidence = None
         self.overrides = {}
@@ -60,6 +61,7 @@ class GitHub:
             self.closed += 1
             if self.close_timeout:
                 raise TimeoutError("uncertain close")
+            self.state = "closed"
             return Response({})
         if method == "PUT":
             return Response({})
@@ -67,7 +69,7 @@ class GitHub:
             "/user": {"id": 50},
             "/repos/example/project/issues/1": {
                 "number": 1,
-                "state": "open",
+                "state": self.state,
                 "body": self.body,
                 "labels": [{"name": "goal:test"}, {"name": "status:review"}],
             },
@@ -237,7 +239,7 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
         },
         host,
     ) == {"outcome": "deferred"}
-    service.harness.sessions[work["run_key"]].status = "completed"
+    assert service._github_event_continuation_pending(scope, 1)
     client.overrides["/repos/example/project/issues/1"]["labels"][-1][
         "name"
     ] = "status:review"
@@ -248,7 +250,11 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
         item["id"], pr="https://github.com/example/project/pull/9"
     )
     worker = GitHubWebhookWorker(
-        service.store, webhook, service.github_webhooks, service=service
+        service.store,
+        webhook,
+        service.github_webhooks,
+        service=service,
+        retry_delay_seconds=0,
     )
 
     def deliver(delivery, event, payload):
@@ -302,7 +308,27 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
             },
         },
     )
+    # The green CI event arrives before the work turn settles. It remains a
+    # durable leased readiness record instead of being marked processed.
     assert worker.process_once() == 1
+    assert [row["run_role"] for row in service.store.links()] == ["work"]
+    with service.store.connection() as con:
+        assert con.execute(
+            "SELECT state, last_error FROM github_webhook_deliveries "
+            "WHERE delivery_id = 'github-event-current-ci'"
+        ).fetchone() == ("leased", "continuation_pending")
+
+    # A fresh worker simulates restart recovery. The exact retained event now
+    # sees the terminal work turn and creates only one verifier.
+    service.harness.sessions[work["run_key"]].status = "completed"
+    restarted = GitHubWebhookWorker(
+        service.store,
+        webhook,
+        service.github_webhooks,
+        service=service,
+        retry_delay_seconds=0,
+    )
+    assert restarted.process_once() == 1
     links = service.store.links(goal_id="goal", number=1)
     assert [row["run_role"] for row in links] == ["work", "verify"]
     verify = links[-1]
@@ -339,7 +365,9 @@ def test_signed_exact_head_ci_continues_opted_github_deferred_pair(
         },
     }
     deliver("github-event-verify-ci", "workflow_run", final_payload)
-    assert worker.process_once() == 1
+    # The retained old CI delivery and this terminal-before-CI delivery may
+    # arrive together. Both replay provider facts, but the close happens once.
+    assert worker.process_once() == 2
     assert client.closed == 1
     assert service.call(
         "update",
@@ -1454,6 +1482,41 @@ def test_uncertain_close_never_causes_second_effect(service, monkeypatch):
         verdict(service, verify)
     assert verdict(service, verify) == {"outcome": "deferred"}
     assert client.closed == 1
+
+
+def test_observed_close_after_outcome_write_failure_is_acked_without_reclose(
+    service, monkeypatch
+):
+    """A recreated coordinator observes the provider effect before its ACK."""
+    client, verify = ready(service, monkeypatch)
+    original_event = service.store.event
+
+    def fail_outcome(*args, **kwargs):
+        if len(args) >= 5 and args[3:5] == ("outcome", "verified"):
+            raise RuntimeError("simulated post-close outcome write failure")
+        return original_event(*args, **kwargs)
+
+    service.store.event = fail_outcome
+    with pytest.raises(RuntimeError, match="post-close"):
+        verdict(service, verify)
+    service.store.event = original_event
+    assert client.closed == 1
+    key = identity(verify["run_key"], "verified", None)
+    assert [event["event_kind"] for event in service.store.events(key)] == ["intent"]
+
+    # Recreate the service object over the same durable store, as a restart
+    # would. The closed provider item yields an ACK only; it cannot PATCH again.
+    from drover.server.work_queue.service import WorkService
+
+    recovered = WorkService(
+        service.config, service.store, service.providers, service.harness
+    )
+    assert verdict(recovered, verify) == {"outcome": "verified"}
+    assert client.closed == 1
+    assert [event["event_kind"] for event in service.store.events(key)] == [
+        "intent",
+        "outcome",
+    ]
 
 
 def test_wrong_repository_source_cannot_close(service, monkeypatch):

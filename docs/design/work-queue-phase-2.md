@@ -107,7 +107,12 @@ PR source, immutable criteria/profile revision, and required checks through the
 provider before it schedules a verifier or accepts evidence. Webhook fields are
 not acceptance facts. Missing webhook configuration, stale delivery,
 unavailable reads, or failed/pending/skipped required checks leave the durable
-intent pending; the event worker has no provider-write path or model loop.
+intent pending. An exact green delivery received before the bound turn/report
+settles remains a leased retryable delivery until the signed pair reaches a
+terminal outcome; a restart can reclaim it. The signed receiver itself has no
+provider-write endpoint; the bounded continuation may invoke the existing
+coordinator close only after final provider rereads. It has no model loop, and
+this retained delivery is not normal queue provider polling.
 Work runs and failed behavioral checks cannot close issues. A failure queues
 revision until the configured attempt budget is exhausted, then blocks and
 writes the generated systemic-review comment. Further launches remain blocked

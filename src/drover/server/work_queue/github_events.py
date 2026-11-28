@@ -104,10 +104,19 @@ class GitHubWebhookReceiver:
 class GitHubWebhookWorker:
     """Process persisted delivery rows with a deliberately small polling loop."""
 
-    def __init__(self, store, config, receiver, providers=None, service=None):
+    def __init__(
+        self,
+        store,
+        config,
+        receiver,
+        providers=None,
+        service=None,
+        retry_delay_seconds=5,
+    ):
         self.store, self.config, self.receiver = store, config, receiver
         self.providers = providers or {}
         self.service = service
+        self.retry_delay_seconds = retry_delay_seconds
         self._stop = threading.Event()
         self._thread = None
 
@@ -140,14 +149,20 @@ class GitHubWebhookWorker:
         rows = self.store.claim_github_webhooks(self.config.batch_size)
         for row in rows:
             error = None
+            retry = False
             try:
-                self._process(row["event_type"], json.loads(row["payload"]))
+                retry = self._process(row["event_type"], json.loads(row["payload"]))
             except (AttributeError, KeyError, TypeError, ValueError):
                 # Bad signed upstream data is completed and observable. Store
                 # failures intentionally escape, retaining the leased row.
                 error = "processing_error"
                 self.receiver.count("processing_errors")
-            self.store.complete_github_webhook(row, error=error)
+            if retry:
+                self.store.retry_github_webhook(
+                    row, delay_seconds=self.retry_delay_seconds
+                )
+            else:
+                self.store.complete_github_webhook(row, error=error)
         return len(rows)
 
     def _item(self, payload, *, pr_number=None, branch=None):
@@ -167,7 +182,7 @@ class GitHubWebhookWorker:
         elif event_type == "pull_request_review":
             self._review(payload)
         elif event_type in _CI_EVENTS:
-            self._ci(event_type, payload)
+            return self._ci(event_type, payload)
         elif event_type == "push":
             self._push(payload)
         elif event_type == "deployment_status":
@@ -262,13 +277,15 @@ class GitHubWebhookWorker:
                 ),
             )
         if rollup == "ci_green_exact_head":
-            self._continue_exact_ci(item, pr_number, sha)
+            return self._continue_exact_ci(item, pr_number, sha)
+        return False
 
     def _continue_exact_ci(self, item, pr_number, sha):
         """Wake only the installed service adapter; provider facts are reread."""
         advance = getattr(self.service, "advance_github_ci", None)
         if callable(advance) and isinstance(pr_number, int):
-            advance(item.get("repo"), pr_number, sha)
+            return advance(item.get("repo"), pr_number, sha) == "pending"
+        return False
 
     def _github_check_state(self, item, sha):
         """Prefer the configured read credential; ``None`` means clean fallback."""
